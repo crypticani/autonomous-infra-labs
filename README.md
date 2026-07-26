@@ -16,7 +16,7 @@ Each service here started as a learning exercise, but is built to a standard whe
 
 ## Architecture
 
-```
+```text
                  ┌─────────────────────┐
    alerts /      │                     │
    logs / scans  │       gateway       │
@@ -28,43 +28,57 @@ Each service here started as a learning exercise, but is built to a standard whe
    log-analyzer  knowledge-      self-healing      security-triage
    (LLM call)    copilot (RAG)   agent (tools +     (scanner output
                                  approval gate)      + LLM triage)
+
 ```
 
 Every service exposes `/metrics` for Prometheus (token cost, latency, error rate — not just uptime) and ships with a small eval harness so behavior is tested, not just demoed once.
 
 ## Design principles
 
-- **Understand before you automate.** Every service is built by hand first; frameworks are added later, only once the underlying loop can be explained without one.
-- **Nothing writes to infrastructure without a human in the loop.** The self-healing agent diagnoses and proposes; a human approves before any restart, scale, or rollback executes.
-- **Sandboxed only.** Everything here runs against a local (kind/minikube) or personal cloud cluster — never against production infrastructure belonging to an employer or client.
-- **A working demo isn't a finished service.** Cost, latency, and failure modes are tracked from day one; each service has a golden-set regression test so changes don't silently break it.
+* **Understand before you automate.** Every service is built by hand first; frameworks are added later, only once the underlying loop can be explained without one.
+* **Nothing writes to infrastructure without a human in the loop.** The self-healing agent diagnoses and proposes; a human approves before any restart, scale, or rollback executes.
+* **Sandboxed only.** Everything here runs against a local (kind/minikube) or personal cloud cluster — never against production infrastructure belonging to an employer or client.
+* **A working demo isn't a finished service.** Cost, latency, and failure modes are tracked from day one; each service has a golden-set regression test so changes don't silently break it.
 
 ## Tech stack
 
-Python · FastAPI · Claude API · Chroma · Docker · Kubernetes · Jenkins · Prometheus · Grafana · Trivy · tfsec/Checkov · Bandit
+Python · FastAPI · Gemini API · Chroma · Docker · Kubernetes · Jenkins · Prometheus · Grafana · Trivy · tfsec/Checkov · Bandit
 
 ## Getting started
 
 Each service is self-contained and will include its own setup instructions as it's built. Global prerequisites:
 
 ```bash
-git clone https://github.com/crypticani/autonomous-infra-labs.git
+git clone [https://github.com/crypticani/autonomous-infra-labs.git](https://github.com/crypticani/autonomous-infra-labs.git)
 cd autonomous-infra-labs
 
 # LLM API key
-export ANTHROPIC_API_KEY=your_key_here
+export GEMINI_API_KEY=your_key_here
 
 # local K8s sandbox
 kind create cluster   # or: minikube start
+
 ```
 
-## Roadmap
+## Roadmap & Challenge Log
 
-- [ ] Log Analyzer — structured, LLM-backed log/error triage
-- [ ] Knowledge Copilot — RAG over runbooks, postmortems, and live infra signals
-- [ ] Self-Healing Agent — diagnose-and-propose remediation for K8s issues, with approval gating
-- [ ] Security Triage — AI-triaged output from existing security scanners
-- [ ] Gateway — unified entrypoint across all four
+This repository follows a scaffolded 30-day learning path.
+
+### Phase 1: Log Analyzer
+
+* [ ] **Day 1: Fundamentals & Baseline**
+* **Learn:** How LLMs actually work for engineers (tokens, context window, temperature, system vs. user prompts, function/tool calling).
+* **Build:** A script that sends a raw error log to the Gemini API and prints back a plain-English explanation.
+
+
+* [ ] **Service Build:** Log Analyzer — structured, LLM-backed log/error triage.
+
+### Future Phases
+
+* [ ] **Knowledge Copilot** — RAG over runbooks, postmortems, and live infra signals.
+* [ ] **Self-Healing Agent** — diagnose-and-propose remediation for K8s issues, with approval gating.
+* [ ] **Security Triage** — AI-triaged output from existing security scanners.
+* [ ] **Gateway** — unified entrypoint across all four services.
 
 ## License
 
