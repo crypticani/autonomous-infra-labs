@@ -8,7 +8,7 @@ Each service here started as a learning exercise, but is built to a standard whe
 
 | Service | What it does | Status |
 |---|---|---|
-| [`services/log-analyzer`](./services/log-analyzer) | FastAPI service that turns a raw error log into structured `{severity, likely_cause, suggested_fix}` output via an LLM | Planned |
+| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Currently CLI scripts; FastAPI wrapper next | In progress |
 | [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data | Planned |
 | [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | Planned |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, tfsec/Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings. Proposes fixes as diffs — never auto-applies them | Planned |
@@ -42,22 +42,30 @@ Every service exposes `/metrics` for Prometheus (token cost, latency, error rate
 
 ## Tech stack
 
-Python · FastAPI · Gemini API · Chroma · Docker · Kubernetes · Jenkins · Prometheus · Grafana · Trivy · tfsec/Checkov · Bandit
+Python · FastAPI · Ollama / Gemini API (pluggable) · Pydantic · Rich · Chroma · Docker · Kubernetes · Jenkins · Prometheus · Grafana · Trivy · tfsec/Checkov · Bandit
 
 ## Getting started
 
 Each service is self-contained and will include its own setup instructions as it's built. Global prerequisites:
 
 ```bash
-git clone [https://github.com/crypticani/autonomous-infra-labs.git](https://github.com/crypticani/autonomous-infra-labs.git)
+git clone https://github.com/crypticani/autonomous-infra-labs.git
 cd autonomous-infra-labs
 
-# LLM API key
-export GEMINI_API_KEY=your_key_here
+pip install -r requirements.txt
+
+# configure the LLM provider (Ollama by default, or Gemini)
+cp .env.example .env
+# then edit .env: set LLM_PROVIDER, and GEMINI_API_KEY if using Gemini
 
 # local K8s sandbox
 kind create cluster   # or: minikube start
+```
 
+Run the log analyzer (current entrypoint):
+
+```bash
+python services/log-analyzer/day2_analyzer.py
 ```
 
 ## Roadmap & Challenge Log
@@ -66,12 +74,11 @@ This repository follows a scaffolded 30-day learning path.
 
 ### Phase 1: Log Analyzer
 
-* [ ] **Day 1: Fundamentals & Baseline**
+* [x] **Day 1: Fundamentals & Baseline**
 * **Learn:** How LLMs actually work for engineers (tokens, context window, temperature, system vs. user prompts, function/tool calling).
-* **Build:** A script that sends a raw error log to the Gemini API and prints back a plain-English explanation.
-
-
-* [ ] **Service Build:** Log Analyzer — structured, LLM-backed log/error triage.
+* **Build:** A script that sends a raw error log to an LLM and prints back a plain-English explanation — with a pluggable provider (Ollama / Gemini) behind one interface.
+* [x] **Day 2: Strict typed output** — enforce a validated `LogAnalysis` schema (`severity`, `likely_cause`, `suggested_fix`, `confidence`) via Pydantic instead of free text.
+* [ ] **Service Build:** Log Analyzer — wrap the CLI in FastAPI with `/metrics` and a golden-set eval harness.
 
 ### Future Phases
 
