@@ -82,25 +82,14 @@ class GeminiProvider(BaseLLMProvider):
                 model=self.model_name,
                 contents=user_prompt,
                 config={
-                    "system_instructions": system_prompt,
+                    "system_instruction": system_prompt,
                     "temperature": temperature,
                 },
             )
             return response.text
         except Exception as e:
-            logger.warning(
-                f"SDK Config rejected system instructions. \
-                           Engaging Fallback mode. Details: {e}"
-            )
-            fallback_prompt = f"SYSTEM INSTRUCTIONS:\n{system_prompt}\n\n\
-                USER PROMPT:\n{user_prompt}"
-
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=fallback_prompt,
-                config={"temperature": temperature},
-            )
-            return response.text
+            logger.critical(f"Gemini API request failed: {e}")
+            raise
 
 
 def analyze_log(provider: BaseLLMProvider, error_log: str) -> None:
