@@ -163,6 +163,6 @@ if __name__ == "__main__":
         provider = GeminiProvider()
     else:
         logger.error(f"Unsupported LLM provider specified: {provider_type}")
-        active_provider = OllamaProvider()
+        provider = OllamaProvider()
 
     analyze_log(provider, sample_raw_log)
