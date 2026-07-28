@@ -1,5 +1,8 @@
+fastapi==0.140.7
+google-genai==2.14.0
 protobuf==7.35.1
 pydantic==2.13.4
 python-dotenv==1.2.2
 Requests==2.34.2
 rich==15.0.0
+uvicorn==0.51.0
