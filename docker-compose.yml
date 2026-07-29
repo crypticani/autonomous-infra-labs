@@ -1,0 +1,21 @@
+services:
+  log-analyzer:
+    build:
+      context: .
+      dockerfile: ./services/log-analyzer/Dockerfile
+    image: log-analyzer:latest
+    container_name: log-analyzer
+    env_file:
+      - .env
+    command: ["uvicorn", "day4_analyzer:app", "--host", "0.0.0.0", "--port", "${PORT:-7000}"]
+    ports:
+      - "${PORT:-7000}:${PORT:-7000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:$PORT/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 10s

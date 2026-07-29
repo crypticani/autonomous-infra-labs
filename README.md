@@ -8,7 +8,7 @@ Each service here started as a learning exercise, but is built to a standard whe
 
 | Service | What it does | Status |
 |---|---|---|
-| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Exposed as a FastAPI `/analyze-log` endpoint; `/metrics` and eval harness next | In progress |
+| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Exposed as a containerized FastAPI service with `/analyze-log` and `/health` endpoints; `/metrics` and eval harness next | In progress |
 | [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data | Planned |
 | [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | Planned |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, tfsec/Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings. Proposes fixes as diffs — never auto-applies them | Planned |
@@ -93,13 +93,23 @@ kind create cluster   # or: minikube start
 
 ### Run the log analyzer
 
-The service is a FastAPI app. Start it (listens on port `7000`):
+The service is a FastAPI app that listens on port `7000`. Run it directly, or in a container.
+
+**Option A — run directly:**
 
 ```bash
-python services/log-analyzer/day3_analyzer.py
+python services/log-analyzer/day4_analyzer.py
 ```
 
-Then POST a raw log to `/analyze-log`:
+**Option B — run with Docker (multi-stage build, non-root user):**
+
+```bash
+docker compose up --build
+```
+
+The container reads config from `.env`. When `LLM_PROVIDER=ollama`, point `OLLAMA_BASE_URL` at `http://host.docker.internal:11434` so the container can reach Ollama running on the host.
+
+Once it's up, POST a raw log to `/analyze-log`:
 
 ```bash
 curl -s http://localhost:7000/analyze-log \
@@ -113,7 +123,7 @@ Response is strict, validated JSON:
 {"severity": "HIGH", "likely_cause": "...", "suggested_fix": "...", "confidence": 0.9}
 ```
 
-Interactive API docs are available at `http://localhost:7000/docs`. The earlier `day1_analyzer.py` / `day2_analyzer.py` are standalone CLI scripts kept for reference.
+Interactive API docs are at `http://localhost:7000/docs`, and a liveness/readiness probe at `http://localhost:7000/health` (returns `503` if the configured provider is misconfigured). The earlier `day1_analyzer.py` / `day2_analyzer.py` are standalone CLI scripts kept for reference.
 
 ## Roadmap & Challenge Log
 
@@ -126,6 +136,7 @@ This repository follows a scaffolded 30-day learning path.
 * **Build:** A script that sends a raw error log to an LLM and prints back a plain-English explanation — with a pluggable provider (Ollama / Gemini) behind one interface.
 * [x] **Day 2: Strict typed output** — enforce a validated `LogAnalysis` schema (`severity`, `likely_cause`, `suggested_fix`, `confidence`) via Pydantic instead of free text.
 * [x] **Day 3: FastAPI wrapper** — expose the analyzer as a `POST /analyze-log` endpoint with typed request/response models and mapped upstream error handling (502/503/504).
+* [x] **Day 4: Containerization** — multi-stage Dockerfile (non-root user, slim runtime), `docker compose` for local runs, and a `/health` endpoint wired to a container healthcheck.
 * [ ] **Service Build:** Log Analyzer — add `/metrics` (token cost, latency, error rate) and a golden-set eval harness.
 
 ### Future Phases
