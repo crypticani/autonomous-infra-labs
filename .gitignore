@@ -217,5 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-docs/
+# Generated artifacts (docs are tracked; build output and exported PDFs are not)
+docs/_build/
 *.pdf

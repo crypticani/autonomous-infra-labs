@@ -8,7 +8,7 @@ Each service here started as a learning exercise, but is built to a standard whe
 
 | Service | What it does | Status |
 |---|---|---|
-| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Currently CLI scripts; FastAPI wrapper next | In progress |
+| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Exposed as a FastAPI `/analyze-log` endpoint; `/metrics` and eval harness next | In progress |
 | [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data | Planned |
 | [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | Planned |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, tfsec/Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings. Proposes fixes as diffs — never auto-applies them | Planned |
@@ -46,27 +46,74 @@ Python · FastAPI · Ollama / Gemini API (pluggable) · Pydantic · Rich · Chro
 
 ## Getting started
 
-Each service is self-contained and will include its own setup instructions as it's built. Global prerequisites:
+Each service is self-contained and will include its own setup instructions as it's built. Global prerequisites: Python 3.10+, and Docker + kind/minikube once you reach the K8s labs.
+
+### 1. Clone and install
 
 ```bash
 git clone https://github.com/crypticani/autonomous-infra-labs.git
 cd autonomous-infra-labs
 
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+```
 
-# configure the LLM provider (Ollama by default, or Gemini)
+### 2. Pick an LLM provider
+
+The log analyzer runs against **Ollama** (local, default) or **Gemini** (cloud). Configure via `.env`:
+
+```bash
 cp .env.example .env
-# then edit .env: set LLM_PROVIDER, and GEMINI_API_KEY if using Gemini
+```
 
-# local K8s sandbox
+**Option A — Ollama (default, runs locally, no API key).**
+
+```bash
+# install (Linux/macOS); see https://ollama.com/download for other platforms
+curl -fsSL https://ollama.com/install.sh | sh
+
+# pull the model referenced in .env (OLLAMA_MODEL)
+ollama pull qwen2.5-coder:7b
+
+# start the server (listens on http://localhost:11434)
+ollama serve
+```
+
+Leave `LLM_PROVIDER=ollama` in `.env`. `OLLAMA_MODEL` must match a model you've pulled, and `OLLAMA_BASE_URL` defaults to `http://localhost:11434`. Smaller machines can use a lighter model, e.g. `ollama pull qwen2.5-coder:1.5b` and set `OLLAMA_MODEL=qwen2.5-coder:1.5b`.
+
+**Option B — Gemini (cloud).** Set `LLM_PROVIDER=gemini` and `GEMINI_API_KEY=<your key>` in `.env` (get a key from https://aistudio.google.com/apikey). `GEMINI_MODEL` selects the model.
+
+> `.env` is gitignored — never commit real API keys.
+
+### 3. (Optional) Local K8s sandbox — needed for later phases
+
+```bash
 kind create cluster   # or: minikube start
 ```
 
-Run the log analyzer (current entrypoint):
+### Run the log analyzer
+
+The service is a FastAPI app. Start it (listens on port `7000`):
 
 ```bash
-python services/log-analyzer/day2_analyzer.py
+python services/log-analyzer/day3_analyzer.py
 ```
+
+Then POST a raw log to `/analyze-log`:
+
+```bash
+curl -s http://localhost:7000/analyze-log \
+  -H "Content-Type: application/json" \
+  -d '{"raw_log": "2026-07-29 09:12:03 ERROR OOMKilled: container api exceeded memory limit 512Mi, restarted 4 times"}'
+```
+
+Response is strict, validated JSON:
+
+```json
+{"severity": "HIGH", "likely_cause": "...", "suggested_fix": "...", "confidence": 0.9}
+```
+
+Interactive API docs are available at `http://localhost:7000/docs`. The earlier `day1_analyzer.py` / `day2_analyzer.py` are standalone CLI scripts kept for reference.
 
 ## Roadmap & Challenge Log
 
@@ -78,7 +125,8 @@ This repository follows a scaffolded 30-day learning path.
 * **Learn:** How LLMs actually work for engineers (tokens, context window, temperature, system vs. user prompts, function/tool calling).
 * **Build:** A script that sends a raw error log to an LLM and prints back a plain-English explanation — with a pluggable provider (Ollama / Gemini) behind one interface.
 * [x] **Day 2: Strict typed output** — enforce a validated `LogAnalysis` schema (`severity`, `likely_cause`, `suggested_fix`, `confidence`) via Pydantic instead of free text.
-* [ ] **Service Build:** Log Analyzer — wrap the CLI in FastAPI with `/metrics` and a golden-set eval harness.
+* [x] **Day 3: FastAPI wrapper** — expose the analyzer as a `POST /analyze-log` endpoint with typed request/response models and mapped upstream error handling (502/503/504).
+* [ ] **Service Build:** Log Analyzer — add `/metrics` (token cost, latency, error rate) and a golden-set eval harness.
 
 ### Future Phases
 
