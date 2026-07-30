@@ -8,7 +8,7 @@ Each service here started as a learning exercise, but is built to a standard whe
 
 | Service | What it does | Status |
 |---|---|---|
-| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Exposed as a containerized FastAPI service with `/analyze-log` and `/health` endpoints; `/metrics` and eval harness next | In progress |
+| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Exposed as a containerized FastAPI service with `/analyze-log`, `/health`, and Prometheus `/metrics` endpoints; golden-set eval harness next | In progress |
 | [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data | Planned |
 | [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | Planned |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, tfsec/Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings. Proposes fixes as diffs — never auto-applies them | Planned |
@@ -98,7 +98,7 @@ The service is a FastAPI app that listens on port `7000`. Run it directly, or in
 **Option A — run directly:**
 
 ```bash
-python services/log-analyzer/day4_analyzer.py
+python services/log-analyzer/day5_analyzer.py
 ```
 
 **Option B — run with Docker (multi-stage build, non-root user):**
@@ -123,7 +123,7 @@ Response is strict, validated JSON:
 {"severity": "HIGH", "likely_cause": "...", "suggested_fix": "...", "confidence": 0.9}
 ```
 
-Interactive API docs are at `http://localhost:7000/docs`, and a liveness/readiness probe at `http://localhost:7000/health` (returns `503` if the configured provider is misconfigured). The earlier `day1_analyzer.py` / `day2_analyzer.py` are standalone CLI scripts kept for reference.
+Interactive API docs are at `http://localhost:7000/docs`, and a liveness/readiness probe at `http://localhost:7000/health` — it reports `status: degraded` with the underlying issue when the configured provider is misconfigured or unreachable (e.g. Ollama down). Prometheus metrics (request count, latency, token usage by provider) are exposed at `http://localhost:7000/metrics`. The earlier `day1_analyzer.py` / `day2_analyzer.py` are standalone CLI scripts kept for reference.
 
 ## Roadmap & Challenge Log
 
@@ -137,7 +137,8 @@ This repository follows a scaffolded 30-day learning path.
 * [x] **Day 2: Strict typed output** — enforce a validated `LogAnalysis` schema (`severity`, `likely_cause`, `suggested_fix`, `confidence`) via Pydantic instead of free text.
 * [x] **Day 3: FastAPI wrapper** — expose the analyzer as a `POST /analyze-log` endpoint with typed request/response models and mapped upstream error handling (502/503/504).
 * [x] **Day 4: Containerization** — multi-stage Dockerfile (non-root user, slim runtime), `docker compose` for local runs, and a `/health` endpoint wired to a container healthcheck.
-* [ ] **Service Build:** Log Analyzer — add `/metrics` (token cost, latency, error rate) and a golden-set eval harness.
+* [x] **Day 5: Observability** — Prometheus `/metrics` (request count, latency, token usage by provider) and a health check that actively probes the provider.
+* [ ] **Service Build:** Log Analyzer — golden-set eval harness so behavior is regression-tested.
 
 ### Future Phases
 
