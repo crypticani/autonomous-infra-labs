@@ -7,7 +7,7 @@ services:
     container_name: log-analyzer
     env_file:
       - .env
-    command: ["uvicorn", "day4_analyzer:app", "--host", "0.0.0.0", "--port", "${PORT:-7000}"]
+    command: ["uvicorn", "day5_analyzer:app", "--host", "0.0.0.0", "--port", "${PORT:-7000}"]
     ports:
       - "${PORT:-7000}:${PORT:-7000}"
     extra_hosts:
