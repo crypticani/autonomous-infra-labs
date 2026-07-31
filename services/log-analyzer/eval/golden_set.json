@@ -1,0 +1,32 @@
+[
+    {
+        "id": "TC-001",
+        "description": "Transient network timeout that successfully retried. Should be LOW severity.",
+        "raw_log": "2026-07-31 09:12:01 [WARN] payment-gateway - Connection timeout to upstream banking API. Retrying 1/3...\n2026-07-31 09:12:03 [INFO] payment-gateway - Connection established on retry 2/3. Transaction 99482 processed successfully.",
+        "expected_severity": "LOW"
+    },
+    {
+        "id": "TC-002",
+        "description": "High memory warning, but no crash. Should be MEDIUM severity.",
+        "raw_log": "2026-07-31 09:25:44 [WARN] inventory-service - JVM memory utilization at 88% (880MB/1024MB). GC pause time 450ms.",
+        "expected_severity": "MEDIUM"
+    },
+    {
+        "id": "TC-003",
+        "description": "Standard single-pod crash due to memory limit. Should be HIGH severity.",
+        "raw_log": "CrashLoopBackOff: OOMKilled, exit code 137, restart count 5. Limits: memory 256Mi. Requests: memory 128Mi.",
+        "expected_severity": "HIGH"
+    },
+    {
+        "id": "TC-004",
+        "description": "known gap: system prompt currently lacks an explicit severity rubric and has previously under-called this as HIGH instead of CRITICAL.",
+        "raw_log": "2026-07-31 09:30:12 [FATAL] db-pool-manager - Exhausted connection pool. 0 available connections.\n2026-07-31 09:30:13 [ERROR] auth-service - Failed to authenticate user: db connection timeout.\n2026-07-31 09:30:14 [ERROR] checkout-service - Cart validation failed: auth-service unreachable.",
+        "expected_severity": "CRITICAL"
+    },
+    {
+        "id": "TC-005",
+        "description": "Total node failure causing pod eviction. Should be CRITICAL severity.",
+        "raw_log": "Node k8s-worker-03 status changed to NotReady. StoragePressure detected. Evicting 14 pods across default and kube-system namespaces.",
+        "expected_severity": "CRITICAL"
+    }
+]
