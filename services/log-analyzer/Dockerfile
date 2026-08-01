@@ -33,7 +33,7 @@ RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
 
 COPY --from=builder /opt/venv /opt/venv
 
-COPY ./services/log-analyzer .
+COPY . .
 
 RUN chown -R appuser:appgroup /app
 

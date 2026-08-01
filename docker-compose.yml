@@ -1,8 +1,8 @@
 services:
   log-analyzer:
     build:
-      context: .
-      dockerfile: ./services/log-analyzer/Dockerfile
+      context: ./services/log-analyzer
+      dockerfile: Dockerfile
     image: log-analyzer:latest
     container_name: log-analyzer
     env_file:
