@@ -200,3 +200,43 @@ type, total tokens).
 
 > Token panels only populate on **real** provider calls — mocked test traffic never hits the
 > token-counting path, so drive live Ollama/Gemini requests to see them move.
+
+## Operations / hardening
+
+A live instance runs publicly behind an nginx reverse proxy (TLS via Let's Encrypt), backed by a
+self-hosted Ollama running `qwen2.5-coder:3b`. Notes on how it's exposed and defended — this is a
+sandbox/demo deployment on a personal domain, not production infra.
+
+### Public surface
+
+| Path | Exposure | Control |
+|---|---|---|
+| `/analyze-log` | public | **rate-limited** at nginx (see below) + `client_max_body_size` |
+| `/health` | public | none (cheap, provider-probing liveness) |
+| `/metrics` | **blocked publicly** (`return 403`) | scraped by Prometheus over the **private** network only |
+| `/docs`, `/openapi.json` | public | left open intentionally for the demo |
+
+### Rate limiting
+
+nginx `limit_req` on the proxied location, keyed on client IP:
+
+```nginx
+# http context
+limit_req_zone $binary_remote_addr zone=analyze:10m rate=10r/m;
+# location
+limit_req zone=analyze burst=5 nodelay;
+```
+
+Verified: under a sustained burst the token bucket drains and excess requests are rejected
+(~31/40 on a back-to-back flood). Rejections currently return nginx's default **`503`** — add
+`limit_req_status 429;` for proper "Too Many Requests" semantics.
+
+### Latency reality
+
+`qwen2.5-coder:3b` on the host answers a real `/analyze-log` call in **~50s** — so nginx uses a
+generous `proxy_read_timeout 120s`, above the app's 60s Ollama client timeout. Because inference
+is slow and served by a **single** model instance, arrival-rate limiting alone doesn't prevent a
+backlog; the natural next step is a **concurrency cap** (`limit_conn`, e.g. 2 in-flight per client)
+and/or a smaller/quantized model to bring the p95 down. The endpoint is currently unauthenticated —
+acceptable while Ollama has no per-token cost, but add an API key before switching to a paid
+provider, since a public unauthenticated endpoint on a cloud model is a direct bill-drain vector.
