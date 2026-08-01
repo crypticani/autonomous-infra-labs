@@ -1,0 +1,175 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Select your existing Prometheus datasource on import.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" },
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0" }
+  ],
+  "id": null,
+  "uid": "log-analyzer-overview",
+  "title": "Log Analyzer — Cost, Latency & Volume",
+  "tags": ["log-analyzer", "llm"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)"
+      }
+    ]
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "provider",
+        "label": "Provider",
+        "type": "query",
+        "datasource": "${DS_PROMETHEUS}",
+        "query": "label_values(llm_requests_total, provider)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Request rate by status (req/s)",
+      "description": "Volume + outcome. A rising 5xx line is the first sign the upstream model is failing.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (status) (rate(llm_requests_total{provider=~\"$provider\"}[5m]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Error rate (%)",
+      "description": "Share of non-200 responses over the last 5m.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 5 },
+              { "color": "red", "value": 20 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "area" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * sum(rate(llm_requests_total{status!=\"200\",provider=~\"$provider\"}[5m])) / clamp_min(sum(rate(llm_requests_total{provider=~\"$provider\"}[5m])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Latency percentiles (s)",
+      "description": "p50/p95/p99 derived from the llm_request_duration_seconds histogram buckets.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(llm_request_duration_seconds_bucket{provider=~\"$provider\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(llm_request_duration_seconds_bucket{provider=~\"$provider\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(llm_request_duration_seconds_bucket{provider=~\"$provider\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Avg latency (s)",
+      "description": "rate(sum)/rate(count) — mean request duration over 5m.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum(rate(llm_request_duration_seconds_sum{provider=~\"$provider\"}[5m])) / clamp_min(sum(rate(llm_request_duration_seconds_count{provider=~\"$provider\"}[5m])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Token throughput by type (tokens/s)",
+      "description": "Prompt vs. completion token rate — the cost driver.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (token_type) (rate(llm_tokens_total{provider=~\"$provider\"}[5m]))",
+          "legendFormat": "{{token_type}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Total tokens consumed",
+      "description": "Cumulative tokens since process start (resets on restart).",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value" },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum(llm_tokens_total{provider=~\"$provider\"})"
+        }
+      ]
+    }
+  ]
+}

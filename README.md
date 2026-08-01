@@ -8,7 +8,7 @@ Each service here started as a learning exercise, but is built to a standard whe
 
 | Service | What it does | Status |
 |---|---|---|
-| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Exposed as a containerized FastAPI service with `/analyze-log`, `/health`, and Prometheus `/metrics` endpoints; golden-set eval harness next | In progress |
+| [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Containerized FastAPI service with `/analyze-log`, `/health`, and Prometheus `/metrics`; golden-set eval harness, mocked-provider tests, CI, and K8s manifests | ✅ Complete |
 | [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data | Planned |
 | [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | Planned |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, tfsec/Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings. Proposes fixes as diffs — never auto-applies them | Planned |
@@ -138,7 +138,9 @@ This repository follows a scaffolded 30-day learning path.
 * [x] **Day 3: FastAPI wrapper** — expose the analyzer as a `POST /analyze-log` endpoint with typed request/response models and mapped upstream error handling (502/503/504).
 * [x] **Day 4: Containerization** — multi-stage Dockerfile (non-root user, slim runtime), `docker compose` for local runs, and a `/health` endpoint wired to a container healthcheck.
 * [x] **Day 5: Observability** — Prometheus `/metrics` (request count, latency, token usage by provider) and a health check that actively probes the provider.
-* [ ] **Service Build:** Log Analyzer — golden-set eval harness so behavior is regression-tested.
+* [x] **Day 6: Testing & CI** — pytest schema tests + endpoint tests that mock the provider (CI never hits a paid API), and a GitHub Actions pipeline: lint → test → validate manifests → build/push.
+* [x] **Day 7: Deploy & document** — Kubernetes manifests (`Deployment`, `Service`, `ConfigMap` + manually-created `Secret`) with `/health` probes and non-root hardening, plus a service README covering architecture and the golden-set finding.
+* [x] **Service Build:** Log Analyzer — golden-set eval harness (imports the live `ANALYSIS_SYSTEM_PROMPT`) that caught the smaller local model under-calling severity; fixed with an explicit severity rubric. **Project 1 complete.**
 
 ### Future Phases
 
