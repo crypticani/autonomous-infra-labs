@@ -35,9 +35,23 @@ jobs:
       - name: Run Tests
         working-directory: services/log-analyzer
         run: python -m pytest tests/ -q
+    
+  validate-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.4.0/kubeconform-linux-amd64.tar.gz \
+            | tar xz kubeconform && sudo mv kubeconform /usr/local/bin/
+      
+      - name: Validate Kubernetes Manifests
+        run: kubeconform -strict -summary services/log-analyzer/k8s/
       
   build-and-push:
-    needs: lint-and-test
+    needs: [lint-and-test, validate-manifests]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -55,4 +69,4 @@ jobs:
         with:
           context: ./services/log-analyzer
           push: true
-          tags: ghcr.io/${{ github.repository }}/log-analyzer:${{ github.sha }}
+          tags: ghcr.io/${{ github.repository }}/log-analyzer:latest

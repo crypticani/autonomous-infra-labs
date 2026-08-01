@@ -15,7 +15,7 @@ spec:
         app: log-analyzer
     spec:
       securityContext:
-        runAsNon-root: true
+        runAsNonRoot: true
         seccompProfile:
           type: RuntimeDefault
       containers:
