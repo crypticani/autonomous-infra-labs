@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: log-analyzer-config
+  labels:
+    app: log-analyzer
+data:
+  LLM_PROVIDER: "ollama"
+  OLLAMA_BASE_URL: "http://100.94.177.43:11434"
+  OLLAMA_MODEL: "qwen2.5-coder:3b"
+  GEMINI_MODEL: "gemini-3.6-flash"
+  LOG_LEVEL: "INFO"

@@ -34,7 +34,7 @@ jobs:
       
       - name: Run Tests
         working-directory: services/log-analyzer
-        run: pytest tests/ -q
+        run: python -m pytest tests/ -q
       
   build-and-push:
     needs: lint-and-test
