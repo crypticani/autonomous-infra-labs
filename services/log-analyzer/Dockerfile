@@ -41,4 +41,4 @@ USER appuser
 
 EXPOSE 7000
 
-CMD ["uvicorn", "day4_analyzer:app", "--host", "0.0.0.0", "--port", "7000"]
+CMD ["uvicorn", "log_analyzer:app", "--host", "0.0.0.0", "--port", "7000"]

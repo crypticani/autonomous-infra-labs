@@ -10,7 +10,13 @@ from rich.table import Table
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 try:
-    from log_analyzer import ANALYSIS_SYSTEM_PROMPT, provider_type
+    from log_analyzer import (
+        ANALYSIS_SYSTEM_PROMPT,
+        provider_type,
+        BaseLLMProvider,
+        OllamaProvider,
+        GeminiProvider,
+    )
 except ImportError as e:
     print(
         f"Failed to import providers. Ensure this script is run from inside the log analyzer directory: {e}"
@@ -20,16 +26,6 @@ except ImportError as e:
 logging.basicConfig(level=logging.ERROR)
 logger = logging.getLogger(__name__)
 console = Console()
-
-
-EVAL_SYSTEM_PROMPT = (
-    "You are a Senior DevOps Engineer with expertise in analyzing error logs. "
-    "Analyze the following log.\n"
-    "1. Identity the root cause of the failure.\n"
-    "2. Explain it in concise, plain English.\n"
-    "3. Suggest one concrete remediation step.\n"
-    "Do not hallucinate or invent metrics not present in the log"
-)
 
 
 def load_cases(filepath: str) -> List[Dict[str, Any]]:
@@ -48,7 +44,7 @@ def run_case(provider: BaseLLMProvider, case: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         analysis = provider.generate(
-            system_prompt=EVAL_SYSTEM_PROMPT,
+            system_prompt=ANALYSIS_SYSTEM_PROMPT,
             user_prompt=f"RAW LOG:\n{raw_log}",
             temperature=0.0,
         )

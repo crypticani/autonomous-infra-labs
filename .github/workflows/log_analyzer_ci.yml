@@ -20,18 +20,21 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.12'
+          python-version: '3.14'
       
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r services/log-analyzer/requirements.txt
-          pip install pytest black httpx
+          pip install pytest httpx
       
       - name: Run Linting
         run: |
           black --check services/log-analyzer
-          flake8 services/log-analyzer
+      
+      - name: Run Tests
+        working-directory: services/log-analyzer
+        run: pytest tests/ -q
       
   build-and-push:
     needs: lint-and-test

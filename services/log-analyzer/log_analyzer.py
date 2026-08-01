@@ -102,7 +102,16 @@ class OllamaProvider(BaseLLMProvider):
             logger.info("Sending request to Ollama API")
             response = requests.post(url, json=payload, timeout=60)
             response.raise_for_status()
-            raw_text = response.json().get("response", "")
+            body = response.json()
+            raw_text = body.get("response", "")
+
+            LLM_TOKENS_TOTAL.labels(provider="ollama", token_type="prompt").inc(
+                body.get("prompt_eval_count", 0)
+            )
+
+            LLM_TOKENS_TOTAL.labels(provider="ollama", token_type="completion").inc(
+                body.get("eval_count", 0)
+            )
 
             try:
                 parsed_json = json.loads(raw_text)
@@ -151,6 +160,14 @@ class GeminiProvider(BaseLLMProvider):
                 },
             )
             raw_text = response.text
+            usage = response.usage_metadata
+            if usage:
+                LLM_TOKENS_TOTAL.labels(provider="gemini", token_type="prompt").inc(
+                    usage.prompt_token_count or 0
+                )
+                LLM_TOKENS_TOTAL.labels(provider="gemini", token_type="completion").inc(
+                    usage.candidates_token_count or 0
+                )
 
             try:
                 parsed_json = json.loads(raw_text)
@@ -167,8 +184,6 @@ class GeminiProvider(BaseLLMProvider):
 
         except genai_errors.APIError as e:
             logger.exception(f"Failed to generate response from Gemini API: {e}")
-            raise
-        except (json.JSONDecodeError, ValidationError):
             raise
 
 
@@ -207,7 +222,7 @@ def health_check():
             details.append("GEMINI_API_KEY missing from environment")
         model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
     elif provider_type == "ollama":
-        model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+        model = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
         base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         try:
             r = requests.get(f"{base_url}/api/tags", timeout=2)
@@ -245,35 +260,36 @@ def analyze_log_endpoint(request: LogRequest):
     logger.info("Received /analyze-log request")
 
     try:
-        analysis = llm_provider.generate(
-            system_prompt=ANALYSIS_SYSTEM_PROMPT,
-            user_prompt=f"RAW LOG:\n{request.raw_log}",
-            temperature=0.1,
-        )
+        with LLM_REQUEST_DURATION_SECONDS.labels(provider=provider_type).time():
+            analysis = llm_provider.generate(
+                system_prompt=ANALYSIS_SYSTEM_PROMPT,
+                user_prompt=f"RAW LOG:\n{request.raw_log}",
+                temperature=0.1,
+            )
         LLM_REQUESTS_TOTAL.labels(provider=provider_type, status="200").inc()
         return analysis
 
     except ValueError as e:
-        logger.exception(f"Data constraint failure: {e}")
+        logger.warning(f"Mapping upstream data error to 502: {e}")
         LLM_REQUESTS_TOTAL.labels(provider=provider_type, status="502").inc()
         raise HTTPException(
             status_code=502,
             detail="Bad Gateway: Upstream AI returned malformed or invalid data.",
         )
     except requests.exceptions.Timeout as e:
-        logger.exception(f"Upstream timeout: {e}")
-        LLM_REQUESTS_TOTAL.labels(provider=provider_type, status="503").inc()
+        logger.warning(f"Upstream timeout: {e}")
+        LLM_REQUESTS_TOTAL.labels(provider=provider_type, status="504").inc()
         raise HTTPException(
             status_code=504, detail="Gateway Timeout. Upstream AI took long to respond."
         )
     except requests.exceptions.RequestException as e:
-        logger.exception(f"Upstream connection error: {e}")
+        logger.warning(f"Upstream connection error: {e}")
         LLM_REQUESTS_TOTAL.labels(provider=provider_type, status="502").inc()
         raise HTTPException(
             status_code=503, detail="Service Unavailable: Upstream AI is unreachable."
         )
     except genai_errors.APIError as e:
-        logger.exception(f"Gemini API error: {e}")
+        logger.warning(f"Gemini API error: {e}")
         raise HTTPException(
             status_code=502, detail="Bad Gateway: Upstream AI API encountered an error."
         )

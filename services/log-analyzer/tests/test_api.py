@@ -11,7 +11,10 @@ client = TestClient(app)
 def test_analyze_log_success(monkeypatch):
     mock_generate = MagicMock(
         return_value=LogAnalysis(
-            severity="MEDIUM", likely_cause="Mocked timeout", confidence=0.9
+            severity="MEDIUM",
+            likely_cause="Mocked timeout",
+            suggested_fix="Increase timeout value / add retry",
+            confidence=0.9,
         )
     )
     monkeypatch.setattr(llm_provider, "generate", mock_generate)
