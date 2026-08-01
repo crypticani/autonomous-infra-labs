@@ -42,9 +42,10 @@
         "type": "query",
         "datasource": "${DS_PROMETHEUS}",
         "query": "label_values(llm_requests_total, provider)",
-        "refresh": 2,
+        "refresh": 1,
         "includeAll": true,
         "multi": true,
+        "allValue": ".*",
         "current": { "text": "All", "value": "$__all" }
       }
     ]
