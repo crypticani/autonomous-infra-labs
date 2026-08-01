@@ -10,7 +10,7 @@ from rich.table import Table
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 try:
-    from day5_analyzer import GeminiProvider, OllamaProvider, BaseLLMProvider
+    from log_analyzer import ANALYSIS_SYSTEM_PROMPT, provider_type
 except ImportError as e:
     print(f"Failed to import providers. Ensure this script is run from inside the log analyzer directory: {e}")
     sys.exit(1)
@@ -72,6 +72,7 @@ def run_case(provider: BaseLLMProvider, case: Dict[str, Any]) -> Dict[str, Any]:
 
 def print_report(results: List[Dict[str, Any]]) -> bool:
     """Renders the Rich table and returns True if all passed, False otherwise."""
+    print(f"\n=== EVALUATION REPORT (Provider: {provider_type.upper()}) ===")
     table = Table(title="Golden Set Regression Evaluation")
     table.add_column("ID", style="cyan", no_wrap=True)
     table.add_column("Expected", style="cyan")
@@ -113,8 +114,8 @@ def print_report(results: List[Dict[str, Any]]) -> bool:
             console.print(f"[cyan]{r['case']['id']} Error:[/cyan] Cause: {r['result']['likely_cause']}")
             console.print(f"    Fix:  {r['result']['suggested_fix']}")
 
-        console.print(f"\n[bold]Summary: {passed_count}/{total} passed.[/bold]")
-        return passed_count == total
+    console.print(f"\n[bold]Summary: {passed_count}/{total} passed.[/bold]")
+    return passed_count == total
 
 
 if __name__ == "__main__":
