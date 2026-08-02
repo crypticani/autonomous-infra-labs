@@ -1,0 +1,7 @@
+chromadb==1.5.9
+google-genai==2.14.0
+python-dotenv==1.2.2
+requests==2.34.2
+rich==15.0.0
+pytest==9.1.1
+black==26.5.1

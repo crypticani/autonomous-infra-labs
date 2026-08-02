@@ -1,0 +1,22 @@
+[
+    {
+        "question": "pods keep dying and restarting right after a deploy, exit code 137",
+        "expected_source": "oomkilled-pod.md"
+    },
+    {
+        "question": "app cant reach the database, getting too many clients already",
+        "expected_source": "postgres-conn-pool-exhaustion.md"
+    },
+    {
+        "question": "browser says the site is not secure, expired certificate warning",
+        "expected_source": "tls-cert-expiry.md"
+    },
+    {
+        "question": "services cant resolve each other by name inside the cluster",
+        "expected_source": "coredns-resolution-failure.md"
+    },
+    {
+        "question": "builds are queued forever, no executors picking up jobs",
+        "expected_source": "jenkins-agent-offline.md"
+    }
+]

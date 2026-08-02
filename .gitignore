@@ -220,3 +220,8 @@ __marimo__/
 # Generated artifacts (docs are tracked; build output and exported PDFs are not)
 docs/_build/
 *.pdf
+
+# Chroma persistent index — rebuildable from corpus/, never committed.
+# Unanchored (**/) on purpose: a relative CHROMA_PATH resolves against the shell's
+# cwd, so the index can land at a nested path an anchored rule would miss.
+**/chroma_data/

@@ -6,6 +6,11 @@ by a pluggable LLM provider (local Ollama or cloud Gemini) behind one interface.
 
 This is **Project 1 (Week 1)** of the [30-day AI-Native DevOps challenge](../../docs/ai-devops-30-day-challenge.md) — complete.
 
+> Building your first LLM-backed service? [**docs/log-analyzer.md**](../../docs/log-analyzer.md)
+> explains the concepts from the ground up — tokens, temperature, structured output, testing a
+> non-deterministic system — and walks through what every part of the code is doing and why.
+> This README is the *what and how much*; that one is the *why*.
+
 ## Architecture
 
 ```text

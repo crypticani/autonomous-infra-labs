@@ -9,10 +9,21 @@ Each service here started as a learning exercise, but is built to a standard whe
 | Service | What it does | Status |
 |---|---|---|
 | [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Containerized FastAPI service with `/analyze-log`, `/health`, and Prometheus `/metrics`; golden-set eval harness, mocked-provider tests, CI, and K8s manifests | ✅ Complete |
-| [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data | Planned |
+| [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data. Retrieval layer built: pluggable embedding provider (Ollama / Gemini) → hand-written chunker → Chroma in cosine space | 🚧 In progress |
 | [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | Planned |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, tfsec/Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings. Proposes fixes as diffs — never auto-applies them | Planned |
 | [`gateway`](./gateway) | Single FastAPI entrypoint tying the services above into one AI DevOps copilot | Planned |
+
+## Explainers
+
+Each service has two documents: a README covering *what was built, how to run it, and what it
+scored*, and a companion explainer covering *why it works*. The explainers assume no prior
+exposure to the AI side — they build up the concepts from scratch, then walk the code.
+
+| Doc | Covers |
+|---|---|
+| [`docs/log-analyzer.md`](./docs/log-analyzer.md) | Tokens, context windows, temperature, system vs. user prompts, constrained decoding, why `def` beats `async def` here, and how to test a non-deterministic system |
+| [`docs/knowledge-copilot.md`](./docs/knowledge-copilot.md) | Embeddings, cosine similarity, chunk size and overlap, what a vector database actually buys you, and why queries and documents are embedded differently |
 
 ## Architecture
 
@@ -142,9 +153,20 @@ This repository follows a scaffolded 30-day learning path.
 * [x] **Day 7: Deploy & document** — Kubernetes manifests (`Deployment`, `Service`, `ConfigMap` + manually-created `Secret`) with `/health` probes and non-root hardening, plus a service README covering architecture and the golden-set finding.
 * [x] **Service Build:** Log Analyzer — golden-set eval harness (imports the live `ANALYSIS_SYSTEM_PROMPT`) that caught the smaller local model under-calling severity; fixed with an explicit severity rubric. **Project 1 complete.**
 
+### Phase 2: Knowledge Copilot
+
+* [x] **Day 8: Embeddings & vector search** — a `BaseEmbeddingProvider` interface (Ollama `nomic-embed-text` / Gemini `gemini-embedding-001`, both pinned to 768 dims) with **separate document and query methods**, since both backends need to know which side of a search the text is on. Hand-written word-boundary chunker with stable `{slug}:{index}` IDs; 8 runbooks indexed into Chroma at three chunk sizes in explicitly-configured cosine space.
+* **The finding:** hit@1, hit@3 and precision@3 all came back **identical across every chunk size** — with 8 topically disjoint runbooks the retrieval task is too easy to discriminate, so the metric had no resolution left. The only signal remaining was *margin* (cosine gap between best correct and best incorrect hit), which ruled out 1024-char chunks but could not separate 256 from 512. Chunk size was chosen on downstream cost, not on this data — and the honest version of that is written up rather than a clean-looking table that the evidence doesn't support.
+* **Also worth keeping:** unrelated text scores **0.59** cosine, not 0. Absolute similarity thresholds are meaningless on this model; only per-query ranking is. And a unit test asserting the boring invariant "no word is lost in chunking" caught a real defect — the chunker snapped window *ends* to word boundaries but not *starts*, so ~85 of 109 chunks opened with a fragment. Silent, symptomless, and polluting every vector.
+* [ ] **Day 9: Ingestion pipeline** — idempotent re-indexing and metadata tagging (service, doc type, date).
+* [ ] **Day 10: `POST /ask-runbook`** — retrieve top-k, augment the prompt, cite sources.
+* [ ] **Day 11: Retrieval quality** — hybrid keyword+vector search, reranking, and an eval set with graded relevance (single-label exact match penalised a semantically correct hit on Day 8).
+* [ ] **Day 12: Live infra signals** — connector ingesting Prometheus alerts / K8s events.
+* [ ] **Day 13: Conversational interface** — Slack bot or web chat in front of the service.
+* [ ] **Day 14: Capstone polish** — auth, architecture diagram, demo recording. Project 2.
+
 ### Future Phases
 
-* [ ] **Knowledge Copilot** — RAG over runbooks, postmortems, and live infra signals.
 * [ ] **Self-Healing Agent** — diagnose-and-propose remediation for K8s issues, with approval gating.
 * [ ] **Security Triage** — AI-triaged output from existing security scanners.
 * [ ] **Gateway** — unified entrypoint across all four services.
