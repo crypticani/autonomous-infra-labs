@@ -328,7 +328,7 @@ pieces that still contribute to the vector. Pure noise.
 chunk[1]:  "rd33 word34 word35 ..."     ← should be "word33 word34 ..."
 ```
 
-No crash, no error, no visible symptom — just a garbage token leading roughly 85 of 109 chunks,
+No crash, no error, no visible symptom — just a garbage token leading 63 of the 107 chunks,
 polluting every vector. Snapping *backwards* rather than forwards is intentional: it can only
 widen the overlap, never drop text between chunks.
 

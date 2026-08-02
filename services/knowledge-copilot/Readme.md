@@ -215,7 +215,8 @@ disjoint wording is unproven.
 `test_every_word_survives_chunking` failed on the first run. `chunk_text` snapped the window
 *end* back to a word boundary but not the *start*, so every chunk after the first opened with a
 fragment — `rd64` instead of `word64`. No crash, no error, no visible symptom: just a garbage
-token leading ~85 of 109 chunks at 256/32, quietly polluting every vector. Caught only because
+token leading 63 of the 107 chunks it produced at 256/32, quietly polluting every vector. (The
+fixed chunker produces 109.) Caught only because
 a test asserted the boring invariant that no word is lost. That test earned its keep before the
 service had a single user.
 
