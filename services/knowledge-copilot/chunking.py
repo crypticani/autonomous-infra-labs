@@ -18,7 +18,7 @@ class Document:
 class Chunk:
     id: str
     text: str
-    metadata: dict[str, str]
+    metadata: dict[str, str | int]
 
 
 def parse_front_matter(raw: str) -> tuple[dict[str, str], str]:

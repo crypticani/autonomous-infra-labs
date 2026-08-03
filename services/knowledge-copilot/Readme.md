@@ -183,19 +183,34 @@ switching providers requires `--reset`.
 python ingest.py --dry-run                                    # preview the plan, change nothing
 python ingest.py                                              # apply
 python ingest.py --reset                                      # full rebuild (to switch provider)
+python ingest.py --corpus ../../docs                          # any directory of markdown
 python ingest.py --query "pods dying after deploy" --where doc_type=runbook
 ```
+
+`--reset` and `--dry-run` are refused together, by `argparse` at the CLI edge and by a
+`ValueError` inside `ingest()` for callers that skip the CLI. They are contradictory: `--reset`
+drops the collection, and a dry run is defined by changing nothing. The first version put the
+drop *above* the dry-run return, so `--reset --dry-run` printed a plan and silently wiped the
+index — a flag whose entire contract is "safe to run" was the destructive one. Both guards
+exist because Day 10's endpoint will import `ingest()` directly and never touch `argparse`.
+
+`--corpus` points the pipeline at any directory of front-mattered markdown; it defaults to
+`./corpus`. That is what makes the script *reusable* rather than merely re-runnable, and it is
+also what lets the tests drive the whole pipeline against a `tmp_path` corpus.
 
 Every chunk carries `title, service, doc_type, last_reviewed, source, chunk_index,
 content_hash, indexed_at`. `--where key=value` (repeatable) filters retrieval on any of them —
 same query, `--where doc_type=postmortem` vs `--where doc_type=runbook`, returns different top
-hits. `search()` here is deliberately thin; Day 10's `POST /ask-runbook` builds the real
-retrieval path (embed query → filter → rank → cite) on the same shape.
+hits. Digit-only values are coerced to `int`, so `--where chunk_index=0` matches the integer
+Chroma actually stored rather than the string `"0"`, which would match nothing. `search()` here
+is deliberately thin; Day 10's `POST /ask-runbook` builds the real retrieval path (embed query →
+filter → rank → cite) on the same shape.
 
-The idempotency guarantee lives in `tests/test_ingest.py` — offline tests over
-`plan_reconcile` and `content_hash`: unchanged → no-op, edit → update, shrink/remove → delete,
-and that the hash flips on a body *or* front-matter change. No embedding call belongs in a unit
-test, same rule as `test_chunking.py`.
+`ingest()` takes an optional `provider` and `client`, defaulting to the configured ones. That
+one seam is what makes the pipeline testable offline: a fake provider that counts vectors and a
+throwaway Chroma path prove the guarantees end to end without a network call. Without it, the
+only untested surface was `ingest()` itself — which is precisely where the `--reset --dry-run`
+bug lived.
 
 ## Testing
 
@@ -206,9 +221,26 @@ python -m pytest tests/ -q
 Both test files are offline and deterministic — no embedding call belongs in a unit test.
 `tests/test_chunking.py` covers chunk size bounds, that overlap actually carries text forward,
 that no word is lost, ID stability across runs, and front matter parsing with and without a
-header. `tests/test_ingest.py` covers the reconcile logic — new → add, unchanged → no-op,
-edit → update, shrink/remove → delete — and that `content_hash` flips on a body *or*
-front-matter change.
+header.
+
+`tests/test_ingest.py` works at two levels. The pure layer covers `plan_reconcile` — new → add,
+unchanged → no-op, edit → update, shrink/remove → delete — and that `content_hash` flips on a
+body *or* front-matter change. The pipeline layer runs `ingest()` itself against a `tmp_path`
+corpus and a `FakeProvider` that returns hash-derived vectors and counts everything it embeds,
+which is what lets these four be asserted rather than assumed:
+
+| Test | Guarantee |
+|---|---|
+| `test_dry_run_writes_nothing` | a plan is produced, `embed_calls == 0`, collection stays empty |
+| `test_reset_is_refused_during_a_dry_run` | the contradictory combination raises, index survives |
+| `test_unchanged_rerun_embeds_nothing` | second pass is all-`unchanged`, not one vector recomputed |
+| `test_removed_doc_is_deleted_from_the_collection` | deleting a source file removes its chunks from Chroma |
+
+Still no network: the fake provider is the whole trick. One gotcha found while writing these —
+`chromadb.EphemeralClient()` is not per-call isolation. Repeated calls with identical settings
+resolve to the same in-process system, so a collection written by one test was visible to the
+next and the "re-run embeds nothing" assertion failed for the wrong reason. Each test now gets
+a `PersistentClient` on its own `tmp_path`, which cannot leak.
 
 There is no CI workflow for this service yet. The existing
 [`log_analyzer_ci.yml`](../../.github/workflows/log_analyzer_ci.yml) is path-scoped to

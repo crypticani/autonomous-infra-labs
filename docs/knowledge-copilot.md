@@ -522,6 +522,91 @@ run's `indexed_at` is attached. Two consequences, both deliberate:
   go stale. `indexed_at` is excluded from the hash for the mirror-image reason: a field that
   changes every run must never be part of the key, or nothing would ever count as unchanged.
 
+"Computed *before* `indexed_at` is attached" is load-bearing enough to be structural rather
+than a matter of statement order. `enrich()` builds a **new** `Document` with the extra fields
+instead of mutating the one it was handed:
+
+```python
+return [
+    replace(doc, metadata={**doc.metadata, "content_hash": content_hash(doc), ...})
+    for doc in docs
+]
+```
+
+`content_hash(doc)` there is unambiguously reading the *original* front matter, so the hash can
+never accidentally include its own output or a timestamp. The mutating version worked, but only
+because two lines happened to be in the right order — and it was quietly writing into a
+`@dataclass(frozen=True)`, which stops attribute rebinding but not `metadata["k"] = v`. Frozen
+that only holds if nobody reaches into the dict is not frozen; it is a comment with syntax.
+
+### A dry run that wasn't
+
+The first version of `ingest()` handled `--reset` like this:
+
+```python
+if reset:
+    client.delete_collection(name)      # ← ran unconditionally
+...
+if dry_run:
+    return plan                         # ← "change nothing" starts here
+```
+
+`--reset --dry-run` therefore printed a tidy plan and destroyed the collection on the way. The
+output said `(dry run)` while the index was already gone; the damage only surfaced on the *next*
+command, as a full re-embed of a corpus that hadn't changed.
+
+The lesson generalizes past this bug. A read-only mode is not "the write at the end is skipped"
+— it is a property of the whole call path, and every side effect above the early return has to
+be checked against it. Reset and dry-run are also simply contradictory, so the fix is to refuse
+the combination rather than order it correctly:
+
+```python
+if reset and dry_run:
+    raise ValueError("reset drops the collection; it is never a dry run")
+```
+
+The guard lives in `ingest()`, not only in `argparse`, because Day 10's endpoint will call
+`ingest()` as a library function and never see the CLI. A safety check that only exists in the
+argument parser protects the one caller that was already easiest to get right.
+
+### Making the pipeline testable at all
+
+Worth asking why that bug survived a test suite that covers reconcile logic five ways. Because
+`ingest()` built its own dependencies:
+
+```python
+provider = get_embedding_provider()          # reads env, opens a network client
+client = chromadb.PersistentClient(...)      # writes to the real index
+```
+
+Every path through it needed a live embedding backend and the production Chroma directory, so
+none of it was tested — and the untested function was the one with the bug. Accepting the
+dependencies instead of constructing them fixes that in one line each:
+
+```python
+def ingest(reset=False, dry_run=False, provider=None, client=None, corpus_dir=CORPUS_DIR):
+    provider = provider or get_embedding_provider()
+    client = client or chromadb.PersistentClient(...)
+```
+
+Defaults preserved, so every existing caller is unaffected — but a test can now pass a
+`FakeProvider` whose "embeddings" are the first four bytes of a sha256, a Chroma path under
+`tmp_path`, and a two-file corpus, and assert the guarantees directly: dry run embeds zero
+vectors, an unchanged re-run embeds zero vectors, deleting a source file removes its chunks from
+the collection. Offline, deterministic, ~2 seconds.
+
+The `FakeProvider` counting its own calls is the important part. "Re-running embeds nothing" is
+a claim about work *not* done, and you cannot observe absent work by inspecting the result — the
+index looks identical either way. You have to instrument the collaborator. That is the general
+shape for testing any cache, skip, or idempotency claim.
+
+One trap on the way there: `chromadb.EphemeralClient()` looks like the obvious in-memory choice,
+but repeated calls with identical settings resolve to the same in-process system rather than a
+fresh one. A collection written by one test was still there in the next, and
+`test_unchanged_rerun_embeds_nothing` failed because its "first" ingest found the previous
+test's data. A `PersistentClient` pointed at each test's own `tmp_path` is the isolation
+`EphemeralClient` only appears to offer.
+
 ### Metadata as a filter
 
 Every chunk now carries `service`, `doc_type`, and a date alongside `content_hash` and
@@ -529,6 +614,13 @@ Every chunk now carries `service`, `doc_type`, and a date alongside `content_has
 `--where doc_type=postmortem` and `--where doc_type=runbook` return different top hits for the
 same question. That only became meaningful once the corpus stopped being eight uniform runbooks
 — Day 9 added two postmortems and a reference doc precisely so `doc_type` is worth filtering on.
+
+Filters are typed, which is easy to miss. `chunk_index` is stored as an integer, so a `where`
+clause carrying the *string* `"0"` matches nothing at all — no error, no warning, just an empty
+result that reads exactly like "there is no such chunk". `--where key=value` arrives from the
+shell as text, so `parse_where` coerces digit-only values back to `int`. Same failure family as
+the rest of this service: the retrieval bugs that hurt are the ones that return a plausible
+answer instead of raising.
 
 ---
 
