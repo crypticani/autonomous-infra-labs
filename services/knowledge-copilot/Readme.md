@@ -9,31 +9,39 @@ This is **Project 2 (Week 2)** of the [30-day AI-Native DevOps challenge](../../
 > explains the concepts from the ground up and walks through what every part of the code is doing
 > and why. This README is the *what and how much*; that one is the *why*.
 
-**Day 8 status:** the retrieval half is standing. Text becomes vectors, vectors go into
-Chroma, and a query finds the right runbook. There is no LLM in the loop yet and no HTTP
-endpoint — Day 10 adds both. Today is about being able to defend the retrieval layer, because
-a RAG service is only ever as good as what it retrieves.
+**Status (through Day 9):** the retrieval half is standing and re-indexing is idempotent.
+Text becomes vectors, vectors go into Chroma, a query finds the right document, and `ingest.py`
+reconciles the index to the corpus on every run (add / update / delete / skip) with metadata
+filtering. There is still no LLM in the loop and no HTTP endpoint — Day 10 adds both. The work
+so far is about being able to defend the retrieval layer, because a RAG service is only ever as
+good as what it retrieves.
 
-## Architecture (as of Day 8)
+## Architecture (as of Day 9)
 
 ```text
-corpus/*.md ──▶ load_corpus() ──▶ chunk_text(size, overlap) ──▶ BaseEmbeddingProvider ──┬──▶ OllamaEmbeddingProvider  (nomic-embed-text)
- (front matter    (chunking.py)      (word-boundary windows,      (embeddings.py)        └──▶ GeminiEmbeddingProvider (gemini-embedding-001)
-  + markdown)                         stable {slug}:{i} IDs)               │
-                                                                           ▼
-                                                             Chroma collection (cosine space)
-                                                                           │
-                           query ──▶ embed_query() ─────────────────────▶ top-k + cosine distance
+corpus/*.md ──▶ load_corpus() ──▶ chunk_corpus(512, 64) ──▶ BaseEmbeddingProvider ──┬──▶ OllamaEmbeddingProvider  (nomic-embed-text)
+ (front matter    (chunking.py)     (word-boundary windows,     (embeddings.py)      └──▶ GeminiEmbeddingProvider (gemini-embedding-001)
+  + markdown)                        stable {slug}:{i} IDs)              │
+                                            │                            ▼
+                              content_hash per doc          Chroma collection (cosine space)
+                                            │                     ▲            │
+                     ingest.py: plan_reconcile(desired, existing) ┘            │
+                     add / update / delete / skip  (idempotent)               │
+                                                                              │
+                           query ──▶ embed_query() ──▶ where filter ─────────▶ top-k + cosine distance
 ```
 
-**Three modules, each with one job:**
+**Four modules, each with one job:**
 
 1. **`chunking.py`** — turns the corpus into identified, embeddable pieces. Pure functions, no
-   network, no Chroma. This is why it is the only module with real unit tests today.
+   network, no Chroma. Unit-tested.
 2. **`embeddings.py`** — the text-to-vector boundary. A `BaseEmbeddingProvider` ABC with two
    backends, mirroring the `BaseLLMProvider` Strategy pattern from the log analyzer. Nothing
    downstream knows which model produced a vector.
-3. **`day8_embeddings.py`** — today's experiment. Indexes the corpus at three chunk sizes and
+3. **`ingest.py`** (Day 9) — the durable ingestion pipeline. Reconciles the Chroma index to the
+   corpus idempotently (add / update / delete / skip via a per-doc `content_hash`) and supports
+   metadata filtering. `plan_reconcile` is a pure, unit-tested function.
+4. **`day8_embeddings.py`** — the Day 8 experiment. Indexes the corpus at three chunk sizes and
    compares retrieval across them. A dated artifact, not a service entrypoint.
 
 ## Design decisions worth defending
@@ -88,23 +96,28 @@ to the log analyzer.
 
 ## The corpus
 
-Eight runbooks in [`corpus/`](./corpus), each ~2.8–3.3k characters, with front matter
+Eleven documents in [`corpus/`](./corpus), with front matter
 (`title`, `service`, `doc_type`, `last_reviewed`) that becomes chunk metadata:
 
-| Document | `service` | Failure domain |
-|---|---|---|
-| `oomkilled-pod.md` | `platform` | Memory limit exceeded, exit code 137 |
-| `crashloopbackoff.md` | `platform` | Container exits on start; reading `--previous` logs |
-| `imagepullbackoff.md` | `platform` | Registry auth, wrong tag, rate limits |
-| `node-disk-pressure.md` | `platform` | Kubelet eviction, image cache, inode exhaustion |
-| `tls-cert-expiry.md` | `edge` | Expired ingress cert, cert-manager renewal failure |
-| `postgres-conn-pool-exhaustion.md` | `data` | `too many clients already`, idle-in-transaction |
-| `jenkins-agent-offline.md` | `ci` | Agent disconnect, workspace disk full, label mismatch |
-| `coredns-resolution-failure.md` | `platform` | In-cluster DNS, `ndots:5`, CoreDNS OOM |
+| Document | `service` | `doc_type` | Failure domain |
+|---|---|---|---|
+| `oomkilled-pod.md` | `platform` | `runbook` | Memory limit exceeded, exit code 137 |
+| `crashloopbackoff.md` | `platform` | `runbook` | Container exits on start; reading `--previous` logs |
+| `imagepullbackoff.md` | `platform` | `runbook` | Registry auth, wrong tag, rate limits |
+| `node-disk-pressure.md` | `platform` | `runbook` | Kubelet eviction, image cache, inode exhaustion |
+| `tls-cert-expiry.md` | `edge` | `runbook` | Expired ingress cert, cert-manager renewal failure |
+| `postgres-conn-pool-exhaustion.md` | `data` | `runbook` | `too many clients already`, idle-in-transaction |
+| `jenkins-agent-offline.md` | `ci` | `runbook` | Agent disconnect, workspace disk full, label mismatch |
+| `coredns-resolution-failure.md` | `platform` | `runbook` | In-cluster DNS, `ndots:5`, CoreDNS OOM |
+| `postmortem-2026-06-checkout-oom-outage.md` | `platform` | `postmortem` | Checkout OOM loop after an unbounded cache release |
+| `postmortem-2026-07-ingress-tls-expiry.md` | `edge` | `postmortem` | Silent cert-manager renewal failure, then expiry |
+| `reference-pod-resource-limits.md` | `platform` | `reference` | Requests vs limits, QoS classes, memory sizing |
 
-All eight are `doc_type: runbook` deliberately — for the Day 8 experiment the only variable
-should be chunk size. Day 9 adds postmortems and reference docs, which is when `doc_type`
-becomes worth filtering on.
+The first eight were all `doc_type: runbook` deliberately — for the Day 8 experiment the only
+variable should be chunk size. **Day 9 added the two postmortems and the reference doc**, which
+is when `doc_type` becomes worth filtering on. They also overlap existing runbook topics on
+purpose (checkout-OOM ↔ `oomkilled-pod`, TLS-expiry ↔ `tls-cert-expiry`), giving the Day 11
+eval the topically-competing documents the original disjoint set lacked.
 
 The retrieval questions in [`queries.json`](./queries.json) were written separately from the
 corpus, without rereading it. That matters: if one author phrases both, a query matches its
@@ -125,6 +138,10 @@ Requires an embedding model on the configured Ollama host:
 ollama pull nomic-embed-text     # 768-dim, ~274MB
 ```
 
+The script prints four sections: what a vector looks like and how cosine similarity separates
+related from unrelated text; index construction at each chunk size; a per-query comparison of
+top-3 hits across configs; and a hit@1 / hit@3 summary.
+
 Config comes from the repo-root `.env`:
 
 | Variable | Default | Purpose |
@@ -135,9 +152,50 @@ Config comes from the repo-root `.env`:
 | `GEMINI_EMBED_MODEL` | `gemini-embedding-001` | Pinned to 768 dims so the two are comparable |
 | `CHROMA_PATH` | `services/knowledge-copilot/chroma_data` | Persistent index; gitignored, rebuildable |
 
-The script prints four sections: what a vector looks like and how cosine similarity separates
-related from unrelated text; index construction at each chunk size; a per-query comparison of
-top-3 hits across configs; and a hit@1 / hit@3 summary.
+## Day 9 — idempotent ingestion (`ingest.py`)
+
+`day8_embeddings.py` is a dated experiment. `ingest.py` is the durable pipeline: it reconciles
+the Chroma index to `corpus/` in one pass — add new chunks, re-embed changed docs, delete
+orphaned chunks, skip unchanged ones. **Re-running it on an unchanged corpus embeds nothing.**
+
+Plain `collection.upsert` is not idempotent: it replaces rows that share an ID this run, but
+it never removes chunks that should no longer exist. Shrink a doc from 8 chunks to 5 and
+`{slug}:5..7` are orphaned; delete a doc and *all* its chunks linger — stale, still
+retrievable, and silent. Day 9 is the reconcile step that fixes that.
+
+The hook is a per-document `content_hash` (sha256 of body **+** front matter) stored on every
+chunk. Each run reads the stored hashes back and `plan_reconcile` — a pure, unit-tested
+function with no Chroma or network — sorts every chunk:
+
+```text
+id absent                    -> add
+id present, hash differs     -> update (re-embed)
+id present, hash matches     -> skip
+id in index, not in corpus   -> delete   <- the half upsert can't do
+```
+
+Production collection: `knowledge_{provider}_512_64` — renamed from the Day 8 experiment's
+`runbooks_*` because the corpus now holds runbooks, postmortems, and reference docs. The name
+encodes the provider and config, so an Ollama index can never be queried with Gemini vectors;
+switching providers requires `--reset`.
+
+```bash
+python ingest.py --dry-run                                    # preview the plan, change nothing
+python ingest.py                                              # apply
+python ingest.py --reset                                      # full rebuild (to switch provider)
+python ingest.py --query "pods dying after deploy" --where doc_type=runbook
+```
+
+Every chunk carries `title, service, doc_type, last_reviewed, source, chunk_index,
+content_hash, indexed_at`. `--where key=value` (repeatable) filters retrieval on any of them —
+same query, `--where doc_type=postmortem` vs `--where doc_type=runbook`, returns different top
+hits. `search()` here is deliberately thin; Day 10's `POST /ask-runbook` builds the real
+retrieval path (embed query → filter → rank → cite) on the same shape.
+
+The idempotency guarantee lives in `tests/test_ingest.py` — offline tests over
+`plan_reconcile` and `content_hash`: unchanged → no-op, edit → update, shrink/remove → delete,
+and that the hash flips on a body *or* front-matter change. No embedding call belongs in a unit
+test, same rule as `test_chunking.py`.
 
 ## Testing
 
@@ -145,9 +203,12 @@ top-3 hits across configs; and a hit@1 / hit@3 summary.
 python -m pytest tests/ -q
 ```
 
-`tests/test_chunking.py` is offline and deterministic — no embedding call belongs in a unit
-test. It covers chunk size bounds, that overlap actually carries text forward, that no word is
-lost, ID stability across runs, and front matter parsing with and without a header.
+Both test files are offline and deterministic — no embedding call belongs in a unit test.
+`tests/test_chunking.py` covers chunk size bounds, that overlap actually carries text forward,
+that no word is lost, ID stability across runs, and front matter parsing with and without a
+header. `tests/test_ingest.py` covers the reconcile logic — new → add, unchanged → no-op,
+edit → update, shrink/remove → delete — and that `content_hash` flips on a body *or*
+front-matter change.
 
 There is no CI workflow for this service yet. The existing
 [`log_analyzer_ci.yml`](../../.github/workflows/log_analyzer_ci.yml) is path-scoped to
@@ -227,7 +288,6 @@ builds the eval set that can settle this.
 
 | Capability | Day |
 |---|---|
-| Idempotent re-indexing, metadata tagging and filtering | 9 |
 | `POST /ask-runbook` — retrieve top-k, augment the prompt, cite sources | 10 |
 | Hybrid keyword+vector search, reranking, a real eval set | 11 |
 | Connector ingesting Prometheus alerts / K8s events | 12 |

@@ -477,6 +477,59 @@ would be wrong — most likely the task prefixes not reaching the model.
 Sections 2–4 index the corpus at three chunk sizes and compare retrieval. **hit@1** is "was the
 top result from the right document"; **hit@3** is "was it anywhere in the top three".
 
+## 2.4 `ingest.py` — why upsert alone isn't idempotent
+
+Day 8 gave chunks deterministic IDs so re-indexing *replaces* rather than *duplicates*. That
+handles two of the four cases a real re-index faces. It does nothing for the other two:
+
+- Shrink a doc from 8 chunks to 5 and IDs `{slug}:5..7` are orphaned — still in the index,
+  still retrievable, now describing text that no longer exists.
+- Delete a doc and every one of its chunks lingers forever.
+
+Orphans never raise. They surface as confident, stale hits — the worst failure a RAG store
+has, because nothing tells you it happened. This is the same shape of silent bug as the chunker
+that stopped overlapping (§2.1): no crash, just quietly worse retrieval weeks later.
+
+So idempotent re-indexing is **reconcile**, not upsert: compare the IDs the corpus *should*
+produce against the IDs the index *currently holds*, and act on the difference. `ingest.py`
+reads the stored `content_hash` of every chunk, and `plan_reconcile` sorts each into
+add / update / skip / delete:
+
+```
+id absent                    -> add
+id present, hash differs     -> update (re-embed)
+id present, hash matches     -> skip
+id in index, not in corpus   -> delete
+```
+
+The **delete** list — IDs in the index that the corpus no longer wants — is the entire point,
+and it is the one thing `collection.upsert` can never give you. `plan_reconcile` is a pure
+function: hand it the desired chunks and a `{id: hash}` map read from Chroma, get back the plan.
+No network, no clock, no Chroma — so the risky logic is fully unit-testable offline, the same
+discipline `chunking.py` follows.
+
+### The hash covers front matter, not just body
+
+`content_hash = sha256(body + front matter)`, one hash per document, computed *before* the
+run's `indexed_at` is attached. Two consequences, both deliberate:
+
+- A re-run with no edits embeds **nothing** — every hash matches, everything is skipped. On a
+  rate-limited provider like Gemini's free tier, that is the difference between a re-index
+  costing a whole quota and costing zero.
+- A metadata-only edit — bumping `last_reviewed`, say — still re-indexes, because the front
+  matter is inside the hash. Had the hash covered only the body, `plan_reconcile` (which
+  compares nothing but the hash) would judge the chunk "unchanged" and let its stored metadata
+  go stale. `indexed_at` is excluded from the hash for the mirror-image reason: a field that
+  changes every run must never be part of the key, or nothing would ever count as unchanged.
+
+### Metadata as a filter
+
+Every chunk now carries `service`, `doc_type`, and a date alongside `content_hash` and
+`indexed_at`. Chroma's `where` clause filters on any of them *before* ranking, so
+`--where doc_type=postmortem` and `--where doc_type=runbook` return different top hits for the
+same question. That only became meaningful once the corpus stopped being eight uniform runbooks
+— Day 9 added two postmortems and a reference doc precisely so `doc_type` is worth filtering on.
+
 ---
 
 # Part 3 — What the run actually showed
