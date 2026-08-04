@@ -9,14 +9,16 @@ This is **Project 2 (Week 2)** of the [30-day AI-Native DevOps challenge](../../
 > explains the concepts from the ground up and walks through what every part of the code is doing
 > and why. This README is the *what and how much*; that one is the *why*.
 
-**Status (through Day 9):** the retrieval half is standing and re-indexing is idempotent.
-Text becomes vectors, vectors go into Chroma, a query finds the right document, and `ingest.py`
-reconciles the index to the corpus on every run (add / update / delete / skip) with metadata
-filtering. There is still no LLM in the loop and no HTTP endpoint — Day 10 adds both. The work
-so far is about being able to defend the retrieval layer, because a RAG service is only ever as
-good as what it retrieves.
+**Status (through Day 10):** the service answers questions over HTTP and cites what it used.
+Text becomes vectors, vectors go into Chroma, `ingest.py` reconciles the index to the corpus on
+every run (add / update / delete / skip), and `POST /ask-runbook` retrieves the top-k chunks,
+builds a context-augmented prompt, and validates every citation the model emits against the
+chunks that were actually retrieved. When retrieval comes back weak the endpoint refuses instead
+of answering from pretraining. Retrieval *quality* — hybrid search, reranking, a real eval set —
+is Day 11; what exists now is a defensible grounding contract, because a RAG service that
+answers confidently from nothing is worse than one that says it doesn't know.
 
-## Architecture (as of Day 9)
+## Architecture (as of Day 10)
 
 ```text
 corpus/*.md ──▶ load_corpus() ──▶ chunk_corpus(512, 64) ──▶ BaseEmbeddingProvider ──┬──▶ OllamaEmbeddingProvider  (nomic-embed-text)
@@ -26,12 +28,21 @@ corpus/*.md ──▶ load_corpus() ──▶ chunk_corpus(512, 64) ──▶ Ba
                               content_hash per doc          Chroma collection (cosine space)
                                             │                     ▲            │
                      ingest.py: plan_reconcile(desired, existing) ┘            │
-                     add / update / delete / skip  (idempotent)               │
-                                                                              │
-                           query ──▶ embed_query() ──▶ where filter ─────────▶ top-k + cosine distance
+                     add / update / delete / skip  (idempotent)                │
+                                                                               │
+POST /ask-runbook ──▶ retrieve() ──▶ embed_query() ─────────────────────────────▶ top-k + cosine distance
+   (app.py)          (retrieval.py)      │                                                   │
+                                         │                     score = 1 - distance, drop < 0.65
+                                         ▼                                                   │
+                     nothing cleared the floor? ──▶ refuse, no LLM call ◀────────────────────┘
+                                         │
+                     build_context() ──▶ <chunk id="n"> blocks ──▶ BaseLLMProvider ──┬──▶ OllamaProvider  (qwen2.5:7b-instruct)
+                                         │                            (llm.py)       └──▶ GeminiProvider  (gemini-3.6-flash)
+                                         ▼
+                     ground_answer() ──▶ markers vs retrieved set ──▶ AskResponse{answer, sources, grounded, answer_source}
 ```
 
-**Four modules, each with one job:**
+**Modules, each with one job:**
 
 1. **`chunking.py`** — turns the corpus into identified, embeddable pieces. Pure functions, no
    network, no Chroma. Unit-tested.
@@ -39,9 +50,16 @@ corpus/*.md ──▶ load_corpus() ──▶ chunk_corpus(512, 64) ──▶ Ba
    backends, mirroring the `BaseLLMProvider` Strategy pattern from the log analyzer. Nothing
    downstream knows which model produced a vector.
 3. **`ingest.py`** (Day 9) — the durable ingestion pipeline. Reconciles the Chroma index to the
-   corpus idempotently (add / update / delete / skip via a per-doc `content_hash`) and supports
-   metadata filtering. `plan_reconcile` is a pure, unit-tested function.
-4. **`day8_embeddings.py`** — the Day 8 experiment. Indexes the corpus at three chunk sizes and
+   corpus idempotently (add / update / delete / skip via a per-doc `content_hash`).
+   `plan_reconcile` is a pure, unit-tested function.
+4. **`retrieval.py`** (Day 10) — question to ranked chunks: embed the query, rank by cosine
+   similarity, drop everything below the floor, return text *and* metadata. No LLM, no FastAPI.
+5. **`llm.py`** (Day 10) — the text-generation boundary. A second `BaseLLMProvider` ABC whose
+   `generate()` returns a plain `str`, and an `UpstreamError` carrying the HTTP status its
+   failure should become.
+6. **`app.py`** (Day 10) — FastAPI. Prompt assembly, citation validation, `POST /ask-runbook`,
+   `GET /health`. The grounding logic inside it is pure functions over strings.
+7. **`day8_embeddings.py`** — the Day 8 experiment. Indexes the corpus at three chunk sizes and
    compares retrieval across them. A dated artifact, not a service entrypoint.
 
 ## Design decisions worth defending
@@ -129,14 +147,21 @@ entire argument for embeddings over grep.
 
 ```bash
 pip install -r requirements.txt
-python day8_embeddings.py --reset
+python ingest.py                 # build or reconcile the index
+uvicorn app:app --port 7100      # serve /ask-runbook and /health
+
+curl -s localhost:7100/ask-runbook -H 'content-type: application/json' \
+  -d '{"question":"why do my pods get OOMKilled after a deploy"}'
 ```
 
-Requires an embedding model on the configured Ollama host:
+Requires two models on the configured Ollama host — one to embed, one to write prose:
 
 ```bash
 ollama pull nomic-embed-text     # 768-dim, ~274MB
+ollama pull qwen2.5:7b-instruct  # generation, ~4.7GB
 ```
+
+The Day 8 experiment is still runnable on its own: `python day8_embeddings.py --reset`.
 
 The script prints four sections: what a vector looks like and how cosine similarity separates
 related from unrelated text; index construction at each chunk size; a per-query comparison of
@@ -151,6 +176,16 @@ Config comes from the repo-root `.env`:
 | `OLLAMA_BASE_URL` | `http://localhost:11434` | Shared with the log analyzer |
 | `GEMINI_EMBED_MODEL` | `gemini-embedding-001` | Pinned to 768 dims so the two are comparable |
 | `CHROMA_PATH` | `services/knowledge-copilot/chroma_data` | Persistent index; gitignored, rebuildable |
+| `LLM_PROVIDER` | `ollama` | Generation backend: `ollama` or `gemini` |
+| `OLLAMA_CHAT_MODEL` | `qwen2.5:7b-instruct` | **Not** `OLLAMA_MODEL` — see below |
+| `SIMILARITY_FLOOR` | `0.65` | Below this score a chunk is not context |
+| `LLM_TIMEOUT` | `300` | Seconds. 120 was not enough — see [findings](#day-10-latency-is-the-real-constraint) |
+| `COPILOT_PORT` | `7100` | Only used by `python app.py`; the log analyzer owns 7000 |
+
+`OLLAMA_CHAT_MODEL` exists because the repo-root `.env` is shared, and `OLLAMA_MODEL` already
+belongs to the log analyzer — which needs a *code* model for schema-constrained JSON output.
+This service needs one that writes incident prose. Two services, one `.env`, two generation
+models, so two variables. `OLLAMA_EMBED_MODEL` splits the same way for the same reason.
 
 ## Day 9 — idempotent ingestion (`ingest.py`)
 
@@ -184,7 +219,6 @@ python ingest.py --dry-run                                    # preview the plan
 python ingest.py                                              # apply
 python ingest.py --reset                                      # full rebuild (to switch provider)
 python ingest.py --corpus ../../docs                          # any directory of markdown
-python ingest.py --query "pods dying after deploy" --where doc_type=runbook
 ```
 
 `--reset` and `--dry-run` are refused together, by `argparse` at the CLI edge and by a
@@ -199,12 +233,14 @@ exist because Day 10's endpoint will import `ingest()` directly and never touch 
 also what lets the tests drive the whole pipeline against a `tmp_path` corpus.
 
 Every chunk carries `title, service, doc_type, last_reviewed, source, chunk_index,
-content_hash, indexed_at`. `--where key=value` (repeatable) filters retrieval on any of them —
-same query, `--where doc_type=postmortem` vs `--where doc_type=runbook`, returns different top
-hits. Digit-only values are coerced to `int`, so `--where chunk_index=0` matches the integer
-Chroma actually stored rather than the string `"0"`, which would match nothing. `search()` here
-is deliberately thin; Day 10's `POST /ask-runbook` builds the real retrieval path (embed query →
-filter → rank → cite) on the same shape.
+content_hash, indexed_at`. Day 9 exposed a `--query` / `--where` pair on the CLI for searching
+against those; **Day 10 deleted both** along with `ingest.py`'s thin `search()`, because that
+function's `include` list omitted `"documents"` and so could never feed a prompt. Keeping a
+second, weaker retrieval implementation alive to serve a demo flag is how two code paths drift
+apart. `retrieval.retrieve()` is now the only one, and `POST /ask-runbook` is its only front
+door. The tradeoff is real and noted below: there is no longer an offline way to eyeball the
+similarity floor, and metadata filtering has to come back as a request parameter when Day 11's
+eval needs it.
 
 `ingest()` takes an optional `provider` and `client`, defaulting to the configured ones. That
 one seam is what makes the pipeline testable offline: a fake provider that counts vectors and a
@@ -212,13 +248,174 @@ throwaway Chroma path prove the guarantees end to end without a network call. Wi
 only untested surface was `ingest()` itself — which is precisely where the `--reset --dry-run`
 bug lived.
 
+## Day 10 — `POST /ask-runbook` (`retrieval.py`, `llm.py`, `app.py`)
+
+The endpoint is the easy half. The half worth defending is what happens when retrieval comes
+back weak, and whether a citation in the prose points at a chunk that was actually retrieved.
+
+### Contract
+
+```
+POST /ask-runbook
+  question: str          min_length 10
+  k: int = 4             bounded 1-10
+
+200 ->
+  answer: str
+  sources: [{marker, source, chunk_index, score}]
+  grounded: bool
+  answer_source: "runbooks" | "none"
+```
+
+```jsonc
+// curl -d '{"question":"why do my pods get OOMKilled after a deploy"}'
+{
+  "answer": "The pods may get OOMKilled after a deploy if the memory limit was not increased
+             to accommodate higher per-request memory use. In the `checkout` service incident,
+             deploying v4.19 without raising the memory limit led to an OOMKill loop [3].",
+  "sources": [{"marker": 3, "source": "postmortem-2026-06-checkout-oom-outage.md",
+               "chunk_index": 0, "score": 0.723}],
+  "grounded": true,
+  "answer_source": "runbooks"
+}
+```
+
+### `grounded` is three conditions, not one
+
+True **only** when all three hold: at least one chunk cleared the floor, the model emitted at
+least one citation marker, and every marker it emitted resolved to a retrieved chunk. Every
+other combination is false.
+
+`grounded` and "we produced an answer" are separate facts and must never collapse into one
+boolean — conflating them is the failure this endpoint exists to prevent. `answer_source` is
+what keeps them separate: an uncited answer and a refusal both carry `grounded: false` and an
+empty `sources`, and only that field distinguishes `"runbooks"` from `"none"`. Without it a
+caller — the Day 13 chat front-end, the Day 15 gateway — would have to string-match the refusal
+text, which is not a contract.
+
+### The similarity floor: 0.65, and it is a guess
+
+Chunks scoring below `SIMILARITY_FLOOR` are not passed to the model. Nothing clears it → the
+endpoint answers `Not covered in the runbooks.` with `answer_source: "none"` and **makes no LLM
+call at all**.
+
+The value comes from four observations on this corpus with `nomic-embed-text`: a bullseye scores
+0.72–0.76, a clearly unrelated chunk 0.59–0.64. The `search_query:` / `search_document:`
+prefixes compress the range hard, so a conventional 0.4–0.5 floor would pass everything (see
+[the cosine floor](#three-things-the-table-doesnt-show)). **This pushes a requirement onto Day
+11:** the eval set needs out-of-corpus questions — "how do I rotate an IAM key" — so the cutoff
+is calibrated against real negatives rather than guessed from positives.
+
+### Citation validation
+
+A regex sweep for `[n]` over the model's output, checked against the ids actually placed in the
+context block. Unresolvable markers are **stripped from the answer text**, `grounded` goes false,
+and the event is logged at WARNING.
+
+This departs from the log analyzer, which maps malformed model output straight to 502. The
+departure is deliberate: a partially-cited answer still helps someone on call at 2am, whereas a
+response that fails schema validation has no salvageable content. An invented citation therefore
+never produces a 502 — the failure stays visible in `grounded` and in the logs instead of being
+swallowed.
+
+The regex is `(?<!\w)\[(\d+)\]`, and both halves of that lookbehind were bugs found by tests.
+`\[(\d+)\]` alone reads `argv[1]` and `${nodes[0]}` in a shell snippet as citations, which
+ungrounds a perfectly good answer. Excluding a preceding `]` as well — `(?<![\w\]])` — silently
+broke the far more common case: models write consecutive citations as `[1][2]`, and the second
+marker was then never extracted, so it stayed in the prose, never reached `sources`, and left
+`grounded` claiming true about a citation the response could not resolve. Exactly the failure
+mode the endpoint exists to prevent, introduced by the fix for a cosmetic one.
+
+### Error handling
+
+| Condition | Status |
+|---|---|
+| model timeout (`LLM_TIMEOUT` exceeded) | 504 |
+| model backend unreachable | 503 |
+| model backend returns 4xx/5xx — e.g. model not pulled | 502 |
+| empty or unusable response body | 502 |
+| embedding backend timeout / failure | 504 / 503 |
+| collection empty or missing | 503 `run ingest.py` |
+| question shorter than 10 chars, `k` outside 1–10 | 422 (Pydantic) |
+
+Two shapes worth naming. **`UpstreamError(message, status)`** lets `llm.py` and `retrieval.py`
+decide what their own failures mean in HTTP terms, so `app.py` has one `except` clause instead of
+five and a Gemini SDK error can't escape as a 500. And `requests.exceptions.HTTPError` **must**
+be caught before `RequestException`, since it is a subclass: without that ordering a model that
+was never pulled — a 404 from Ollama — is reported as "backend unreachable", sending you to check
+the network instead of running `ollama pull`.
+
+**The empty-collection case is the important one.** If `EMBEDDING_PROVIDER` changes,
+`get_or_create_collection` silently creates a fresh empty collection under the new name. Every
+query then returns nothing, nothing clears the floor, and the endpoint answers "Not covered in
+the runbooks." That answer is *false* — the runbooks are fine, the index is not built. So
+`retrieve()` distinguishes "no rows in the collection" (raise) from "nothing cleared the floor"
+(return `[]`). Same failure family as the Day 9 `--reset --dry-run` bug: the wrong answer was
+plausible, which is what made it dangerous.
+
+### `/health`
+
+Returns `healthy | degraded` with an `issues` list, plus the configured provider, model,
+embedding provider, collection name, chunk count, and floor.
+
+```json
+{"status": "healthy", "provider": "ollama", "model": "qwen2.5:7b-instruct",
+ "embedding_provider": "ollama", "collection": "knowledge_ollama_512_64",
+ "chunks_indexed": 68, "similarity_floor": 0.65, "issues": []}
+```
+
+Two checks have no equivalent in the log analyzer's health endpoint, and both cover failures that
+would otherwise reach users as a confidently wrong answer or a mid-request 502:
+
+- **the collection is non-empty** — catches the `EMBEDDING_PROVIDER` switch above.
+- **the configured chat model is actually pulled** on the Ollama host. Constructing a provider
+  does no I/O, so `/health` is the only place a missing model can surface *before* it becomes a
+  502 in the middle of someone's question.
+
+### Context assembly: flat top-k
+
+The chunks that clear the floor become numbered blocks, each carrying its `source` and
+`chunk_index`, so marker `[2]` resolves to exactly one chunk:
+
+```xml
+<context>
+<chunk id="1" source="oomkilled-pod.md" chunk_index="0">...</chunk>
+<chunk id="2" source="postmortem-2026-06-checkout-oom-outage.md" chunk_index="1">...</chunk>
+</context>
+<question>...</question>
+```
+
+Two alternatives were rejected. **Neighbour expansion** (pulling `{slug}:{i±1}` in, which the
+deterministic IDs make a cheap `collection.get` with no second embedding) fixes facts truncated
+at a chunk boundary, but a marker would then point at a three-chunk window, weakening the
+citation claim — and Day 11's hit@k would measure something the endpoint doesn't serve. Good
+Day 11 experiment once an eval exists to prove it helps. **Whole-document context** is viable at
+these sizes (1.5–3.3 KB per doc) and would guarantee the model never sees a truncated sentence,
+but it conflicts directly with inline markers: `[1]` would mean "somewhere in this 3 KB
+document", and Day 8 already showed that picking the right *document* out of eleven is too easy
+to discriminate.
+
+### What was deliberately left out
+
+- **`allow_general`** — a flag to answer from model knowledge when the runbooks don't cover a
+  question. Designed, then dropped: the honest refusal is the more defensible default, and a 7B
+  local model inventing *this* cluster's conventions is exactly where it would be least
+  reliable. If it returns, `answer_source` already has a `"model_knowledge"` slot waiting.
+- **Metadata filtering** on the request. Chroma supports it and Day 9's chunks carry the
+  metadata; it comes back when the eval needs to compare `doc_type=runbook` against
+  `doc_type=postmortem`.
+- **`/metrics`**, auth, and a shared LLM package across the two services. Day 14, Day 14, and
+  Day 30 respectively — the third wants three call sites to design against, not two.
+
 ## Testing
 
 ```bash
-python -m pytest tests/ -q
+python -m pytest tests/ -q     # 57 tests, ~2s, no network
 ```
 
-Both test files are offline and deterministic — no embedding call belongs in a unit test.
+Every test file is offline and deterministic — no embedding call and no model call belongs in a
+unit test.
+
 `tests/test_chunking.py` covers chunk size bounds, that overlap actually carries text forward,
 that no word is lost, ID stability across runs, and front matter parsing with and without a
 header.
@@ -242,10 +439,36 @@ resolve to the same in-process system, so a collection written by one test was v
 next and the "re-run embeds nothing" assertion failed for the wrong reason. Each test now gets
 a `PersistentClient` on its own `tmp_path`, which cannot leak.
 
+`tests/conftest.py` (Day 10) holds what three files now share: `FakeProvider`, the `tmp_path`
+Chroma client, and a throwaway corpus. Day 9 needed them in one file and defined them there.
+
+`tests/test_retrieval.py` uses a `StubCollection` rather than real Chroma, because the assertions
+are about *exact* scores — a hash-derived vector cannot produce a distance of 0.24 on demand.
+Below-floor chunks are dropped, nothing-above-floor returns `[]` while an empty collection
+**raises**, `k` reaches the query, `include` asks for `documents`, and embedding failures come
+back as `UpstreamError` with 504/503. One test does run against real Chroma, to prove chunk text
+actually comes back — the thing the deleted `search()` could not do.
+
+`tests/test_grounding.py` is pure string work: byte-exact context blocks, marker extraction,
+consecutive `[1][2]` markers, shell subscripts that are *not* markers, stripping that leaves
+punctuation clean, and the `grounded` truth table (no chunks → false; chunks but no citation →
+false; one invented marker → false and stripped; all resolve → true).
+
+`tests/test_llm.py` covers the boundary that talks to a model: timeout → 504, HTTP error → 502,
+connection refused → 503, empty body → 502, and that `temperature` is sent inside `options`
+where Ollama actually reads it. That last one is a bug in the log analyzer, which passes it at
+the top level of the payload and has therefore been running at the default 0.8, not 0.1.
+
+`tests/test_api.py` drives the endpoint through `TestClient` with both upstreams replaced —
+a spy LLM and a stubbed `retrieve`. The assertion that matters most is `spy.calls == 0` on the
+below-floor path: *skipping* work is a claim that can only be proven by instrumenting the
+collaborator, the same trick as `FakeProvider.embed_calls` on Day 9. A green suite would
+otherwise say nothing about whether a refusal quietly called the model anyway.
+
 There is no CI workflow for this service yet. The existing
 [`log_analyzer_ci.yml`](../../.github/workflows/log_analyzer_ci.yml) is path-scoped to
-`services/log-analyzer/**` and will not run these tests. Worth adding once there is an
-endpoint to protect.
+`services/log-analyzer/**` and will not run these tests. Now that there is an endpoint to
+protect, this is the most overdue item on the list.
 
 ## Findings
 
@@ -316,12 +539,38 @@ service had a single user.
 Five queries is a smoke test, not a benchmark — one query moving swings hit@1 by 20%. Day 11
 builds the eval set that can settle this.
 
+### Day 10: latency is the real constraint
+
+Run of 2026-08-04 — `qwen2.5:7b-instruct` on self-hosted Ollama, 68 chunks indexed, `k=4`.
+
+| Request | Result | Wall clock |
+|---|---|---|
+| `/health` | `healthy`, 68 chunks, model pulled | < 1s |
+| out-of-corpus question, below floor | `answer_source: "none"`, no model call | < 1s |
+| grounded question, cold model | **504** — `LLM_TIMEOUT` was 120s | 120s |
+| grounded question, warm model | `grounded: true`, 1 source, score 0.723 | **195s** |
+| trivial prompt, direct to Ollama | control measurement | 6.5s |
+
+**Every grounded answer 504'd at the original 120-second timeout.** The cause is not the model
+size but where it runs: `/api/ps` reports `size_vram: 0`, so appsrv is serving from CPU, and
+prompt eval over four ~512-character chunks is what costs the time. The 6.5s control on a
+two-word prompt against the same warm model isolates it — this is prompt-length cost, so it
+scales with `k`, and raising `k` to improve recall makes it worse.
+
+The default is now 300s, which makes the endpoint usable rather than fast. The real options are
+a GPU on appsrv, a smaller prose model, or a lower `k`, and picking between them wants Day 11's
+eval to say what recall actually costs. **Day 11's eval set therefore needs a latency column**;
+measuring retrieval quality while ignoring a 3-minute answer would optimize the wrong thing.
+
+The log analyzer never hit this because its prompts are one short log line. It is the first
+place this project has paid for retrieval augmentation rather than just benefited from it.
+
 ## Not built yet
 
 | Capability | Day |
 |---|---|
-| `POST /ask-runbook` — retrieve top-k, augment the prompt, cite sources | 10 |
-| Hybrid keyword+vector search, reranking, a real eval set | 11 |
+| Hybrid keyword+vector search, reranking, a real eval set (with latency) | 11 |
 | Connector ingesting Prometheus alerts / K8s events | 12 |
 | Slack bot or web chat in front of the service | 13 |
-| Auth, architecture diagram, demo recording | 14 |
+| `/metrics`, auth, architecture diagram, demo recording | 14 |
+| A CI workflow that runs these 57 tests | overdue |

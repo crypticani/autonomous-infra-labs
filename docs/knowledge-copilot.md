@@ -1,9 +1,10 @@
 # Knowledge Copilot — how it works
 
-A ground-up explanation of the retrieval layer in
+A ground-up explanation of
 [`services/knowledge-copilot`](../services/knowledge-copilot): what embeddings and vector
-search actually are, why each design choice was made, and what every piece of the code is
-doing. Written for someone meeting embeddings for the first time.
+search actually are, how retrieved text becomes a grounded answer, why each design choice was
+made, and what every piece of the code is doing. Written for someone meeting embeddings for the
+first time.
 
 The service README covers *what was built and what it scored*. This document covers *why any
 of it works*.
@@ -257,15 +258,58 @@ Skipping this doesn't raise an error. It just makes retrieval quietly worse. Tha
 interface has two methods — `embed_documents()` and `embed_query()` — rather than one `embed()`:
 you cannot forget which side you're on if the API won't let you express it.
 
+## 1.6 What RAG actually is
+
+Everything above finds text. **Retrieval-Augmented Generation** is the small idea that turns
+found text into an answer: paste it into the prompt.
+
+```
+question ──▶ retrieve top-k chunks ──▶ build a prompt containing them ──▶ LLM ──▶ answer
+```
+
+That's it. There is no fine-tuning, no training, no model weights involved. The model is not
+"taught" your runbooks — it reads them, in the prompt, at the moment you ask. Which means the
+answer's quality is bounded by what retrieval found: **a RAG system's ceiling is its retriever.**
+This is why Days 8–9 came before Day 10, and why Day 11 is an eval rather than a feature.
+
+### Why not just ask the model?
+
+`qwen2.5:7b-instruct` genuinely knows what OOMKilled means. It does *not* know that your checkout
+service ran out of memory in June because a cache release removed a bound, that the fix was
+raising the limit to 512Mi, or that your convention is to set requests at 60% of limits. Nothing
+in its training data contains your infrastructure. Asked anyway, it will produce a fluent,
+plausible, generic answer — and the failure is invisible, because fluency reads as knowledge.
+
+### The failure RAG introduces
+
+Putting text in a prompt does not force the model to use it. Three things can go wrong, and only
+the first is obvious:
+
+1. **Retrieval finds nothing relevant**, so the context is noise. Answering anyway produces a
+   confident answer from the model's general knowledge, dressed in your runbooks' credibility.
+2. **The model cites something that isn't there.** Asked to write `[1]`, `[2]`, it will sometimes
+   emit `[7]` — a reference to a source that was never in the prompt. A reader who trusts
+   citations has no way to know.
+3. **The answer blends retrieved fact and pretraining**, two sentences from a runbook and a third
+   invented, in one paragraph. The reader cannot tell them apart, and neither can a log.
+
+The endpoint's whole design is a response to these. A **similarity floor** answers (1) by
+refusing when nothing scores well enough. **Marker validation** answers (2) by checking every
+`[n]` against the chunks actually placed in the prompt. And a **`grounded` boolean that is
+separate from "we answered"** answers (3) by refusing to let one flag stand for both. §2.7 is
+how each is implemented.
+
 ---
 
 # Part 2 — The code
 
-Three modules, each with one job.
+Six modules, each with one job.
 
 ```
-corpus/*.md ──▶ chunking.py ──▶ embeddings.py ──▶ Chroma ──▶ results
-               (text → pieces)  (text → vectors)  (store + search)
+corpus/*.md ──▶ chunking.py ──▶ embeddings.py ──▶ Chroma ◀── retrieval.py ◀── app.py ──▶ llm.py
+               (text → pieces)  (text → vectors)  (store)   (rank + floor)  (prompt,   (text →
+                    ▲                                                        cite,      prose)
+                    └────────── ingest.py (reconcile the index) ──────────┘   validate)
 ```
 
 ## 2.1 `chunking.py` — text into identified pieces
@@ -617,10 +661,230 @@ same question. That only became meaningful once the corpus stopped being eight u
 
 Filters are typed, which is easy to miss. `chunk_index` is stored as an integer, so a `where`
 clause carrying the *string* `"0"` matches nothing at all — no error, no warning, just an empty
-result that reads exactly like "there is no such chunk". `--where key=value` arrives from the
-shell as text, so `parse_where` coerces digit-only values back to `int`. Same failure family as
-the rest of this service: the retrieval bugs that hurt are the ones that return a plausible
-answer instead of raising.
+result that reads exactly like "there is no such chunk". Day 9's `--where key=value` arrived from
+the shell as text, so it coerced digit-only values back to `int`. Same failure family as the rest
+of this service: the retrieval bugs that hurt are the ones that return a plausible answer instead
+of raising.
+
+Day 10 removed that flag along with `ingest.py`'s `search()` — see §2.5. The metadata is still on
+every chunk and Chroma still filters on it; what's gone is the CLI surface that exposed it. It
+returns as a request parameter when Day 11's eval needs to compare `doc_type=runbook` against
+`doc_type=postmortem`, and the string-vs-int trap will be waiting there too.
+
+## 2.5 `retrieval.py` — ranked chunks, and a floor
+
+One function does the work: embed the question, ask Chroma for the top `k`, convert distance to
+similarity, drop what scores too low.
+
+```python
+result = collection.query(
+    query_embeddings=[provider.embed_query(question)],
+    n_results=k,
+    include=["documents", "metadatas", "distances"],
+)
+```
+
+`include=["documents", ...]` is the whole reason this module exists. Day 9 had a `search()`
+helper whose `include` list asked only for metadata and distances — fine for printing "which
+document matched", useless for Day 10, because **you cannot put a citation in a prompt without
+the text it cites**. Day 10 deleted `search()` rather than patching it, so there is exactly one
+retrieval implementation. Two implementations of the same idea drift, and the one used by the
+demo is never the one that gets tested.
+
+### The similarity floor
+
+```python
+kept = [hit for hit in hits if hit.score >= floor]     # floor = 0.65
+```
+
+Chroma always returns `k` results. It has no concept of "nothing here is relevant" — ask an index
+of Kubernetes runbooks how to rotate an IAM key and you get four confident chunks about pods,
+ranked. Without a floor those become context, and the model dutifully answers an AWS question
+from a Kubernetes runbook.
+
+§1.2 explained why an absolute threshold is dangerous: cosine similarity on this model has a
+floor around 0.59 and a ceiling around 0.80, so the usable band is narrow and model-specific.
+That makes 0.65 a *calibrated guess*, not a principle — it sits between the 0.72–0.76 a bullseye
+scores on this corpus and the 0.59–0.64 an unrelated chunk scores. It is `SIMILARITY_FLOOR` in
+the environment precisely because it will need retuning the day the embedding model changes, and
+Day 11's eval set needs out-of-corpus questions so the number is measured against real negatives
+instead of inferred from positives.
+
+### Empty is not the same as irrelevant
+
+```python
+if collection.count() == 0:
+    raise EmptyIndexError(...)
+```
+
+Two situations produce zero usable chunks, and they demand opposite responses. *Nothing cleared
+the floor* means the corpus genuinely doesn't cover the question — the honest answer is "not
+covered", and it is correct. *The collection is empty* means the index was never built, and "not
+covered in the runbooks" is then a **lie**: the runbooks are fine.
+
+This is not hypothetical. Change `EMBEDDING_PROVIDER` and `get_or_create_collection` creates a
+fresh, empty collection under the new name (§2.3) — no error anywhere. Every query returns
+nothing, and a service that treated empty as irrelevant would answer "not covered" to every
+question ever asked, forever, while looking healthy. So `retrieve()` raises on one and returns
+`[]` on the other, and `app.py` maps the raise to a 503 that names the fix.
+
+## 2.6 `llm.py` — the second Strategy boundary
+
+Structurally the twin of `embeddings.py`: an ABC with an Ollama and a Gemini implementation,
+selected by an environment variable. One difference is worth explaining, because it looks like an
+inconsistency.
+
+```python
+# log analyzer
+def generate(self, system_prompt, user_prompt, temperature=0.1) -> LogAnalysis: ...
+# here
+def generate(self, system_prompt, user_prompt, temperature=0.1) -> str: ...
+```
+
+The log analyzer's entire output *is* structure — a severity, a cause, a fix, a confidence — so
+its provider validates against a Pydantic schema and anything malformed is a 502. Here the model
+writes prose with citation markers in it. Prose has no schema, and the parsing that matters
+(which markers appear, do they resolve) is a property of the *answer plus the retrieved set*,
+which the provider has never seen. So the provider returns a string, and grounding happens in
+`app.py`. Same pattern, deliberately different contract — which is also why the ABC is copied
+into this service rather than shared. A shared abstraction would have to be generic enough to
+mean nothing.
+
+### `UpstreamError`, and why exception order is a bug
+
+Every provider fails in its own vocabulary: `requests` raises `Timeout`, the `google-genai` SDK
+raises `APIError`. Callers don't care which — they need to know what to tell the client. So each
+provider translates its own failures into one exception that carries the answer:
+
+```python
+raise UpstreamError("the model took too long to answer", 504) from e
+```
+
+One `except` clause in the endpoint, and no SDK-specific exception can escape as an unhandled 500.
+
+The ordering trap is worth internalizing because it is silent:
+
+```python
+except requests.exceptions.Timeout:          # 504
+except requests.exceptions.HTTPError:        # 502  <- must come before the next one
+except requests.exceptions.RequestException: # 503
+```
+
+`HTTPError` is a *subclass* of `RequestException`, and Python takes the first matching clause. Put
+the general one first and a model that was never pulled — Ollama answers 404, `raise_for_status()`
+raises `HTTPError` — is reported as "the model backend is unreachable". You then spend twenty
+minutes checking Tailscale and firewall rules for a problem that `ollama pull` fixes. The test
+`test_transport_failures_carry_the_right_status` exists to keep that ordering honest, because
+nothing about the code *looks* wrong.
+
+## 2.7 `app.py` — grounding, which is the actual product
+
+The HTTP layer is thin. What matters is three pure functions and the contract they defend.
+
+### Numbered context blocks
+
+```xml
+<context>
+<chunk id="1" source="oomkilled-pod.md" chunk_index="0">...</chunk>
+<chunk id="2" source="postmortem-2026-06-checkout-oom-outage.md" chunk_index="1">...</chunk>
+</context>
+<question>why do my pods get OOMKilled after a deploy</question>
+```
+
+XML tags rather than markdown headings, following the Day 2 prompt work: they delimit
+unambiguously, so a chunk containing `## Symptom` can't be mistaken for prompt structure. The
+`id` is what makes citation possible at all — the model is told to cite ids, never filenames,
+because `[2]` resolves to exactly one chunk of one document while
+`postmortem-2026-06-checkout-oom-outage.md` resolves to 3 KB of text.
+
+Numbering is **per-request**, not global. `[2]` means "the second chunk retrieved for *this*
+question" and means something different next request. That is why `sources` in the response maps
+each marker back to a file and `chunk_index`: the marker is a local handle, and the response has
+to translate it before it leaves the process.
+
+### Validating citations
+
+```python
+valid = set(range(1, len(hits) + 1))
+cited = extract_markers(raw_answer)
+unresolvable = {marker for marker in cited if marker not in valid}
+```
+
+Three chunks in the prompt means `{1, 2, 3}` are the only legal markers. A `[7]` is the model
+inventing a source — the failure from §1.6 (2) — and it is stripped from the answer text,
+`grounded` goes false, and a WARNING is logged. Note what does *not* happen: no 502. A
+partially-cited answer still helps someone at 2am, whereas a response that failed schema
+validation has nothing salvageable in it. The log analyzer maps malformed output to 502 because
+there is no partial credit in a schema; here there is.
+
+Finding the markers is a regex, and it took two bugs to get right:
+
+```python
+MARKER_RE = re.compile(r"(?<!\w)\[(\d+)\]")
+```
+
+`\[(\d+)\]` alone matches `argv[1]` and `${nodes[0]}` inside a shell snippet the model quoted
+from a runbook. Those aren't citations; treating them as invented ones ungrounds a good answer.
+The negative lookbehind fixes that — a marker can't be preceded by a word character.
+
+The second bug was the fix for the first. Excluding a preceding `]` as well, `(?<![\w\]])`, looks
+harmless and breaks the most common citation style there is: models write consecutive references
+as `[1][2]`, and the second was then never extracted. Which meant it stayed in the prose, never
+appeared in `sources`, and — because it was never *seen* — never counted as unresolvable, so
+`grounded` still reported **true** about an answer containing a citation the response could not
+resolve. A cosmetic fix reintroduced the exact failure the module exists to prevent, and only a
+test spelling out `[1][2]` catches it.
+
+### `grounded` is three conditions
+
+```python
+grounded = bool(hits) and bool(sources) and not unresolvable
+```
+
+Chunks cleared the floor, **and** the model cited at least one, **and** every marker it emitted
+resolved. Anything else is false.
+
+The temptation is to make `grounded` mean "we answered", because in the happy path they coincide.
+They are different facts, and the gap between them is where every RAG failure lives — an answer
+with no citations, an answer citing a source that doesn't exist, a refusal. Collapsing them into
+one boolean produces a service that reports success whenever it produced text.
+
+### Why `answer_source` exists
+
+There are two ways to get `grounded: false, sources: []`, and they mean opposite things:
+
+| | `answer` | `grounded` | `sources` | `answer_source` |
+|---|---|---|---|---|
+| Nothing cleared the floor | `Not covered in the runbooks.` | `false` | `[]` | `"none"` |
+| Chunks found, model cited none | prose | `false` | `[]` | `"runbooks"` |
+
+Without the field, a caller distinguishes "we have no idea" from "here is an answer, uncited" by
+string-matching the refusal sentence — which breaks the first time the wording changes. The field
+is the contract; the sentence is for the human. A `"model_knowledge"` value was designed for an
+`allow_general` flag that would answer from pretraining when the runbooks don't cover something,
+and deliberately not built: an honest refusal is the better default, and general knowledge about
+*this* cluster's conventions is precisely where a 7B local model invents things.
+
+### The refusal makes no model call
+
+```python
+if not hits:
+    return AskResponse(answer=NOT_COVERED, sources=[], grounded=False, answer_source="none")
+```
+
+Cheaper, faster, and — the real point — impossible to accidentally answer from pretraining if the
+model is never asked. A test asserts `spy.calls == 0` here, because "we skipped the work" is a
+claim about something *not* happening: the response looks identical whether or not a model was
+called and its output discarded. You have to instrument the collaborator, the same trick as
+`FakeProvider.embed_calls` in §2.4.
+
+### Why the endpoint is `def`, not `async def`
+
+`requests` and the `google-genai` client are blocking. Declared `async def`, a 195-second model
+call would stall FastAPI's event loop and freeze every other request — health checks included.
+Plain `def` makes Starlette run the handler in a threadpool instead, so the service stays
+responsive while the model thinks. This is the single most common FastAPI performance bug, and it
+gets worse the slower the upstream is, which §3's latency finding makes very concrete.
 
 ---
 
@@ -647,6 +911,19 @@ OOMKilled pod *presents* as CrashLoopBackOff, and the two runbooks cross-referen
 Binary single-label scoring can't express partial correctness. Day 11's eval set needs graded
 relevance or it will penalize the model for being right.
 
+**Day 10: the answer took 195 seconds.** One grounded question, `k=4`, warm model — and the first
+attempt returned a 504 because the timeout was 120s. The model isn't the problem; where it runs
+is. `/api/ps` reports `size_vram: 0`, so Ollama on appsrv serves from CPU, and a two-word prompt
+to that same warm model returns in 6.5s. The difference is **prompt eval**: the model has to read
+~2,000 characters of retrieved context before it writes a single token, and on CPU that read is
+the entire cost.
+
+Which reframes something §1.3 treated as free. Chunk size and `k` were discussed as a
+precision-versus-context tradeoff; they are also the latency dial, and on CPU it is the dominant
+one. Doubling `k` to improve recall roughly doubles time-to-answer. Retrieval quality and
+response time are the same knob, so Day 11's eval has to measure both or it will happily
+recommend a configuration nobody can wait for.
+
 ---
 
 # Glossary
@@ -666,5 +943,13 @@ relevance or it will penalize the model for being right.
 | **ANN** | Approximate Nearest Neighbour. Trades exactness for speed; the category HNSW belongs to |
 | **Matryoshka** | Training so the leading dimensions carry the most information, making truncation viable |
 | **RAG** | Retrieval-Augmented Generation — retrieve relevant text, put it in an LLM prompt, generate a grounded answer. Day 10 |
+| **Top-k** | The *k* highest-scoring chunks a query returns. `k=4` here; it is both a recall and a latency dial |
+| **Similarity floor** | Minimum score a chunk needs to be used as context. Below it, the service refuses instead of answering |
+| **Grounded** | The answer's every claim came from retrieved text, and every citation resolves to a chunk that was actually in the prompt |
+| **Citation marker** | The `[n]` in an answer, referring to chunk *n* of the retrieved set — a per-request handle, not a document ID |
+| **Hallucination** | Fluent, confident output that isn't supported by the source. The `[7]` that cites a chunk which was never in the prompt |
+| **System prompt** | Instructions given to the model separately from the user's text — here, the rules about citing and refusing |
+| **Temperature** | Randomness in generation. 0.1 for near-deterministic operational prose; Ollama reads it from `options`, not the top level |
+| **Prompt eval** | The model reading the prompt before generating anything. On CPU this dominates latency and scales with context size |
 | **hit@k** | Fraction of queries where the correct document appears in the top *k* results |
 | **Anisotropy** | The tendency of embeddings to occupy a narrow cone rather than the full sphere — why unrelated text still scores 0.59 |

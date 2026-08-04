@@ -1,4 +1,5 @@
 import pytest
+import requests
 from fastapi.testclient import TestClient
 
 import app as app_module
@@ -70,6 +71,7 @@ def test_grounded_answer_returns_sources(wire):
     assert response.status_code == 200
     body = response.json()
     assert body["grounded"] is True
+    assert body["answer_source"] == "runbooks"
     assert [s["marker"] for s in body["sources"]] == [1, 2]
     assert body["sources"][0]["source"] == "oomkilled-pod.md"
     assert spy.calls == 1
@@ -101,8 +103,21 @@ def test_below_floor_refuses_and_makes_no_llm_call(wire):
 
     assert body["answer"] == NOT_COVERED
     assert body["grounded"] is False
+    assert (
+        body["answer_source"] == "none"
+    )  # tells a caller this is a refusal, not prose
     assert body["sources"] == []
     assert spy.calls == 0  # the assertion this endpoint exists for
+
+
+def test_an_uncited_answer_is_ungrounded_but_still_from_the_runbooks(wire):
+    wire(HITS, answer="Raise the limit. No citations offered.")
+    body = client.post("/ask-runbook", json=OOM_QUESTION).json()
+
+    # Same grounded/sources as a refusal; answer_source is what separates them.
+    assert body["grounded"] is False
+    assert body["sources"] == []
+    assert body["answer_source"] == "runbooks"
 
 
 def test_empty_index_is_503(wire, monkeypatch):
@@ -146,6 +161,68 @@ def test_health_reports_both_upstreams(monkeypatch, provider):
     assert body["chunks_indexed"] == 42
     assert (body["provider"], body["model"]) == ("spy", "spy-model")
     assert body["embedding_provider"] == "fake"
+
+
+class FakeOllama(SpyLLM):
+    name = "ollama"
+    model_name = "qwen2.5:7b-instruct"
+    base_url = "http://appsrv:11434"
+
+
+class Collection:
+    name = "knowledge_ollama_512_64"
+
+    def count(self):
+        return 68
+
+
+def wire_health(monkeypatch, tags_response, provider=None):
+    monkeypatch.setattr(app_module, "get_llm_provider", lambda: FakeOllama())
+    monkeypatch.setattr(app_module, "open_collection", lambda: (provider, Collection()))
+    monkeypatch.setattr(app_module.requests, "get", tags_response)
+
+
+def test_health_is_healthy_when_the_model_is_pulled(monkeypatch, provider):
+    class Tags:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"models": [{"name": "qwen2.5:7b-instruct"}]}
+
+    wire_health(monkeypatch, lambda *a, **k: Tags(), provider)
+    body = client.get("/health").json()
+
+    assert body["status"] == "healthy"
+    assert body["issues"] == []
+
+
+def test_health_degrades_when_the_model_is_not_pulled(monkeypatch, provider):
+    class Tags:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"models": [{"name": "qwen2.5-coder:3b"}]}
+
+    wire_health(monkeypatch, lambda *a, **k: Tags(), provider)
+    body = client.get("/health").json()
+
+    # Constructing OllamaProvider does no I/O, so this is the only place a missing
+    # model surfaces before it becomes a 502 in the middle of an answer.
+    assert body["status"] == "degraded"
+    assert "is not pulled" in body["issues"][0]
+
+
+def test_health_degrades_when_ollama_is_unreachable(monkeypatch, provider):
+    def refused(*args, **kwargs):
+        raise requests.exceptions.ConnectionError("connection refused")
+
+    wire_health(monkeypatch, refused, provider)
+    body = client.get("/health").json()
+
+    assert body["status"] == "degraded"
+    assert "unreachable" in body["issues"][0]
 
 
 def test_health_degrades_instead_of_crashing(monkeypatch):

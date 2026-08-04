@@ -1,7 +1,9 @@
 import logging
 import os
 import re
+from typing import Literal
 
+import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -27,7 +29,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-MARKER_RE = re.compile(r"(?<![\w\]])\[(\d+)\]")
+# The lookbehind skips subscripts like argv[1] or ${nodes[0]}, but must NOT exclude a
+# preceding "]": models write consecutive citations as [1][2], and dropping the second
+# left an unresolvable marker in the prose while `grounded` still claimed true.
+MARKER_RE = re.compile(r"(?<!\w)\[(\d+)\]")
 
 NOT_COVERED = "Not covered in the runbooks."
 
@@ -57,6 +62,10 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[Source]
     grounded: bool
+    # "we produced an answer" and "that answer is grounded" are separate facts. Without
+    # this field a caller can only tell a refusal from an uncited answer by string-
+    # matching NOT_COVERED, since both carry grounded=false and no sources.
+    answer_source: Literal["runbooks", "none"]
 
 
 def build_context(hits: list[Hit]) -> str:
@@ -85,9 +94,7 @@ def strip_markers(answer: str, markers: set[int]) -> str:
     return re.sub(r"\s+([.,;:])", r"\1", cleaned).strip()
 
 
-def ground_answer(
-    raw_answer: str, hits: list[Hit]
-) -> tuple[str, list[Source], bool]:
+def ground_answer(raw_answer: str, hits: list[Hit]) -> tuple[str, list[Source], bool]:
     valid = set(range(1, len(hits) + 1))
     cited = extract_markers(raw_answer)
     unresolvable = {marker for marker in cited if marker not in valid}
@@ -128,11 +135,13 @@ def ask_runbook(request: AskRequest):
         )
         if not hits:
             logger.info("nothing cleared the similarity floor; refusing")
-            return AskResponse(answer=NOT_COVERED, sources=[], grounded=False)
+            return AskResponse(
+                answer=NOT_COVERED, sources=[], grounded=False, answer_source="none"
+            )
 
         raw = get_llm_provider().generate(
             GROUNDED_SYSTEM_PROMPT,
-            f"{build_context(hits)}\n<question>\n{request.question}\n</question>"
+            f"{build_context(hits)}\n<question>\n{request.question}\n</question>",
         )
     except EmptyIndexError as e:
         logger.error(f"{e}")
@@ -140,10 +149,12 @@ def ask_runbook(request: AskRequest):
     except UpstreamError as e:
         logger.warning(f"{e}")
         raise HTTPException(status_code=e.status, detail=str(e))
-    
+
     answer, sources, grounded = ground_answer(raw, hits)
     logger.info(f"answered grounded={grounded} sources={[s.marker for s in sources]}")
-    return AskResponse(answer=answer, sources=sources, grounded=grounded)
+    return AskResponse(
+        answer=answer, sources=sources, grounded=grounded, answer_source="runbooks"
+    )
 
 
 @app.get("/health")
@@ -156,7 +167,21 @@ def health_check():
         llm = get_llm_provider()
         provider_name, model = llm.name, llm.model_name
     except Exception as e:
+        llm = None
         issues.append(f"LLM provider unavailable: {e}")
+
+    # Constructing a provider does no I/O, so without this the endpoint reports healthy
+    # while appsrv is down or the model was never pulled -- which reaches callers as a
+    # 502 mid-answer instead of a degraded health check.
+    if llm is not None and llm.name == "ollama":
+        try:
+            tags = requests.get(f"{llm.base_url}/api/tags", timeout=2)
+            tags.raise_for_status()
+            pulled = {entry["name"] for entry in tags.json().get("models", [])}
+            if model not in pulled and f"{model}:latest" not in pulled:
+                issues.append(f"model {model!r} is not pulled on {llm.base_url}")
+        except requests.exceptions.RequestException as e:
+            issues.append(f"Ollama unreachable at {llm.base_url}: {e}")
 
     try:
         embed_provider, collection = open_collection()

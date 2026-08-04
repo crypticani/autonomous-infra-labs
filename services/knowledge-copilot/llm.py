@@ -12,7 +12,10 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
+# 120s was not enough: measured 195s for one grounded answer against a warm
+# qwen2.5:7b-instruct on appsrv, which serves from CPU (api/ps reports size_vram 0).
+# Prompt eval over four ~512-char chunks is what costs it, so this scales with k.
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "300"))
 
 
 class UpstreamError(RuntimeError):

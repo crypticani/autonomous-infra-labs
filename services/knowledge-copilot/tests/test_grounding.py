@@ -29,6 +29,12 @@ def test_markers_are_deduplicated_in_order_of_use():
     assert extract_markers("no citations here") == []
 
 
+def test_consecutive_markers_are_both_read():
+    # [1][2] used to yield only [1]: the second was left in the prose, absent from
+    # sources, and grounded still claimed true.
+    assert extract_markers("both at once [1][2] then [3]") == [1, 2, 3]
+
+
 def test_shell_subscripts_are_not_markers():
     assert extract_markers("check ${nodes[0]} and argv[1], then see [2]") == [2]
     assert extract_markers("kubectl get po -o jsonpath='{.items[0].spec}'") == []
@@ -70,3 +76,11 @@ def test_all_markers_resolving_is_grounded():
     assert [s.marker for s in sources] == [1, 2]
     assert sources[1].score == 0.712
     assert answer == "both [1] and [2]"
+
+
+def test_adjacent_citations_resolve_to_both_chunks():
+    hits = [hit(), hit(source="tls-cert-expiry.md", index=1, score=0.71)]
+    answer, sources, grounded = ground_answer("one cause, two records [1][2].", hits)
+    assert grounded is True
+    assert [s.marker for s in sources] == [1, 2]
+    assert answer == "one cause, two records [1][2]."
