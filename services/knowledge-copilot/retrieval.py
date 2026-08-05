@@ -29,9 +29,20 @@ MODES = ("dense", "lexical", "hybrid")
 RETRIEVAL_MODE = os.getenv("RETRIEVAL_MODE", "hybrid").lower()
 DEFAULT_LAM = 1.0
 
+if RETRIEVAL_MODE not in MODES:
+    # Checked at import, not per request: a typo in .env would otherwise 500 on
+    # every single call with nothing in the response explaining why. This way
+    # uvicorn refuses to start and says so.
+    raise ValueError(f"RETRIEVAL_MODE={RETRIEVAL_MODE!r} is not one of {MODES}")
+
 
 class EmptyIndexError(RuntimeError):
-    """The collection exists but holds no rows: the index was never built"""
+    """The index is unusable: no rows at all, or rows without embeddings.
+
+    Both mean the same thing to a caller — re-run ingest.py — and app.py maps
+    this to a 503. A bare RuntimeError here would reach the client as a 500 with
+    no explanation instead.
+    """
 
 
 @dataclass(frozen=True)
@@ -81,8 +92,8 @@ def load_index(collection) -> LexicalIndex:
         if embeddings is None or len(embeddings) != len(stored["ids"]):
             # A broken index, not a bad query. Scoring 0 here would blame
             # retrieval quality for an infrastructure fault.
-            raise RuntimeError(
-                f"collection {collection.name!r} returned no embeddings: re-ingest"
+            raise EmptyIndexError(
+                f"collection {collection.name!r} returned no embeddings: run ingest.py"
             )
         documents = list(stored["documents"])
         _index_cache[key] = LexicalIndex(

@@ -17,7 +17,11 @@ class StubCollection:
         # Any non-dense mode asks for the whole collection. Default to vectors
         # that make every chunk equally similar, so a test that cares about exact
         # scores still gets them from query()'s distances rather than from here.
-        self.embeddings = embeddings or [[1.0] * 4 for _ in rows]
+        # `is not None`, not `or`: passing [] must mean "an index with no vectors",
+        # which is a case a test needs to reach.
+        self.embeddings = (
+            embeddings if embeddings is not None else [[1.0] * 4 for _ in rows]
+        )
         self.query_kwargs = {}
 
     def count(self) -> int:
@@ -184,6 +188,16 @@ def test_metadata_filter_excludes_by_doc_type(provider):
     )
 
     assert [hit.source for hit in hits] == ["p.md"]
+
+
+def test_an_index_without_embeddings_raises_empty_index(provider):
+    rows = [("terminated with exit code 137", meta("c.md"), 0.35)]
+    collection = StubCollection(rows, embeddings=[])  # rows present, vectors gone
+
+    # EmptyIndexError, not a bare RuntimeError: app.py maps this to a 503 with a
+    # "run ingest.py" message. A RuntimeError reaches the client as a blank 500.
+    with pytest.raises(EmptyIndexError, match="no embeddings"):
+        retrieve(QUESTION, provider=provider, collection=collection, mode="lexical")
 
 
 def test_an_unknown_mode_is_rejected(provider):
