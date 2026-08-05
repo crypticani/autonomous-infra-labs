@@ -3,7 +3,7 @@ import requests
 
 from ingest import get_collection, ingest
 from llm import UpstreamError
-from retrieval import EmptyIndexError, retrieve
+from retrieval import CANDIDATE_POOL, EmptyIndexError, retrieve
 
 
 class StubCollection:
@@ -11,18 +11,33 @@ class StubCollection:
 
     name = "stub"
 
-    def __init__(self, rows, count=None):
+    def __init__(self, rows, count=None, embeddings=None):
         self.rows = rows
         self._count = len(rows) if count is None else count
+        # Any non-dense mode asks for the whole collection. Default to vectors
+        # that make every chunk equally similar, so a test that cares about exact
+        # scores still gets them from query()'s distances rather than from here.
+        self.embeddings = embeddings or [[1.0] * 4 for _ in rows]
         self.query_kwargs = {}
 
     def count(self) -> int:
         return self._count
 
+    def get(self, include=None):
+        # The whole collection, unlike query() -- this is what feeds BM25 and the
+        # cosine of a chunk only BM25 found.
+        return {
+            "ids": [f"doc:{i}" for i in range(len(self.rows))],
+            "documents": [text for text, _, _ in self.rows],
+            "metadatas": [meta for _, meta, _ in self.rows],
+            "embeddings": self.embeddings,
+        }
+
     def query(self, **kwargs):
         self.query_kwargs = kwargs
         rows = self.rows[: kwargs.get("n_results", len(self.rows))]
         return {
+            "ids": [[f"doc:{i}" for i in range(len(rows))]],
             "documents": [[text for text, _, _ in rows]],
             "metadatas": [[meta for _, meta, _ in rows]],
             "distances": [[distance for _, _, distance in rows]],
@@ -60,13 +75,14 @@ def test_an_empty_collection_raises(provider):
         retrieve(QUESTION, provider=provider, collection=StubCollection([], count=0))
 
 
-def test_k_reaches_the_collection(provider):
+def test_k_trims_a_larger_candidate_pool(provider):
     rows = [(f"text {i}", meta(f"doc{i}.md"), 0.10) for i in range(5)]
     collection = StubCollection(rows)
 
     hits = retrieve(QUESTION, provider=provider, collection=collection, k=2)
 
-    assert collection.query_kwargs["n_results"] == 2
+    # Chroma is asked for the pool, not k: MMR needs candidates to choose among.
+    assert collection.query_kwargs["n_results"] == CANDIDATE_POOL
     assert collection.query_kwargs["include"] == [
         "documents",
         "metadatas",
@@ -102,6 +118,78 @@ def test_embedding_failures_become_upstream_errors(error, status):
 
     # A Gemini embedding error used to escape app.py entirely as a 500.
     assert caught.value.status == status
+
+
+def test_bm25_rescues_a_chunk_the_dense_pool_missed(provider):
+    rows = [
+        ("a pod restarted", meta("a.md"), 0.20),
+        ("another pod restarted", meta("b.md"), 0.30),
+        ("terminated with exit code 137", meta("c.md"), 0.35),
+    ]
+    # pool=1 means the dense side only ever sees a.md, so BM25 is the only route
+    # by which c.md can surface -- the `137` case hybrid search exists for.
+    collection = StubCollection(rows, embeddings=[[1.0] * 4] * 3)
+    hits = retrieve(
+        "exit code 137",
+        provider=provider,
+        collection=collection,
+        mode="hybrid",
+        pool=1,
+        floor=0.0,
+    )
+
+    assert "c.md" in [hit.source for hit in hits]
+    # And it carries a real cosine from its stored embedding, not a sentinel and
+    # not a BM25 score, so the floor can still judge it on the same terms.
+    rescued = next(hit for hit in hits if hit.source == "c.md")
+    assert rescued.score == pytest.approx(sum(provider.embed_query("exit code 137")))
+
+
+def test_a_rescued_chunk_still_has_to_clear_the_floor(provider):
+    rows = [("terminated with exit code 137", meta("c.md"), 0.35)]
+    collection = StubCollection(rows, embeddings=[[0.0] * 4])  # cosine 0.0
+
+    hits = retrieve(
+        "exit code 137", provider=provider, collection=collection, mode="lexical"
+    )
+
+    # A keyword match must not smuggle a chunk past Day 10's refusal guard.
+    assert hits == []
+
+
+def test_metadata_filter_excludes_by_doc_type(provider):
+    rows = [
+        (
+            "runbook text",
+            {"source": "r.md", "chunk_index": 0, "doc_type": "runbook"},
+            0.2,
+        ),
+        (
+            "postmortem text",
+            {"source": "p.md", "chunk_index": 0, "doc_type": "postmortem"},
+            0.25,
+        ),
+    ]
+    collection = StubCollection(rows, embeddings=[[1.0] * 4] * 2)
+
+    # lexical mode, so this exercises retrieval.matches() rather than Chroma's
+    # own `where` -- the stub does not implement server-side filtering.
+    hits = retrieve(
+        "text",
+        provider=provider,
+        collection=collection,
+        mode="lexical",
+        where={"doc_type": "postmortem"},
+        floor=0.0,
+    )
+
+    assert [hit.source for hit in hits] == ["p.md"]
+
+
+def test_an_unknown_mode_is_rejected(provider):
+    collection = StubCollection([("x", meta("x.md"), 0.1)])
+    with pytest.raises(ValueError, match="unknown retrieval mode"):
+        retrieve(QUESTION, provider=provider, collection=collection, mode="magic")
 
 
 def test_retrieve_reads_documents_from_a_real_collection(corpus, backend):

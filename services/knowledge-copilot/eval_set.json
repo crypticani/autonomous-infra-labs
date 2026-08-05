@@ -1,0 +1,88 @@
+[
+    {
+        "kind": "overlap",
+        "question": "pods keep dying and restarting right after a deploy, exit code 137",
+        "primary": "oomkilled-pod.md",
+        "acceptable": ["crashloopbackoff.md", "reference-pod-resource-limits.md"],
+        "must_contain": "137"
+    },
+    {
+        "kind": "overlap",
+        "question": "container starts then immediately dies over and over, restart count climbing",
+        "primary": "crashloopbackoff.md",
+        "acceptable": ["oomkilled-pod.md"],
+        "must_contain": "CrashLoopBackOff"
+    },
+    {
+        "kind": "overlap",
+        "question": "how much memory should I actually give a pod, request versus limit",
+        "primary": "reference-pod-resource-limits.md",
+        "acceptable": ["oomkilled-pod.md"],
+        "must_contain": "throttl"
+    },
+    {
+        "kind": "postmortem",
+        "question": "what broke in the June checkout outage",
+        "primary": "postmortem-2026-06-checkout-oom-outage.md",
+        "acceptable": ["oomkilled-pod.md"],
+        "must_contain": "checkout",
+        "where": {"doc_type": "postmortem"}
+    },
+    {
+        "kind": "postmortem",
+        "question": "we served an expired certificate in July, what was the root cause",
+        "primary": "postmortem-2026-07-ingress-tls-expiry.md",
+        "acceptable": ["tls-cert-expiry.md"],
+        "must_contain": "cert-manager",
+        "where": {"doc_type": "postmortem"}
+    },
+    {
+        "kind": "exact_token",
+        "question": "too many clients already",
+        "primary": "postgres-conn-pool-exhaustion.md",
+        "acceptable": [],
+        "must_contain": "too many clients already"
+    },
+    {
+        "kind": "exact_token",
+        "question": "openssl x509 -noout -dates on the ingress cert",
+        "primary": "tls-cert-expiry.md",
+        "acceptable": ["postmortem-2026-07-ingress-tls-expiry.md"],
+        "must_contain": "x509"
+    },
+    {
+        "kind": "paraphrase",
+        "question": "one microservice cannot find another by its short name inside the cluster",
+        "primary": "coredns-resolution-failure.md",
+        "acceptable": [],
+        "must_contain": "CoreDNS"
+    },
+    {
+        "kind": "paraphrase",
+        "question": "builds sit queued forever and nothing ever picks them up",
+        "primary": "jenkins-agent-offline.md",
+        "acceptable": [],
+        "must_contain": "executor"
+    },
+    {
+        "kind": "plain",
+        "question": "the container image will not download and the pod is stuck pulling",
+        "primary": "imagepullbackoff.md",
+        "acceptable": [],
+        "must_contain": "ImagePullBackOff"
+    },
+    {
+        "kind": "plain",
+        "question": "nodes are evicting pods and reporting disk pressure",
+        "primary": "node-disk-pressure.md",
+        "acceptable": [],
+        "must_contain": "DiskPressure"
+    },
+    {
+        "kind": "absent",
+        "question": "why is our Kafka consumer lag growing",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    }
+]

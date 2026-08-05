@@ -40,6 +40,19 @@ class FakeProvider:
         return self._vector(text)
 
 
+@pytest.fixture(autouse=True)
+def clear_index_cache():
+    # retrieval's index cache is keyed on (collection name, row count), and every
+    # StubCollection is named "stub" -- so two same-sized stubs collide and the
+    # second test reads the first one's documents. Same leak the PersistentClient
+    # comment below is about: in-process state has to be reset per test.
+    from retrieval import _index_cache
+
+    _index_cache.clear()
+    yield
+    _index_cache.clear()
+
+
 @pytest.fixture
 def provider():
     return FakeProvider()

@@ -18,7 +18,7 @@ of answering from pretraining. Retrieval *quality* — hybrid search, reranking,
 is Day 11; what exists now is a defensible grounding contract, because a RAG service that
 answers confidently from nothing is worse than one that says it doesn't know.
 
-## Architecture (as of Day 10)
+## Architecture (as of Day 11)
 
 ```text
 corpus/*.md ──▶ load_corpus() ──▶ chunk_corpus(512, 64) ──▶ BaseEmbeddingProvider ──┬──▶ OllamaEmbeddingProvider  (nomic-embed-text)
@@ -30,12 +30,16 @@ corpus/*.md ──▶ load_corpus() ──▶ chunk_corpus(512, 64) ──▶ Ba
                      ingest.py: plan_reconcile(desired, existing) ┘            │
                      add / update / delete / skip  (idempotent)                │
                                                                                │
-POST /ask-runbook ──▶ retrieve() ──▶ embed_query() ─────────────────────────────▶ top-k + cosine distance
+POST /ask-runbook ──▶ retrieve() ──▶ embed_query() ─────────────────────────────▶ dense pool of 15 (HNSW)
    (app.py)          (retrieval.py)      │                                                   │
+                                         │        bm25_scores() over the cached index ──▶ lexical pool of 15
+                                         │                    (hybrid.py)                    │
+                                         │                                    rrf() fuses the two rankings
+                                         │                                                   │
                                          │                     score = 1 - distance, drop < 0.65
-                                         ▼                                                   │
+                                         ▼                     (cosine, never the fused score)
                      nothing cleared the floor? ──▶ refuse, no LLM call ◀────────────────────┘
-                                         │
+                                         │                                        top k=4
                      build_context() ──▶ <chunk id="n"> blocks ──▶ BaseLLMProvider ──┬──▶ OllamaProvider  (qwen2.5:7b-instruct)
                                          │                            (llm.py)       └──▶ GeminiProvider  (gemini-3.6-flash)
                                          ▼
@@ -52,15 +56,20 @@ POST /ask-runbook ──▶ retrieve() ──▶ embed_query() ─────�
 3. **`ingest.py`** (Day 9) — the durable ingestion pipeline. Reconciles the Chroma index to the
    corpus idempotently (add / update / delete / skip via a per-doc `content_hash`).
    `plan_reconcile` is a pure, unit-tested function.
-4. **`retrieval.py`** (Day 10) — question to ranked chunks: embed the query, rank by cosine
-   similarity, drop everything below the floor, return text *and* metadata. No LLM, no FastAPI.
-5. **`llm.py`** (Day 10) — the text-generation boundary. A second `BaseLLMProvider` ABC whose
+4. **`retrieval.py`** (Day 10, extended Day 11) — question to ranked chunks: embed the query,
+   build a candidate pool from dense and lexical rankings, fuse them, drop everything below the
+   floor, return text *and* metadata. No LLM, no FastAPI.
+5. **`hybrid.py`** (Day 11) — BM25, Reciprocal Rank Fusion, and MMR as pure functions over text
+   and vectors. No I/O at all, which is why its tests need neither Chroma nor a network.
+6. **`llm.py`** (Day 10) — the text-generation boundary. A second `BaseLLMProvider` ABC whose
    `generate()` returns a plain `str`, and an `UpstreamError` carrying the HTTP status its
    failure should become.
-6. **`app.py`** (Day 10) — FastAPI. Prompt assembly, citation validation, `POST /ask-runbook`,
+7. **`app.py`** (Day 10) — FastAPI. Prompt assembly, citation validation, `POST /ask-runbook`,
    `GET /health`. The grounding logic inside it is pure functions over strings.
-7. **`day8_embeddings.py`** — the Day 8 experiment. Indexes the corpus at three chunk sizes and
+8. **`day8_embeddings.py`** — the Day 8 experiment. Indexes the corpus at three chunk sizes and
    compares retrieval across them. A dated artifact, not a service entrypoint.
+9. **`eval_retrieval.py`** (Day 11) — the retrieval quality sweep over `eval_set.json`. Never
+   calls the generator, so the whole grid runs in seconds rather than 195s per answer.
 
 ## Design decisions worth defending
 
@@ -161,6 +170,17 @@ ollama pull nomic-embed-text     # 768-dim, ~274MB
 ollama pull qwen2.5:7b-instruct  # generation, ~4.7GB
 ```
 
+Day 11's retrieval sweep runs without the generator, so it costs seconds rather than minutes:
+
+```bash
+python eval_retrieval.py --modes dense --lam 1.0    # the baseline, on its own
+python eval_retrieval.py --filters                  # the full grid
+python eval_retrieval.py --modes hybrid --lam 1.0 0.5 0.3
+```
+
+It prints quality and latency per configuration, plus `soft_hit@1` broken out by query kind —
+which is where a technique that helps one kind and hurts another becomes visible at all.
+
 The Day 8 experiment is still runnable on its own: `python day8_embeddings.py --reset`.
 
 The script prints four sections: what a vector looks like and how cosine similarity separates
@@ -178,7 +198,8 @@ Config comes from the repo-root `.env`:
 | `CHROMA_PATH` | `services/knowledge-copilot/chroma_data` | Persistent index; gitignored, rebuildable |
 | `LLM_PROVIDER` | `ollama` | Generation backend: `ollama` or `gemini` |
 | `OLLAMA_CHAT_MODEL` | `qwen2.5:7b-instruct` | **Not** `OLLAMA_MODEL` — see below |
-| `SIMILARITY_FLOOR` | `0.65` | Below this score a chunk is not context |
+| `SIMILARITY_FLOOR` | `0.65` | Below this score a chunk is not context. Measured ~0.01 too high — see [findings](#two-failures-the-eval-found-that-are-not-ranking-problems) |
+| `RETRIEVAL_MODE` | `hybrid` | `dense`, `lexical`, or `hybrid`. Day 11's eval chose the default |
 | `LLM_TIMEOUT` | `300` | Seconds. 120 was not enough — see [findings](#day-10-latency-is-the-real-constraint) |
 | `COPILOT_PORT` | `7100` | Only used by `python app.py`; the log analyzer owns 7000 |
 
@@ -403,14 +424,103 @@ to discriminate.
   reliable. If it returns, `answer_source` already has a `"model_knowledge"` slot waiting.
 - **Metadata filtering** on the request. Chroma supports it and Day 9's chunks carry the
   metadata; it comes back when the eval needs to compare `doc_type=runbook` against
-  `doc_type=postmortem`.
+  `doc_type=postmortem`. *(Day 11 built and measured it — see
+  [the filter finding](#metadata-filters-cost-recall-and-bought-nothing).)*
 - **`/metrics`**, auth, and a shared LLM package across the two services. Day 14, Day 14, and
   Day 30 respectively — the third wants three call sites to design against, not two.
+
+## Day 11 — retrieval quality (`hybrid.py`, `eval_set.json`, `eval_retrieval.py`)
+
+Day 11 names four things: an eval set, hybrid keyword+vector search, reranking, and metadata
+filters. They were not built in that order. The eval came first, dense-only established a
+baseline, and each technique then had to move a number to survive. Two of the three did not, and
+that is recorded below rather than quietly dropped.
+
+### The eval set is built to fail
+
+Day 8's eval scored 5/5 on hit@1 for every chunk configuration, which is not a finding about
+chunking — it is a finding about an eval with no resolution left. `eval_set.json` is therefore
+composed to make retrieval hard: 3 queries where OOMKilled, CrashLoopBackOff and the
+resource-limits reference genuinely compete; 2 postmortem-versus-runbook pairs; 2 exact-token
+queries; 2 pure paraphrases with almost no shared vocabulary; 2 straightforward ones; and 1
+question the corpus cannot answer at all. Each of the 11 documents is `primary` exactly once.
+
+It worked: dense-only scores **8/12**, not 12/12.
+
+### Relevance is a set, plus one substring
+
+Day 10 scored the exit-code-137 query as a miss because it returned `crashloopbackoff.md` — but
+an OOMKilled pod *presents* as CrashLoopBackOff, and the two runbooks cross-reference each other.
+Binary single-label scoring cannot express that, so each case carries:
+
+```json
+{
+  "primary": "oomkilled-pod.md",
+  "acceptable": ["crashloopbackoff.md", "reference-pod-resource-limits.md"],
+  "must_contain": "137"
+}
+```
+
+`primary` drives `hit@1`, `primary ∪ acceptable` drives `soft_hit@1` and `recall@k`, and
+`must_contain` is the **chunk-level** check the day actually asks for — obtained with one `in`
+test instead of hand-labelling all 68 chunks. `primary: null` means the only correct behaviour is
+a refusal. This is deliberately not nDCG: graded 0–2 labels would mean hand-scoring ~36
+document-query cells, and on 12 queries MRR orders the candidate configurations identically.
+
+### BM25 by hand, fused on rank
+
+`hybrid.py` is ~15 lines of BM25 over `collections.Counter` and `math.log`, not `rank_bm25` — a
+new dependency for that much arithmetic isn't worth it, and the mechanism is the thing being
+learned. One detail matters more than it looks:
+
+```python
+idf = log(1 + (n - df[term] + 0.5) / (df[term] + 0.5))
+```
+
+The textbook form, `log((n - df + 0.5) / (df + 0.5))`, goes **negative** for any term appearing
+in more than half the corpus. Across 68 runbook chunks that means `pod`, `kubectl`, `restart` —
+and a negative idf actively penalises a chunk for containing a query term. The `1 +` floor keeps
+every contribution non-negative. `tests/test_hybrid.py` asserts a term present in every chunk
+still scores above zero, which is the test that would have caught the other formula.
+
+Fusion is Reciprocal Rank Fusion, on **rank** rather than score, because cosine lives in 0.65–0.90
+here and BM25 is unbounded — there is no honest way to add them. RRF over a single ranking is
+order-preserving, so `mode="dense"` and `mode="lexical"` need no special case.
+
+### The floor stays on cosine, and rescued chunks are scored properly
+
+RRF values land around 0.016–0.033. A 0.65 threshold on them would be meaningless, and it would
+silently break Day 10's refusal guard. So fusion only ever *reorders*; `Hit.score` remains cosine.
+
+One API-visible consequence: `sources` in an `/ask-runbook` response is **no longer sorted by
+score**. A real hybrid response looks like `0.707, 0.733, 0.771, 0.656` — because RRF decided the
+order and cosine is only the score attached to it. Re-sorting by score would discard the fusion,
+which is the same mistake MMR nearly made (see below). The order is the ranking.
+
+The candidate set is a **union**, not an intersection — otherwise hybrid degenerates into
+"reorder the dense results" and the case it exists for becomes unreachable. `137` is an exact
+token that cosine blurs, so BM25 must be able to surface a chunk dense search ranked 20th. Such a
+chunk gets its real cosine computed from its stored embedding, so a keyword match cannot smuggle
+anything past the floor. `test_a_rescued_chunk_still_has_to_clear_the_floor` pins that.
+
+### The index is loaded once, in full
+
+68 chunks × 768 dimensions is about 400KB, so one `collection.get(include=[…, "embeddings"])`
+serves BM25's corpus statistics, MMR's redundancy vectors, and the exact cosine of a rescued
+chunk, with no per-query round trip. Chroma's own `query()` still does the dense retrieval — the
+part that has to scale — rather than being replaced by a local scan.
+
+The cache is keyed on `(collection name, row count)`, which is a documented ceiling rather than a
+correct key: an in-place content edit that changes no row count will not bust it, so restart
+after re-ingest. That ceiling stopped being theoretical during testing — every `StubCollection`
+is named `"stub"`, so two same-sized stubs collided and the second test read the first one's
+documents. `conftest.py` now clears the cache per test, the same in-process leak its
+`PersistentClient` comment already warns about.
 
 ## Testing
 
 ```bash
-python -m pytest tests/ -q     # 57 tests, ~2s, no network
+python -m pytest tests/ -q     # 69 tests, ~2s, no network
 ```
 
 Every test file is offline and deterministic — no embedding call and no model call belongs in a
@@ -448,6 +558,17 @@ Below-floor chunks are dropped, nothing-above-floor returns `[]` while an empty 
 **raises**, `k` reaches the query, `include` asks for `documents`, and embedding failures come
 back as `UpstreamError` with 504/503. One test does run against real Chroma, to prove chunk text
 actually comes back — the thing the deleted `search()` could not do.
+
+Day 11 added four more there, covering the paths hybrid mode made load-bearing: BM25 rescuing a
+chunk the dense pool never returned (`pool=1` forces it), that a rescued chunk still has to clear
+the floor, that a metadata filter excludes by `doc_type`, and that an unknown mode raises rather
+than silently falling back to dense.
+
+`tests/test_hybrid.py` (Day 11) needs no fixtures at all — `hybrid.py` has no I/O, so BM25, RRF
+and MMR are testable as arithmetic. The MMR tests use unit vectors constructed from angles, so
+every dot product is exactly `cos(difference)` and the assertions are about geometry rather than
+about whatever a hash produced. Two of them share identical candidates and differ only in `lam`,
+which is what proves the reranker does something rather than nothing.
 
 `tests/test_grounding.py` is pure string work: byte-exact context blocks, marker extraction,
 consecutive `[1][2]` markers, shell subscripts that are *not* markers, stripping that leaves
@@ -565,12 +686,94 @@ measuring retrieval quality while ignoring a 3-minute answer would optimize the 
 The log analyzer never hit this because its prompts are one short log line. It is the first
 place this project has paid for retrieval augmentation rather than just benefited from it.
 
+### Day 11: three techniques measured, one shipped
+
+Run of 2026-08-05 — `nomic-embed-text`, 68 chunks, `k=4`, pool 15, floor 0.65, 12 eval queries.
+No generator call anywhere in this table; the whole sweep is milliseconds.
+
+| Config | hit@1 | soft@1 | recall@k | MRR | chunk | refused | p50 | p95 |
+|---|---|---|---|---|---|---|---|---|
+| dense (Day 10 baseline) | 8/12 | 8/12 | 0.85 | 0.79 | 10/11 | 2 | 3ms | 14ms |
+| dense + filter | 8/12 | 8/12 | 0.81 | 0.79 | 10/11 | 2 | 2ms | 3ms |
+| lexical (BM25 ranking) | 8/12 | **10/12** | **0.88** | **0.88** | 10/11 | 2 | 4ms | 15ms |
+| **hybrid (shipped)** | **9/12** | 9/12 | 0.85 | 0.83 | 10/11 | 2 | 5ms | 7ms |
+| hybrid + filter | 9/12 | 9/12 | 0.81 | 0.83 | 10/11 | 2 | 5ms | 6ms |
+
+`RETRIEVAL_MODE` now defaults to `hybrid`. Latency excludes the embedding call, which is cached
+across configurations precisely because it is constant across them — at 2–15ms, ranking is
+nowhere near the 195s the generator costs, so retrieval quality here is effectively free.
+
+**The honest caveat on that choice.** Lexical scored higher on three of the four quality metrics.
+The differences are one to two queries out of twelve, which this eval cannot resolve — so hybrid
+was chosen on a structural argument rather than on the headline number: BM25-only ranking requires
+shared vocabulary, and the eval has just two paraphrase queries to observe that failure with. A
+config that degrades gracefully when vocabulary doesn't overlap is the safer default heading into
+Day 13's chat interface. Widening the paraphrase set is the way to actually settle it.
+
+### MMR could not act, and the embedding space explains why
+
+MMR at `lam=0.7` changed **nothing** — identical output for all 12 queries in every mode. That
+looked like a bug, so it got measured across all 2,278 chunk pairs:
+
+| Pairs | n | mean cosine | min | max |
+|---|---|---|---|---|
+| same document | 185 | 0.787 | 0.661 | 0.881 |
+| different documents | 2,093 | 0.699 | 0.510 | 0.953 |
+
+Separation is **0.088**. MMR at `lam=0.7` over a 15-candidate pool needs a redundancy gap above
+`(0.7/15)/0.3 = 0.156` to move a single rank position. The signal is roughly half the size the
+knob needs — this is the [anisotropy](../../docs/knowledge-copilot.md#glossary) already in the
+glossary, now with a number attached: everything is similar to everything, so "too similar to what
+I already picked" is a distinction this space can barely make.
+
+Solving for the threshold says `lam < 0.57`, so lower values were tested rather than concluded
+about. At `lam=0.3` MMR finally reorders — and `chunk` drops 10/11 → 9/11 and MRR 0.79 → 0.78. It
+is inert above 0.57 and mildly harmful below it. **MMR does not ship**, `DEFAULT_LAM` stays 1.0,
+and the code stays in `hybrid.py` because the finding is the point.
+
+### Metadata filters cost recall and bought nothing
+
+Applying `where={"doc_type": "postmortem"}` to the two postmortem queries moved `recall@k` from
+0.85 to 0.81 and moved nothing else — same hit@1, same soft@1, same MRR, same chunk hits.
+
+The mechanism is obvious in hindsight and was invisible in advance: filtering to postmortems
+removes `oomkilled-pod.md` from reach, and that runbook is in the query's `acceptable` set. The
+filter is doing exactly what it was asked to and the ask was wrong. Both queries already scored
+2/2 unfiltered, because a question phrased as *"what broke in the June checkout outage"* is
+already lexically and semantically specific to the postmortem — there was no confusion left for a
+filter to resolve. **Filters stay off by default.** They earn their keep when a query is ambiguous
+across doc types, which Day 12's live alert data is far more likely to produce than 11 hand-written
+runbooks are.
+
+### Two failures the eval found that are not ranking problems
+
+**The floor costs a real answer.** *"builds sit queued forever and nothing ever picks them up"*
+returns nothing in every mode — best score **0.643** against a floor of 0.65. It is the right
+document missed by seven thousandths. The refusal count of 2 in every row above is therefore one
+correct refusal (the Kafka question, best 0.588) and one wrong one, and the gap between 0.643 and
+0.588 is the entire margin separating "tune the floor" from "the corpus cannot answer this". Day
+10 called the 0.65 floor a guess and asked Day 11 to calibrate it against real negatives; the
+answer is that it is roughly one hundredth too high, and the honest fix is more out-of-corpus
+queries to place it against, not nudging it until this one query passes.
+
+**The eval set's own `acceptable` sets are still too narrow.** On the exit-code-137 query,
+`postmortem-2026-06-checkout-oom-outage.md:1` wins at **0.796**, beating `oomkilled-pod.md:0` at
+0.758 — and that chunk literally reads `Code 137). Pod restarts; RESTARTS count begins climbing.`
+It is a defensible answer to the question, and it is not in `acceptable`, so it scores as a miss.
+This is precisely the Day 10 mistake recurring one level up: the fix for binary single-label
+scoring was applied, and the resulting label set was still drawn too tightly. Adding the
+postmortem to `acceptable` on both overlap queries would take hybrid to 11/12 on soft@1 — which is
+a judgement about what a good answer is, not a tuning knob, so it is left as an open call rather
+than applied to make the number look better.
+
 ## Not built yet
 
 | Capability | Day |
 |---|---|
-| Hybrid keyword+vector search, reranking, a real eval set (with latency) | 11 |
+| Cross-encoder reranking (needs a GPU; see the MMR finding for why not now) | later |
+| Widen the paraphrase set to separate lexical from hybrid properly | 12 |
+| Calibrate the 0.65 floor against more out-of-corpus queries | 12 |
 | Connector ingesting Prometheus alerts / K8s events | 12 |
 | Slack bot or web chat in front of the service | 13 |
 | `/metrics`, auth, architecture diagram, demo recording | 14 |
-| A CI workflow that runs these 57 tests | overdue |
+| A CI workflow that runs these 69 tests | overdue |

@@ -303,13 +303,15 @@ how each is implemented.
 
 # Part 2 — The code
 
-Six modules, each with one job.
+Seven modules, each with one job.
 
 ```
 corpus/*.md ──▶ chunking.py ──▶ embeddings.py ──▶ Chroma ◀── retrieval.py ◀── app.py ──▶ llm.py
                (text → pieces)  (text → vectors)  (store)   (rank + floor)  (prompt,   (text →
-                    ▲                                                        cite,      prose)
-                    └────────── ingest.py (reconcile the index) ──────────┘   validate)
+                    ▲                                            ▲          cite,      prose)
+                    └────────── ingest.py (reconcile) ───────┘    │          validate)
+                                                          hybrid.py
+                                                    (bm25, rrf, mmr — no I/O)
 ```
 
 ## 2.1 `chunking.py` — text into identified pieces
@@ -926,6 +928,296 @@ recommend a configuration nobody can wait for.
 
 ---
 
+# Part 4 — Retrieval quality
+
+## 4.1 The opening claim, revisited
+
+This document opens with `grep` failing. The runbook says "restart on a loop" and "Exit Code:
+137"; the question says "pods keep dying after deploy"; no characters match, so `grep` returns
+nothing. The conclusion drawn was that you need something matching **meaning** rather than
+characters.
+
+Day 11 measured that claim, and it needs qualifying. Ranking the same twelve questions by BM25 —
+which is `grep` with statistics bolted on, still matching nothing but characters — scored **higher
+than semantic search on three of the four quality metrics**.
+
+The premise was not wrong. Matching meaning is *necessary*: the paraphrased CoreDNS question
+("one microservice cannot find another by its short name") shares almost no vocabulary with its
+runbook, and only the embedding finds it. But necessary is not sufficient, and the reason is
+visible in the failures. Consider what the corpus actually contains:
+
+- `137` — an exit code. Three characters carrying more diagnostic information than any sentence
+  around them.
+- `too many clients already` — a Postgres error string, quoted verbatim from a log.
+- `x509`, `NET::ERR_CERT_DATE_INVALID`, `ImagePullBackOff`, `DiskPressure`.
+
+These are **identifiers**, not prose. An embedding's whole job is to map surface forms onto
+nearby positions in a space — which is exactly wrong for a token whose value is that it is
+*precisely itself*. `137` gets averaged into a 768-dimensional summary of the sentence it appeared
+in, and the distinction between "the chunk containing 137" and "a chunk about pods dying" softens
+into a distinction the vector can barely express.
+
+Keyword search doesn't blur, because it doesn't generalise. Both are correct about different
+questions, which is the entire argument for hybrid search: you are not picking a better retriever,
+you are refusing to pick.
+
+## 4.2 BM25 from first principles
+
+BM25 scores a document against a query by summing a contribution per shared term. Three ideas,
+each fixing a failure of the idea before it.
+
+**Idea one: count the term.** A chunk mentioning `137` five times is more about `137` than one
+mentioning it once. So score by term frequency, `tf`.
+
+This fails immediately. A chunk saying `137` twenty times is not twenty times more relevant than
+one saying it once — after two or three mentions you already know the chunk is about it. Raw `tf`
+lets one repetitive chunk dominate everything. So BM25 **saturates**:
+
+```
+tf * (k1 + 1) / (tf + k1)
+```
+
+As `tf` grows, this approaches `k1 + 1` and stops. The first occurrence buys the most, the second
+less, the tenth almost nothing. `k1 = 1.5` sets how fast the saturation bites.
+
+**Idea two: weight rare terms higher.** `pod` appears in nearly every chunk of a Kubernetes runbook
+corpus, so a chunk containing it has told you nothing. `137` appears in four documents out of
+eleven, so a chunk containing it has told you a great deal. That is inverse document frequency:
+
+```
+idf = log(1 + (n - df + 0.5) / (df + 0.5))
+```
+
+where `df` is how many chunks contain the term and `n` is how many chunks exist. Rare term → small
+`df` → large ratio → large `idf`. On this corpus a term in all 68 chunks scores `idf = 0.13`; a
+term in one scores `0.98`, about seven times more. The eval's exact-token queries live entirely
+off this multiplier.
+
+**The trap here is worth dwelling on.** The classical form of that formula is:
+
+```
+log((n - df + 0.5) / (df + 0.5))          # not what the code uses
+```
+
+When a term appears in more than half the chunks, the numerator drops below the denominator, the
+ratio drops below 1, and the log goes **negative**. A negative `idf` means a chunk is *penalised*
+for containing a query term — asking about pods makes chunks mentioning pods score worse. On a
+corpus of eleven documents that all discuss pods, this is not a corner case, it is Tuesday. The
+`1 +` inside the log floors every contribution at zero. `tests/test_hybrid.py` asserts that a term
+present in every chunk still scores above zero, which is the assertion that separates the two
+formulas.
+
+**Idea three: correct for length.** A 900-character chunk has more room to contain your term than a
+200-character one, purely by being longer. Left alone, BM25 quietly prefers long chunks. So the
+saturation denominator is scaled by how long this chunk is relative to the corpus average:
+
+```
+tf * (k1 + 1) / (tf + k1 * (1 - b + b * dl / avgdl))
+```
+
+`dl / avgdl` is above 1 for a long chunk, which inflates the denominator and shrinks the score.
+`b = 0.75` applies three-quarters of that correction — full correction (`b = 1`) over-punishes
+genuinely detailed chunks, none (`b = 0`) lets long chunks win on bulk alone.
+
+Put together, that is fifteen lines of `Counter` and `log`. No dependency was added for it, and
+writing it out is the only reason the negative-`idf` trap was ever noticed.
+
+## 4.3 Fusing two rankings you cannot add
+
+Now there are two ranked lists and one answer is needed. The obvious move — add the scores — does
+not survive contact with the numbers:
+
+| Ranker | Score of a good match | Score of a bad match | Range |
+|---|---|---|---|
+| Cosine | 0.76 | 0.59 | bounded, narrow, all positive |
+| BM25 | 8.4 | 0.0 | unbounded, depends on corpus size and query length |
+
+Adding `0.76` to `8.4` produces a number that means nothing. BM25 would swamp cosine entirely, and
+worse, the weighting would silently change as the corpus grew — `idf` depends on `n`. Normalising
+each to 0–1 first is the usual reflex, but min-max normalisation over a 15-item candidate list is
+unstable: one outlier compresses everything else, and the "best" score becomes 1.0 by definition
+whether it was good or not.
+
+**Reciprocal Rank Fusion** sidesteps the problem by discarding scores and keeping only positions:
+
+```python
+fused[doc_id] += 1 / (k + rank)          # k = 60
+```
+
+A chunk ranked 1st by cosine and 3rd by BM25 gets `1/61 + 1/63`. A chunk ranked 2nd by both gets
+`2/62`. Ranks are comparable across rankers in a way scores never are, because a rank is a
+statement about the ranker's own list rather than about a magnitude.
+
+`k = 60` is from the original TREC work, and its job is to flatten the top. Without it, first place
+(`1/1`) would be worth twice second place (`1/2`), and a single confident ranker would dictate the
+outcome. With it, `1/61` versus `1/62` is a 1.6% difference — so agreement between rankers matters
+more than confidence within one. That is the behaviour you want from a fusion rule.
+
+One consequence to be deliberate about: **the fused set is a union, not an intersection.** A chunk
+only BM25 found still appears. Restricting to chunks both rankers returned would reduce hybrid
+search to "reorder the dense results", and the entire `137` case — a chunk cosine ranked twentieth
+— becomes unreachable. Hybrid search that cannot rescue is not hybrid search.
+
+Which raises a safety question. If BM25 can inject a chunk on the strength of a keyword alone,
+what stops a chunk about something else entirely from reaching the model because it happened to
+contain `137`? The similarity floor, still applied — and applied to **cosine**, not to the fused
+score. Fusion decides ordering and nothing else; a rescued chunk has its real cosine computed from
+its stored embedding and must clear 0.65 like everything else. Two reasons this matters. RRF scores
+sit around 0.016–0.033, so a 0.65 threshold against them would admit literally everything. And
+§2.7's refusal behaviour — the endpoint that says *"Not covered in the runbooks"* and makes no model
+call — depends on `floor` continuing to mean *similarity to the question*. Changing what the number
+means would have broken grounding silently, while every test still passed.
+
+## 4.4 MMR, and a measurement that killed it
+
+Fusion decides which chunks are best. It has nothing to say about whether they're **redundant**.
+
+The failure mode is concrete. Ask about resource limits and the top four chunks come back as
+`reference-pod-resource-limits:0`, `oomkilled-pod:5`, `oomkilled-pod:3`,
+`postmortem:2` — with `k = 4`, three slots spent on documents already represented. The
+diagnosis you needed from a fourth document never arrives, and `recall@k` is capped by
+duplication rather than by ranking quality.
+
+**Maximal Marginal Relevance** picks greedily, penalising similarity to what it already holds:
+
+```
+score = lam * relevance - (1 - lam) * max(similarity to anything already picked)
+```
+
+At `lam = 1.0` it is pure relevance — the input order, unchanged, which makes it a free control
+condition. Lower `lam` trades rank position for variety.
+
+**One subtlety cost a rewrite.** The natural implementation passes the query vector and computes
+`relevance` as cosine. Do that in hybrid mode and MMR re-sorts the candidates by raw cosine —
+throwing away the fusion that just happened. MMR must inherit relevance from *whatever ranked the
+candidates*, so `mmr()` takes `(id, relevance, vector)` triples and `rank_relevance()` derives
+relevance linearly from position. This also puts relevance on the same 0–1 scale as the cosine
+redundancy term, without which `lam` has no consistent meaning.
+
+Then it was measured, and **it changed nothing.** Identical output on all twelve queries, in every
+mode. That looks like a dead code path, so the embedding space itself got measured — all 2,278
+chunk pairs:
+
+| Pairs | n | mean cosine |
+|---|---|---|
+| chunks of the *same* document | 185 | 0.787 |
+| chunks of *different* documents | 2,093 | 0.699 |
+
+**Separation: 0.088.** Now the threshold. Over a 15-candidate pool, one rank position is worth
+`lam / 15` of relevance; a redundancy gap is worth `(1 - lam)` times its size. For MMR to demote a
+near-duplicate by even one position at `lam = 0.7`:
+
+```
+0.3 * gap > 0.7/15   →   gap > 0.156
+```
+
+The signal available is 0.088. The knob needs 0.156. MMR is not being unhelpful — it is
+**structurally unable to act**, by roughly a factor of two.
+
+This is §1.4 returning with a bill. That section explained that unrelated text still scores 0.59
+because embeddings occupy a narrow cone rather than the full sphere, and treated it as a
+calibration nuisance — the reason the floor is 0.65 instead of a textbook 0.4. The same
+anisotropy means *everything is similar to everything*, so "too similar to what I already picked"
+is a distinction this space can barely draw. A property that looked like a threshold-tuning
+detail turned out to determine whether an entire technique can function.
+
+Solving `(1 - lam) * 0.088 > lam / 15` gives `lam < 0.57`, so rather than concluding from theory,
+lower values were run. At `lam = 0.3` MMR finally reorders — and `chunk_hit` drops from 10/11 to
+9/11 while MRR slips 0.79 to 0.78. Inert above 0.57, mildly harmful below it. So MMR does not
+ship, `DEFAULT_LAM` stays at 1.0, and the code stays in `hybrid.py` because the measurement is
+the deliverable.
+
+The upgrade path is not a better `lam`. It is an embedding model with more spread, or a
+cross-encoder that scores query-document pairs directly instead of comparing precomputed vectors
+— which needs a GPU this project does not have.
+
+## 4.5 Measuring retrieval at all
+
+Every conclusion above depends on the eval set being able to tell configurations apart. Day 8's
+could not: 5/5 on hit@1 for all three chunk sizes. That is not a finding about chunking, it is a
+finding about a measurement with no resolution left, and the cause was one runbook per topic —
+picking the right document out of eleven unrelated ones is too easy to discriminate.
+
+So the twelve queries are composed to be hard: three where OOMKilled, CrashLoopBackOff and the
+resource-limits reference genuinely compete; two postmortem-versus-runbook pairs; two exact-token
+queries; two paraphrases with near-zero shared vocabulary; two straightforward; and one the corpus
+cannot answer. Dense-only scores 8/12 — the set has room to move.
+
+**Relevance is a set, not a label.** Day 10 scored the exit-137 query as a miss for returning
+`crashloopbackoff.md`, which is wrong: an OOMKilled pod *presents* as CrashLoopBackOff and the two
+runbooks cross-reference each other. Binary single-label scoring cannot express "also correct", so:
+
+```json
+{
+  "primary": "oomkilled-pod.md",
+  "acceptable": ["crashloopbackoff.md", "reference-pod-resource-limits.md"],
+  "must_contain": "137"
+}
+```
+
+`primary` drives `hit@1`. `primary ∪ acceptable` drives `soft_hit@1` and `recall@k`. `MRR` — the
+reciprocal of the rank where the first relevant document appears — captures *how far down* an
+answer was, which a hit/miss count throws away. And `must_contain` is the **chunk-level** check
+the day asks for: not "did the right document appear" but "did a chunk carrying the actual answer
+appear", for the cost of one `in` test rather than labelling all 68 chunks.
+
+`primary: null` marks a question with no answer in the corpus, where the only correct behaviour is
+refusal. Day 10 asked for these explicitly: the 0.65 floor was calibrated against positives only,
+and a threshold set without negatives is a guess.
+
+**Why not nDCG.** The textbook metric grades each document 0–2 and discounts by `log2(rank + 1)`.
+It is the right tool at scale. Here it would mean hand-scoring ~36 document-query cells, and on
+twelve queries it orders the candidate configurations identically to MRR. It buys precision the
+decision does not consume.
+
+## 4.6 What the eval decided, including against its author
+
+| Config | hit@1 | soft@1 | recall@k | MRR | p50 |
+|---|---|---|---|---|---|
+| dense (Day 10 baseline) | 8/12 | 8/12 | 0.85 | 0.79 | 3ms |
+| lexical (BM25 ranking) | 8/12 | **10/12** | **0.88** | **0.88** | 4ms |
+| **hybrid (shipped)** | **9/12** | 9/12 | 0.85 | 0.83 | 5ms |
+| hybrid + metadata filter | 9/12 | 9/12 | 0.81 | 0.83 | 5ms |
+
+Read that table honestly and lexical wins. It was not shipped, and the reasoning has to be stated
+rather than buried: the differences are one to two queries out of twelve, which this eval cannot
+resolve, and BM25-only ranking has a structural failure mode — it requires shared vocabulary —
+that the eval has exactly two paraphrase queries to observe. Choosing hybrid is a bet that the
+under-sampled failure matters more than a one-query lead, ahead of a chat interface where
+paraphrase is the norm. The way to settle it is more paraphrase queries, not more argument.
+
+**Metadata filters cost recall and bought nothing.** `where={"doc_type": "postmortem"}` moved
+`recall@k` from 0.85 to 0.81 and moved nothing else. The mechanism is obvious afterwards: filtering
+to postmortems removes `oomkilled-pod.md`, which is in the query's `acceptable` set. The filter did
+exactly what it was told; the instruction was wrong. Both queries already scored 2/2 unfiltered,
+because *"what broke in the June checkout outage"* is already specific enough that there was no
+ambiguity left to resolve. A filter earns its keep when a query is genuinely ambiguous across doc
+types — which Day 12's live alert data is far likelier to produce than eleven hand-written runbooks.
+
+**The floor costs a real answer, by seven thousandths.** *"builds sit queued forever and nothing
+ever picks them up"* returns nothing in every mode: best score **0.643** against a floor of 0.65.
+The Kafka question — genuinely unanswerable — scores 0.588. That gap, 0.643 against 0.588, is the
+entire margin separating "the threshold is slightly wrong" from "the corpus cannot answer this",
+and it is the reason `retrieval.py` logs the best score alongside a refusal. Same empty list, two
+completely different bugs. Day 10 called 0.65 a guess and asked for calibration; the answer is that
+it is about a hundredth too high, and the fix is more negatives to place it against rather than
+nudging it until this one query passes.
+
+**And the eval set repeated the mistake it was built to fix.** On the exit-137 query,
+`postmortem-2026-06-checkout-oom-outage:1` wins at 0.796, beating `oomkilled-pod:0` at 0.758. That
+chunk reads `Code 137). Pod restarts; RESTARTS count begins climbing.` — it is a defensible answer
+to the question. It is not in `acceptable`, so it scores as a miss.
+
+This is Day 10's lesson recurring one level up. The fix for binary single-label scoring was
+applied, and the replacement label set was still drawn too tightly: a *postmortem of exactly this
+failure* was not considered an acceptable answer to a question about exactly this failure. Adding
+it would take hybrid to 11/12 on soft@1, which is precisely why it has not been added yet —
+changing the labels after seeing the scores is how an eval stops measuring anything. It is a
+judgement about what a good answer is, and it belongs in a separate decision from the run that
+exposed it.
+
+---
+
 # Glossary
 
 | Term | Meaning |
@@ -952,4 +1244,27 @@ recommend a configuration nobody can wait for.
 | **Temperature** | Randomness in generation. 0.1 for near-deterministic operational prose; Ollama reads it from `options`, not the top level |
 | **Prompt eval** | The model reading the prompt before generating anything. On CPU this dominates latency and scales with context size |
 | **hit@k** | Fraction of queries where the correct document appears in the top *k* results |
-| **Anisotropy** | The tendency of embeddings to occupy a narrow cone rather than the full sphere — why unrelated text still scores 0.59 |
+| **Anisotropy** | The tendency of embeddings to occupy a narrow cone rather than the full sphere — why unrelated text still scores 0.59, and why MMR cannot act. §4.4 |
+| **Dense retrieval** | Ranking by embedding similarity. "Dense" because every one of the 768 dimensions carries a value |
+| **Lexical retrieval** | Ranking by which query words appear in the text. Exact, not semantic — `grep` with statistics |
+| **Hybrid search** | Running both and combining the rankings, on the grounds that they fail on different questions. §4.1 |
+| **BM25** | The standard lexical scoring function: term frequency, saturated; weighted by rarity; corrected for length. §4.2 |
+| **tf** | Term frequency — how often a query term appears in this chunk |
+| **df** | Document frequency — how many chunks contain the term at all. Low `df` means the term discriminates |
+| **idf** | Inverse document frequency, `log(1 + (n - df + 0.5)/(df + 0.5))`. The `1 +` keeps it from going negative on a common term |
+| **Saturation** | Capping the reward for repetition, so the tenth mention of a term adds almost nothing. `k1` controls the rate |
+| **Length normalization** | Scaling a chunk's score by `dl / avgdl`, so a long chunk can't win on bulk. `b = 0.75` here |
+| **RRF** | Reciprocal Rank Fusion — combine rankings as `1/(k + rank)`, using positions because scores from different rankers aren't comparable. §4.3 |
+| **Candidate pool** | The over-fetch before final selection. 15 here against `k = 4`, so fusion and reranking have something to choose among |
+| **Rescue** | A chunk surfaced by one ranker that the other never returned. Why the fused set is a union; the `137` case. §4.3 |
+| **MMR** | Maximal Marginal Relevance — pick greedily, penalising similarity to what's already picked. Measured inert on this corpus. §4.4 |
+| **lambda (λ)** | MMR's dial between relevance and variety. `1.0` = pure relevance, i.e. no reranking at all, which is why it's the control. Below `0.57` on this corpus MMR can finally act, and makes things worse |
+| **Bi-encoder** | Embedding query and document *separately*, then comparing vectors. Everything in this service is one — which is what makes precomputed vectors and a vector database possible |
+| **Cross-encoder** | Feeding query and document through a model *together* and scoring the pair directly. Far more accurate than comparing two vectors, and unusable as a first-stage retriever: nothing can be precomputed, so every candidate costs an inference. The reranker Day 11 wanted and skipped. §4.4 |
+| **MRR** | Mean Reciprocal Rank — average of `1/rank` of the first relevant result. Captures *how far down* an answer was, which hit/miss discards |
+| **recall@k** | What fraction of the relevant documents made it into the top *k* at all |
+| **precision@k** | What fraction of the top *k* results are relevant. The mirror of recall@k: recall asks what was missed, precision asks what was wasted |
+| **soft hit@1** | Top result is the primary answer **or** one explicitly marked acceptable — how partial correctness gets expressed. §4.5 |
+| **primary / acceptable** | The eval set's two-tier answer key. `primary` is the single best document and drives `hit@1`; `acceptable` is what a competent engineer would also take, and widens `soft hit@1` and `recall@k`. The distinction exists because Day 10 scored a semantically right answer as a miss. §4.5 |
+| **must_contain / chunk hit** | A substring that has to appear in some retrieved chunk's text. Doc-level metrics only prove the right *file* was found; this is the cheap way to ask whether the chunk carrying the actual answer came back. §4.5 |
+| **nDCG** | The graded-relevance metric with logarithmic rank discounting. Correct at scale; deliberately skipped at twelve queries. §4.5 |
