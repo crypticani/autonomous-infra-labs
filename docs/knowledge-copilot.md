@@ -1218,6 +1218,222 @@ exposed it.
 
 ---
 
+# Part 5 — Live data
+
+## 5.1 What actually changes when the index stops being a folder
+
+Everything up to here was built over eleven markdown files, and those files have three properties
+the design leaned on without ever saying so:
+
+1. They change only when a human changes them.
+2. They never disappear.
+3. "The corpus" and "the collection" are the same set.
+
+Alerts break all three. They appear at 03:00 without asking, they vanish when the condition clears,
+and they share a collection with documents they do not own. None of that is a *feature* problem —
+the retriever, the chunker, and the grounding contract all work fine on an alert. It is an
+*invariant* problem, and the interesting part of this day is that two pieces of already-shipped,
+already-tested code were quietly resting on invariants that stopped being true.
+
+Say that more precisely, because it is the transferable lesson: **a cache key and a
+reconciliation scope are both statements about what can change.** Write them for data that only
+you edit and they are correct. Point the same code at data that edits itself and they are wrong —
+not slowly wrong, wrong on the first poll.
+
+## 5.2 The bug that deletes your corpus
+
+Day 9 built `plan_reconcile`, and its contract is simple: given what the index holds and what it
+*should* hold, produce adds, updates, and deletes. The deletes come from one line —
+
+```python
+plan.to_delete = [cid for cid in existing if cid not in desired_ids]
+```
+
+— and `existing` came from `existing_hashes(collection)`, which read **the entire collection**.
+
+That is exactly right while one source owns everything. `load_corpus()` returns every document
+there is, so anything in the index and not in that list was deleted from disk, and deleting it from
+Chroma is the correct response.
+
+Now add a second source. An alert sync's desired set is three alerts. It contains no runbooks —
+not because the runbooks are gone, but because runbooks are not this source's business.
+`plan_reconcile` cannot tell those apart. It sees 68 ids it was not asked for and deletes all of
+them.
+
+The fix is one parameter:
+
+```python
+def existing_hashes(collection, where: dict | None = None) -> dict[str, str]:
+    stored = collection.get(include=["metadatas"], where=where or None)
+```
+
+threaded through `ingest()`, so the corpus source reconciles against everything and the alert
+source reconciles against `{"doc_type": "alert"}`.
+
+What matters is *where* that fix went. The tempting version is a guard inside the alert connector —
+"don't delete anything that isn't an alert" — and it would work, for alerts. But the bug is not
+"alerts delete runbooks". The bug is that **reconciliation assumed a single owner**, and the next
+source to arrive — K8s events, Jenkins builds, PagerDuty incidents — walks into the identical trap
+with no guard of its own. Fixing it at the shared function is both the smaller diff and the only
+one that covers code nobody has written yet.
+
+## 5.3 Resolution is something you infer, not something you're told
+
+Alertmanager's `/api/v2/alerts` returns alerts that are *currently known*. When a condition clears,
+Prometheus sends a resolve, Alertmanager holds the alert for `resolve_timeout` — five minutes by
+default, and five minutes on appsrv — and then drops it entirely.
+
+So there is no "what resolved?" endpoint. There is no resolved-alert record to fetch. The only
+signal available is **the alert you had is no longer being mentioned**.
+
+That inverts the usual direction of a sync. Normally you ask the source what exists and write it
+down. Here you have to diff:
+
+```
+desired = live alerts from the API
+        + indexed alerts absent from the API, marked resolved, if under 24h old
+```
+
+Two consequences follow, and both are load-bearing.
+
+**First: retention needs no code.** An alert older than the window simply isn't in `desired`, and
+`plan_reconcile` already deletes what isn't desired. The retention policy is the *absence* of a
+document, not a deletion routine, a TTL field, or a cleanup job. This is what reusing Day 9's
+machinery bought — the entire 24-hour policy is one `continue` statement.
+
+**Second: an empty response is now dangerous.** If `merge` receives `[]`, it concludes that every
+indexed alert resolved simultaneously. For a genuinely quiet cluster that is exactly right. For an
+Alertmanager that just 500'd, timed out, or restarted, it is catastrophic and silent.
+
+A failed fetch and a quiet cluster produce *the same input*. The only thing distinguishing them is
+whether the request succeeded — a fact that exists at the moment of the call and nowhere
+afterwards. So it has to be preserved as control flow rather than flattened into a value:
+
+```python
+    except requests.exceptions.RequestException as e:
+        raise AlertmanagerError(f"Alertmanager at {url} did not answer: {e}") from e
+```
+
+`sync_alerts` deliberately does not catch that. The poll loop does, logs it, and tries again in
+sixty seconds having written nothing. This is why `fetch_alerts` returning `[]` on error would be
+a data-loss bug rather than a style preference, and why it has a test that asserts the collection
+is untouched.
+
+## 5.4 Why the same text has to be rendered twice
+
+A resolved alert cannot be re-fetched, so it is re-rendered from what the index already holds. That
+sounds like a detail and produced two of the day's bugs.
+
+**Why the status is in the text at all.** `/ask-runbook` builds its prompt from chunk *text*.
+Metadata never reaches the model. An alert whose metadata says `status: resolved` but whose text
+still reads `Status: firing` will be reported as an ongoing incident — fluently, in operational
+prose, with a citation marker that resolves correctly to a chunk that really was retrieved. Every
+grounding check from Day 10 passes. The answer is still false. So `Status:` and `Resolved:` are
+part of the document body, and the cost is one re-embed per resolution.
+
+**Why every timestamp is absolute.** The natural way to write an alert is `firing for 47 minutes`.
+Do that and the text changes on every poll → `content_hash` changes → `plan_reconcile` classifies
+every alert as an update → the entire alert set re-embeds every sixty seconds, forever, against a
+CPU-only Ollama. The live payload made the same point about `updatedAt`: it had drifted thirteen
+minutes past `startsAt` on an alert that had not otherwise changed. Duration is a display concern.
+The document stores the instant; the reader does the subtraction.
+
+**Why metadata is rebuilt from a list rather than copied.** When Chroma hands back a resolved
+alert's metadata, that dict contains `content_hash` and `indexed_at`, which `enrich()` stamped on
+after the hash was computed. Copy it wholesale into the next document and you are folding a hash
+into the input of its own successor. It never settles: every poll sees a change, every poll
+re-embeds. So `rebuild()` names the keys it carries — `META_KEYS`, `ANNOTATION_KEYS` — and takes
+nothing else.
+
+All three are one mistake wearing three hats: **something that varies leaked into the identity of
+something that didn't change.** It is worth learning as a shape rather than three rules, because
+the fourth instance will not look like any of them.
+
+## 5.5 The two bugs that only real data found
+
+The unit suite was green — 110 tests, including tests written specifically for churn and
+retention. Both of these appeared within twenty minutes of pointing the service at appsrv.
+
+**A resolved alert lost the only sentence worth reading.** `rebuild()` reconstructs the document
+from metadata, and annotations weren't stored, so they couldn't be restored. The shipped version
+carried a `ponytail:` comment saying so and judging it low-cost. Then a real alert resolved, and
+the line that disappeared was:
+
+```
+Summary: root filesystem is 79.3% full on 10.0.0.24:9100
+```
+
+That is not a nicety, it is the entire informational content of the document. What remained was an
+alertname, a severity, and two timestamps — a husk that would still match "NodeDiskSpaceLow" and
+tell a reader nothing. The estimate was wrong because it was made about a *shape* ("annotations")
+rather than about the *content* ("the number"). Carrying `summary` and `description` in metadata
+fixed it in three lines.
+
+**Chroma's `upsert` merges metadata; it does not replace it.**
+
+```python
+upsert(ids=["a"], metadatas=[{"status": "resolved", "resolved_at": "T1"}])
+upsert(ids=["a"], metadatas=[{"status": "firing"}])
+# → {'resolved_at': 'T1', 'status': 'firing'}
+```
+
+A key you *stop sending* survives. The retention code read
+
+```python
+resolved_at = meta.get("resolved_at") or now.isoformat()
+```
+
+which is correct if the key's presence means "this is resolved". Under merge semantics it means
+"this was resolved at some point, possibly long ago, possibly followed by re-firing". So a flapping
+alert — resolve, re-fire, resolve again — reads back the *first* resolution's timestamp, and if
+that is over 24 hours old the alert is deleted the moment it resolves the second time. A
+chronically flapping alert becomes the one alert the index refuses to keep.
+
+The fix is to stop trusting presence and start trusting a field that is rewritten every poll:
+
+```python
+already_resolved = meta.get("status") == "resolved" and meta.get("resolved_at")
+resolved_at = already_resolved or now.isoformat()
+```
+
+Note how it was found. A Prometheus restart pushed `NodeDiskSpaceLow` back to `pending`, which
+expired it out of Alertmanager, which resolved it in the index — and then its `for: 5m` re-elapsed
+and it fired again. Resolve → expire → re-fire, in about four minutes. No unit test had thought to
+write that sequence, because writing it requires having watched a real monitoring stack restart.
+The tests were not lacking rigour; they were lacking *imagination about time*, which is the thing
+production has and fixtures don't.
+
+## 5.6 What it cost the retriever
+
+The concern was concrete: BM25's `df` and `avgdl` are corpus-wide, so any chunk added anywhere
+changes the score of every query — including questions about runbooks that have nothing to do with
+alerts.
+
+Measured, corpus-only versus corpus plus three live alerts, nothing moved. Not one of hit@1,
+soft@1, recall@4, MRR, or chunk-hit changed in any of the six configurations.
+
+The honest reading is **unmeasurable, not absent**. Three chunks against 68 is 4.4% of the corpus,
+and twelve queries cannot resolve a shift that small. The mechanism is entirely intact; it just
+needs volume to show itself. Reporting this as "adding alerts is free" would be the same error the
+Day 8 eval made when it scored 5/5 on every chunk configuration and called it a result about
+chunking.
+
+What the run *did* establish is the thing the day was for:
+
+| Question | Top result |
+|---|---|
+| "is the disk filling up on the node right now" | the live alert, 0.760, ahead of `node-disk-pressure.md` at 0.729 |
+| "why do my pods get OOMKilled after a deploy" | runbook, postmortem, reference — no alert anywhere |
+
+Live state ranks first when the question is about now, and stays out of the way when it isn't. And
+the grounded answer cited both a runbook and an alert as separate sources, reporting that the disk
+was at 79.3% — a number that appears nowhere in the corpus and was thirty seconds old.
+
+That is the difference between a service that knows what OOMKilled means and one that knows what
+your infrastructure is doing.
+
+---
+
 # Glossary
 
 | Term | Meaning |
@@ -1268,3 +1484,12 @@ exposed it.
 | **primary / acceptable** | The eval set's two-tier answer key. `primary` is the single best document and drives `hit@1`; `acceptable` is what a competent engineer would also take, and widens `soft hit@1` and `recall@k`. The distinction exists because Day 10 scored a semantically right answer as a miss. §4.5 |
 | **must_contain / chunk hit** | A substring that has to appear in some retrieved chunk's text. Doc-level metrics only prove the right *file* was found; this is the cheap way to ask whether the chunk carrying the actual answer came back. §4.5 |
 | **nDCG** | The graded-relevance metric with logarithmic rank discounting. Correct at scale; deliberately skipped at twelve queries. §4.5 |
+| **Alertmanager** | The component that receives fired alerts from Prometheus and handles grouping, silencing, inhibition, and routing. The authority on alert *state* as an operator experiences it, which is why the connector reads it rather than Prometheus. §5.3 |
+| **Fingerprint** | Alertmanager's stable hash over an alert's label set. Two polls of the same alert produce the same fingerprint, which makes it the document id and the whole reason re-syncing embeds nothing. §5.3 |
+| **resolve_timeout** | How long Alertmanager keeps an alert after it stops firing — five minutes by default. After that it vanishes from the API entirely, which is why resolution has to be inferred from absence. §5.3 |
+| **Silenced / suppressed** | An alert muted at Alertmanager. Still firing; someone chose not to be notified. Rendered as `silenced`, never as `resolved` — the distinction is the difference between "fixed" and "ignored" |
+| **Scoped reconcile** | Restricting `plan_reconcile`'s read-back with a metadata filter so a source deletes only documents it owns. The fix for reconciliation having assumed a single owner. §5.2 |
+| **Retention window** | The 24 hours a resolved alert stays in the index, so a question at 09:00 still finds what fired at 03:00. Implemented as absence from the desired set, not as a deletion routine. §5.3 |
+| **Resolution by absence** | Concluding an alert resolved because a *successful* fetch did not mention it. Requires that a failed fetch be impossible to confuse with an empty one. §5.3 |
+| **Metadata merge** | Chroma's `upsert` folds new metadata keys into existing ones rather than replacing the dict, so a key you stop sending survives. The cause of the flapping-alert expiry bug. §5.5 |
+| **Alert flapping** | An alert that resolves and re-fires repeatedly. The sequence that no fixture had imagined and that production produced in four minutes. §5.5 |

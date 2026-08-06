@@ -9,6 +9,13 @@ This is **Project 2 (Week 2)** of the [30-day AI-Native DevOps challenge](../../
 > explains the concepts from the ground up and walks through what every part of the code is doing
 > and why. This README is the *what and how much*; that one is the *why*.
 
+**Status (through Day 12):** the index is no longer just a corpus. Alongside eleven runbooks and
+postmortems it now holds **live Alertmanager alerts**, synced every 60 seconds by a background
+task, retained 24 hours after they resolve. Ask *"is the disk filling up right now?"* and
+retrieval returns the firing alert ahead of the runbook that explains it, and the answer cites
+both separately. What made this a day's work rather than an afternoon's is that live data broke
+two assumptions the static-corpus design was resting on — see [Day 12](#day-12--live-infra-data-connectorsalertmanagerpy).
+
 **Status (through Day 10):** the service answers questions over HTTP and cites what it used.
 Text becomes vectors, vectors go into Chroma, `ingest.py` reconciles the index to the corpus on
 every run (add / update / delete / skip), and `POST /ask-runbook` retrieves the top-k chunks,
@@ -70,6 +77,11 @@ POST /ask-runbook ──▶ retrieve() ──▶ embed_query() ─────�
    compares retrieval across them. A dated artifact, not a service entrypoint.
 9. **`eval_retrieval.py`** (Day 11) — the retrieval quality sweep over `eval_set.json`. Never
    calls the generator, so the whole grid runs in seconds rather than 195s per answer.
+10. **`connectors/alertmanager.py`** (Day 12) — Alertmanager as a second document source.
+    Exactly one function does I/O (`fetch_alerts`); rendering and the resolved/expiry diff are
+    pure, which is why retention is tested against a recorded payload with no network and no
+    database. It returns `list[Document]` — the same type `load_corpus()` returns — so a
+    connector is a producer, not a parallel pipeline.
 
 ## Design decisions worth defending
 
@@ -517,10 +529,149 @@ is named `"stub"`, so two same-sized stubs collided and the second test read the
 documents. `conftest.py` now clears the cache per test, the same in-process leak its
 `PersistentClient` comment already warns about.
 
+Day 12 reached the other end of that ceiling — see below.
+
+## Day 12 — live infra data (`connectors/alertmanager.py`)
+
+Days 8–11 built a retriever over eleven markdown files. Those files have three properties the
+design quietly depended on: they change only when a human changes them, they never disappear, and
+"the corpus" and "the collection" are the same thing. Live alerts have none of them.
+
+So the work of this day was not writing an HTTP client. It was that **making the index live
+invalidates assumptions that were correct while it was static** — two of which were load-bearing
+in code that already shipped.
+
+### The pipeline
+
+```text
+                    every ALERT_SYNC_INTERVAL (60s), from app.py's lifespan
+                                          │
+        fetch_alerts() ──▶ GET /api/v2/alerts?active&silenced&inhibited
+              │              raises on ANY failure — never returns []
+              ▼
+        merge(live, indexed, now) ──▶ desired set:
+              │                        live alerts, rendered as prose
+              │                      + indexed alerts absent from the response,
+              │                        marked resolved, kept 24h
+              ▼
+        ingest(docs=…, where={"doc_type": "alert"})
+              │            scoped reconcile — deletes only what this source owns
+              ▼
+        _index_cache.clear()  if the plan changed anything
+```
+
+### An alert as a document
+
+Rendered as prose, not JSON, because the embedding model was trained on text. BM25 tokenizes
+either form equally well, so the dense side decides the format.
+
+```text
+Alert: NodeDiskSpaceLow
+Status: firing
+Severity: warning
+service: node | instance: 10.0.0.24:9100 | job: node
+Summary: root filesystem is 76.4% full on 10.0.0.24:9100
+Description: Disk pressure on the root filesystem. Left to grow this causes failed writes …
+Started: 2026-08-06T16:00:15.457Z
+```
+
+Identity is Alertmanager's own `fingerprint`, a stable hash over the label set, so the id is
+`alert-<fingerprint>:0` and an unchanged alert reconciles as `unchanged` with nothing re-embedded.
+At ~400 characters it is one chunk under `SIZE = 512`, needing no special case.
+
+**Every timestamp is absolute, and that is the load-bearing detail.** Rendering `firing for 47
+minutes` would change the text on every poll → change `content_hash` → make `plan_reconcile`
+classify every alert as an update → re-embed the entire alert set every 60 seconds against a
+CPU-only Ollama. `updatedAt` is excluded for the same reason; the live payload confirmed it
+drifting 13 minutes past `startsAt` while the alert sat unchanged.
+
+### Reconciliation assumed a single owner
+
+`existing_hashes()` read the whole collection, and `plan_reconcile` deletes every id not in
+`desired`. An alert sync's desired set contains no runbooks. **First poll, all 68 runbook chunks
+gone.**
+
+The fix is a `where` parameter threaded through `ingest()`, so each source reconciles only what it
+owns. It is deliberately framed as *reconciliation assumed a single owner* rather than *alerts
+delete runbooks* — the next source (K8s events, Jenkins builds) hits the identical bug, and a
+guard written inside the alert connector would not protect it. Verified live: `to_delete` is 0.
+
+### Resolution is inferred from absence
+
+Alertmanager returns *active* alerts. A resolved one is retained only for `resolve_timeout`
+(five minutes, confirmed in appsrv's config) and then disappears — there is no resolved-alert
+record to fetch. So an id in the index that a **successful** response did not mention has
+resolved. It is re-rendered with `Status: resolved`, kept 24 hours, then falls out of `desired` —
+and retention needs no deletion routine, because `plan_reconcile` already removes anything not
+desired.
+
+Status lives in the document *text*, not only in metadata, and that is a grounding requirement.
+`/ask-runbook` pastes text into the prompt; metadata never reaches it. A resolved alert whose text
+still reads `firing` gets reported as an ongoing incident — fluently, with a citation that
+resolves correctly. It costs one re-embed per resolution.
+
+### A failed fetch is not an empty cluster
+
+If Alertmanager 500s, times out, or has just restarted, the absence diff concludes that *every*
+indexed alert resolved at once. A failed fetch and a genuinely quiet cluster produce identical
+input and opposite correct behaviours.
+
+`fetch_alerts()` raises on any transport error or non-2xx, and `sync_alerts()` deliberately does
+not catch it — so a failed poll returns having read and written nothing. A successful `[]` is
+trusted. This is a data-loss path, so it has an explicit test that a raising fetch leaves the
+collection byte-identical.
+
+### The cache key reached its ceiling
+
+`retrieval.py`'s `_index_cache` is keyed on `(name, count)`, with a `ponytail:` comment predicting
+exactly when that would break. One alert resolving as another fires leaves the count identical and
+the content completely different, and the app would serve the resolved alert until uvicorn
+restarted.
+
+Because the writer now lives in-process it knows when it wrote, so the fix is
+`_index_cache.clear()` after a plan that changed something — one line instead of the content-hash
+key the comment proposed. Its limit is unchanged and still documented: a CLI re-ingest while the
+app runs still needs a restart.
+
+### The loop
+
+Started from `lifespan`, and shaped by three constraints. It runs through `asyncio.to_thread`,
+because `sync_alerts` blocks on Ollama embeddings for seconds and would otherwise stall every
+concurrent `/ask-runbook`. It reuses `open_collection()`'s client, because two `PersistentClient`s
+on one path in one process is a Chroma footgun. And it assumes a **single uvicorn worker** — two
+workers means two loops racing on the same writes, documented rather than solved with a lock,
+since a distributed lock for a single-node deployment is machinery for nobody.
+
+A tick never raises. An unreachable Alertmanager logs a warning and retries in 60 seconds; a dead
+monitoring stack must not take down the Q&A endpoint.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ALERTMANAGER_URL` | `http://localhost:9093` | v2 API base |
+| `ALERTMANAGER_TIMEOUT` | `10` | seconds per fetch |
+| `ALERT_SYNC_ENABLED` | `true` | the in-app poll loop; `false` for CLI-only use and in tests |
+| `ALERT_SYNC_INTERVAL` | `60` | seconds between polls |
+| `ALERT_RETENTION_HOURS` | `24` | how long a resolved alert survives |
+
+```bash
+python ingest.py --source alerts --dry-run   # plan only; to_delete must be 0
+python ingest.py --source alerts             # one sync, no app required
+```
+
+`--reset --source alerts` is refused: reset drops the whole collection, runbooks included, which
+is never what a caller syncing alerts meant. Alerts leave by retention, not by reset.
+
+The Prometheus rules that produce this data live in
+[`observability/alert-rules.yml`](./observability/alert-rules.yml) — appsrv had `rule_files:`
+empty, and a connector that reads Alertmanager cannot be demonstrated against an empty
+Alertmanager.
+
 ## Testing
 
 ```bash
-python -m pytest tests/ -q     # 69 tests, ~2s, no network
+python -m pytest tests/ -q     # 112 tests, ~3s, no network
 ```
 
 Every test file is offline and deterministic — no embedding call and no model call belongs in a
@@ -585,6 +736,25 @@ a spy LLM and a stubbed `retrieve`. The assertion that matters most is `spy.call
 below-floor path: *skipping* work is a claim that can only be proven by instrumenting the
 collaborator, the same trick as `FakeProvider.embed_calls` on Day 9. A green suite would
 otherwise say nothing about whether a refusal quietly called the model anyway.
+
+`tests/test_alertmanager.py` (Day 12) is the largest single file, and needs neither network nor
+database: `fetch_alerts` is the only I/O in the module, so `merge` and `to_document` are tested
+against a recorded payload (`tests/fixtures/alertmanager_alerts.json`, captured from appsrv). The
+tests worth naming are the ones asserting a *non-event*:
+
+| Test | Guarantee |
+|---|---|
+| `test_updated_at_never_reaches_the_document` | the field that would re-embed everything every 60s stays out |
+| `test_resyncing_a_resolved_alert_is_byte_identical` | rebuilt metadata folds in no `content_hash`, so the hash settles |
+| `test_a_resolved_alert_is_not_restamped_into_immortality` | `resolved_at` is kept, not refreshed, so retention can expire it |
+| `test_a_stale_resolved_at_on_a_firing_alert_is_ignored` | Chroma's metadata merge cannot expire a flapping alert |
+| `test_an_http_error_raises_rather_than_returning_empty` | a failed fetch is never mistaken for a quiet cluster |
+| `test_alertmanagers_zero_endsat_is_not_a_resolution` | `0001-01-01T00:00:00Z` is a zero value, not a past date |
+
+`tests/test_ingest.py` gained the integration half: `test_an_alert_sync_does_not_delete_the_corpus`
+and its mirror `test_a_corpus_ingest_does_not_delete_alerts` pin the scoped reconcile from both
+directions, and `test_a_failed_fetch_leaves_the_collection_untouched` drives the data-loss path
+through real Chroma rather than asserting on a plan.
 
 There is no CI workflow for this service yet. The existing
 [`log_analyzer_ci.yml`](../../.github/workflows/log_analyzer_ci.yml) is path-scoped to
@@ -766,14 +936,92 @@ postmortem to `acceptable` on both overlap queries would take hybrid to 11/12 on
 a judgement about what a good answer is, not a tuning knob, so it is left as an open call rather
 than applied to make the number look better.
 
+### Day 12: three alert chunks moved nothing, and that is not proof
+
+Measured against the Day 11 baseline, corpus-only versus the same corpus plus three live alerts:
+
+| config | hit@1 | soft@1 | recall@4 | MRR | chunk hit |
+|---|---|---|---|---|---|
+| dense, lam=1.0 | 8/12 → 8/12 | 8/12 → 8/12 | 0.85 → 0.85 | 0.79 → 0.79 | 10/11 → 10/11 |
+| lexical, lam=1.0 | 8/12 → 8/12 | 10/12 → 10/12 | 0.88 → 0.88 | 0.88 → 0.88 | 10/11 → 10/11 |
+| hybrid, lam=1.0 | 9/12 → 9/12 | 9/12 → 9/12 | 0.85 → 0.85 | 0.83 → 0.83 | 10/11 → 10/11 |
+
+Not one metric moved. The honest reading is *unmeasurable at this volume*, not *no effect*: BM25's
+`df` and `avgdl` are corpus-wide, so alert chunks genuinely do change the score of every query —
+but three chunks against 68 is 4.4% of the corpus, far below what twelve queries can resolve. The
+mechanism is untouched by this result. Re-measure if a hundred alerts ever fire at once.
+
+What the same run *did* show, on three questions outside the eval set:
+
+| Question | Top hits |
+|---|---|
+| "is the disk filling up on the node right now" | **alert 0.760**, then `node-disk-pressure.md` 0.729 |
+| "is anything failing to be scraped at the moment" | both `TargetDown` alerts; no runbook covers this |
+| "why do my pods get OOMKilled after a deploy" | runbook, postmortem, reference — **no alert intrusion** |
+
+The third row is the control that matters. Live data ranked first where it should and stayed out
+of the way where it shouldn't.
+
+End to end, `POST /ask-runbook` returned in 167s with `grounded: true`:
+
+> "the root filesystem on node 10.0.0.24:9100 is **currently** filling up [2]. The disk usage is at
+> **79.3%** … Reclaim space by pruning unused container images, old logs, or unused volumes. [1]"
+
+`[2]` is the live alert, `[1]` is the runbook. That percentage exists nowhere in the corpus.
+
+### Day 12: two bugs that only live data could find
+
+Both survived the full unit suite and appeared within twenty minutes of running against appsrv.
+
+**A resolved alert lost the only sentence worth reading.** `rebuild()` re-renders a resolved alert
+from index metadata, since Alertmanager no longer returns it. Annotations weren't stored, so they
+couldn't be restored — the shipped version carried a `ponytail:` comment calling this low-cost.
+Watching it happen said otherwise: the line that vanished was `root filesystem is 79.3% full on
+10.0.0.24:9100`, which is the entire informational content. A question about last night's alerts
+would have retrieved a husk of alertname plus two timestamps. Fixed by carrying `summary` and
+`description` in metadata (`ANNOTATION_KEYS`) rather than re-reading documents from Chroma on
+every poll.
+
+**Chroma's `upsert` merges metadata rather than replacing it.** Verified directly:
+
+```python
+upsert(ids=["a"], metadatas=[{"status": "resolved", "resolved_at": "T1"}])
+upsert(ids=["a"], metadatas=[{"status": "firing"}])
+# → {'resolved_at': 'T1', 'status': 'firing'}
+```
+
+A key you stop sending survives. So a *flapping* alert — resolve, re-fire, resolve again — read
+back the first resolution's timestamp through `meta.get("resolved_at") or now`, and if that was
+more than 24 hours old it would be deleted on the spot instead of retained. Found because the
+Prometheus restart pushed `NodeDiskSpaceLow` back to pending, expired it out of Alertmanager, and
+then re-fired it five minutes later — a sequence no unit test had thought to write. Fixed by
+gating on `status == "resolved"` instead of on the key's presence: `status` is rewritten every
+poll, the stale key is not.
+
+Both are the same class of mistake as the timestamp trap they sit next to: **something that varies
+leaked into the identity of something that hadn't changed.**
+
+### Day 12: the monitoring stack had no alert rules
+
+appsrv ran Prometheus, Alertmanager, and Grafana with `rule_files:` empty — nothing could ever
+fire, so there was nothing to ingest. Writing rules became part of the day. Three scrape targets
+were also genuinely broken, which is where the first real alerts came from: `postgres` scraped at
+`127.0.0.1:9187` from a host-network Prometheus, a self-scrape pointed at the Docker DNS name
+`prometheus:9090` that cannot resolve on the host network, and `torvix` down. The first was fixed,
+the third removed from monitoring; the self-scrape one is still firing and is a real
+misconfiguration rather than a demo prop.
+
 ## Not built yet
 
 | Capability | Day |
 |---|---|
 | Cross-encoder reranking (needs a GPU; see the MMR finding for why not now) | later |
-| Widen the paraphrase set to separate lexical from hybrid properly | 12 |
-| Calibrate the 0.65 floor against more out-of-corpus queries | 12 |
-| Connector ingesting Prometheus alerts / K8s events | 12 |
+| Widen the paraphrase set to separate lexical from hybrid properly | 13 |
+| Calibrate the 0.65 floor against more out-of-corpus queries | 13 |
+| Eval queries that target *live* state, so alert retrieval is measured not demonstrated | 13 |
+| Re-measure alert interference at ~100 firing alerts | when it happens |
+| K8s events as a second connector (no cluster attached yet) | later |
+| Webhook-based resolution instead of polling (needs the auth story) | 14 |
 | Slack bot or web chat in front of the service | 13 |
 | `/metrics`, auth, architecture diagram, demo recording | 14 |
-| A CI workflow that runs these 69 tests | overdue |
+| A CI workflow that runs these 112 tests | overdue |
