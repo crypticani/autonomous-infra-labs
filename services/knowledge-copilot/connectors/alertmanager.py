@@ -30,6 +30,12 @@ ALERT_DOC_TYPE = "alert"
 # makes it churn on every poll, forever.
 META_KEYS = ("severity", "instance", "service", "job")
 
+# Stored for the same reason, and learned the hard way: a resolved alert rebuilt
+# without them loses its summary and description, which is where the actual
+# information lives. "root filesystem is 79.3% full" is the sentence someone asking
+# "what alerted overnight?" needs; alertname and two timestamps are a husk.
+ANNOTATION_KEYS = ("summary", "description")
+
 # How long a resolved alert stays in the index. Long enough that a question at 09:00
 # can still find what woke someone at 03:00.
 RETENTION_HOURS = int(os.getenv("ALERT_RETENTION_HOURS", "24"))
@@ -93,6 +99,7 @@ def to_document(alert: dict, status: str, resolved_at: str | None = None) -> Doc
         "status": status,
         "started_at": alert["startsAt"],
         **{key: labels[key] for key in META_KEYS if key in labels},
+        **{key: annotations[key] for key in ANNOTATION_KEYS if annotations.get(key)},
     }
     # Omitted rather than set to None: Chroma rejects None metadata values.
     if resolved_at:
@@ -129,13 +136,10 @@ def live_status(alert: dict, now: datetime) -> tuple[str, str | None]:
 def rebuild(meta: dict, resolved_at: str) -> Document:
     """Re-render a resolved alert from index metadata, because Alertmanager dropped it.
 
-    Only the fields to_document needs are carried across -- see META_KEYS. Passing the
-    stored dict through wholesale would carry content_hash and indexed_at into the
-    next hash computation, and the hash would never settle.
-
-    ponytail: annotations are not stored, so a resolved alert loses its summary and
-    description lines. Fetch documents alongside metadatas in sync_alerts if that
-    prose turns out to matter for retrieval on resolved alerts.
+    Only the fields to_document needs are carried across -- see META_KEYS and
+    ANNOTATION_KEYS. Passing the stored dict through wholesale would carry
+    content_hash and indexed_at into the next hash computation, and the hash would
+    never settle.
     """
     alert = {
         "fingerprint": meta["fingerprint"],
@@ -144,7 +148,7 @@ def rebuild(meta: dict, resolved_at: str) -> Document:
             "alertname": meta["source"],
             **{key: meta[key] for key in META_KEYS if key in meta},
         },
-        "annotations": {},
+        "annotations": {key: meta[key] for key in ANNOTATION_KEYS if key in meta},
     }
     return to_document(alert, status="resolved", resolved_at=resolved_at)
 
@@ -178,10 +182,18 @@ def merge(
     for fingerprint, meta in indexed.items():
         if fingerprint in seen:
             continue
-        # Keep the original timestamp if it already resolved. Restamping it every
+        # Keep the original timestamp if it was already resolved. Restamping it every
         # poll would make a resolved alert immortal -- always "just resolved", never
         # old enough to expire.
-        resolved_at = meta.get("resolved_at") or now.isoformat()
+        #
+        # Gated on `status`, not on the key being present, because Chroma's upsert
+        # MERGES metadata rather than replacing it: once resolved_at is written it
+        # survives every later write that omits it. So a flapping alert -- resolve,
+        # re-fire, resolve again -- would read back the first resolution's timestamp,
+        # and if that is more than retention_hours old it gets deleted immediately
+        # instead of kept. status is rewritten on every poll; the stale key is not.
+        already_resolved = meta.get("status") == "resolved" and meta.get("resolved_at")
+        resolved_at = already_resolved or now.isoformat()
         if parse_ts(resolved_at) <= cutoff:
             # Falls out of `desired`, so plan_reconcile deletes it. Retention needs
             # no new code path -- only a correct desired set.

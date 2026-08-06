@@ -271,3 +271,27 @@ def test_connection_refused_raises(monkeypatch):
     monkeypatch.setattr(requests, "get", boom)
     with pytest.raises(AlertmanagerError):
         fetch_alerts("http://am:9093")
+
+
+def test_a_resolved_alert_keeps_its_summary_and_description():
+    """Rebuilt from metadata, a resolved alert must not lose the sentence that
+    carries the actual information -- 'root filesystem is 79.3% full' is what a
+    question about last night's alerts needs to match."""
+    was = indexed_from(merge([FIRING], indexed={}, now=NOW))
+    doc = merge([], indexed=was, now=NOW)[0]
+    assert "Summary: connection pool utilisation above 90%" in doc.text
+    assert "Description: postgres-primary has held" in doc.text
+
+
+def test_a_stale_resolved_at_on_a_firing_alert_is_ignored():
+    """Chroma's upsert MERGES metadata, so resolved_at survives every later write
+    that omits it. A flapping alert -- resolve, re-fire, resolve again -- would
+    otherwise read back the first resolution and expire instantly."""
+    stale = (NOW - timedelta(hours=40)).isoformat()
+    indexed = {
+        "a1b2c3d4e5f6": {**FIRING_META, "status": "firing", "resolved_at": stale}
+    }
+    docs = merge([], indexed=indexed, now=NOW)
+
+    assert len(docs) == 1, "a 40h-stale resolved_at must not expire a live alert"
+    assert docs[0].metadata["resolved_at"] == NOW.isoformat()

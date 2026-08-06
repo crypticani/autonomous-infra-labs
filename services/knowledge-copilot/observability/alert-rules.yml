@@ -1,0 +1,60 @@
+# Prometheus alerting rules for appsrv.
+#
+# Day 12 needs live alerts to ingest, and appsrv had no rule_files configured --
+# a connector that reads Alertmanager cannot be demonstrated against an empty
+# Alertmanager. These are deliberately real rules about real conditions, not
+# synthetic ones: TargetDown fires today for three genuinely broken scrape
+# targets, and the disk rule fires because / is 79% full.
+#
+# Deploy: copy to appsrv, reference from prometheus.yml, reload.
+#   rule_files:
+#     - /etc/prometheus/alert-rules.yml
+#   curl -X POST http://127.0.0.1:9090/-/reload
+#
+# `service` is set where it makes sense because Alertmanager's route groups by
+# it, and the connector carries it onto chunk metadata as a filter dimension.
+
+groups:
+  - name: infra
+    interval: 30s
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus cannot scrape {{ $labels.job }} at {{ $labels.instance }}"
+          description: >-
+            The target has been unreachable for two minutes. Either the exporter
+            is not running, its port is not published on the interface Prometheus
+            reaches it on, or the address is wrong for the network namespace
+            Prometheus itself runs in.
+
+      - alert: NodeDiskSpaceLow
+        expr: >-
+          100 - (node_filesystem_avail_bytes{mountpoint="/"}
+          / node_filesystem_size_bytes{mountpoint="/"} * 100) > 75
+        for: 5m
+        labels:
+          severity: warning
+          service: node
+        annotations:
+          summary: "root filesystem is {{ printf \"%.1f\" $value }}% full on {{ $labels.instance }}"
+          description: >-
+            Disk pressure on the root filesystem. Left to grow this causes failed
+            writes, evicted workloads, and a node that reports NotReady. Reclaim
+            space from container images, old logs, or unused volumes.
+
+      - alert: NodeMemoryHigh
+        expr: 100 * (1 - node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 85
+        for: 5m
+        labels:
+          severity: warning
+          service: node
+        annotations:
+          summary: "memory is {{ printf \"%.1f\" $value }}% used on {{ $labels.instance }}"
+          description: >-
+            Sustained high memory use on the node. Processes will start being
+            OOM-killed if it keeps climbing; check for a container without a
+            memory limit or a recent deploy that raised baseline usage.

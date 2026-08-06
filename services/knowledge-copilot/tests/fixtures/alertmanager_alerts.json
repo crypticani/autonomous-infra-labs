@@ -1,0 +1,87 @@
+[
+    {
+        "annotations": {
+            "description": "The target has been unreachable for two minutes. Either the exporter is not running, its port is not published on the interface Prometheus reaches it on, or the address is wrong for the network namespace Prometheus itself runs in.",
+            "summary": "Prometheus cannot scrape torvix at 10.0.0.24:8080"
+        },
+        "endsAt": "2026-08-06T15:39:45.457Z",
+        "fingerprint": "338f1c7b0efa2239",
+        "receivers": [
+            {
+                "name": "discord"
+            }
+        ],
+        "startsAt": "2026-08-06T15:23:45.457Z",
+        "status": {
+            "inhibitedBy": [],
+            "silencedBy": [],
+            "state": "active"
+        },
+        "updatedAt": "2026-08-06T15:35:45.461Z",
+        "generatorURL": "http://appsrv:9090/graph?g0.expr=up+%3D%3D+0&g0.tab=1",
+        "labels": {
+            "alertname": "TargetDown",
+            "instance": "10.0.0.24:8080",
+            "job": "torvix",
+            "severity": "warning"
+        }
+    },
+    {
+        "annotations": {
+            "description": "Disk pressure on the root filesystem. Left to grow this causes failed writes, evicted workloads, and a node that reports NotReady. Reclaim space from container images, old logs, or unused volumes.",
+            "summary": "root filesystem is 79.3% full on 10.0.0.24:9100"
+        },
+        "endsAt": "2026-08-06T15:39:45.457Z",
+        "fingerprint": "468857a01e20b7e2",
+        "receivers": [
+            {
+                "name": "discord"
+            }
+        ],
+        "startsAt": "2026-08-06T15:26:45.457Z",
+        "status": {
+            "inhibitedBy": [],
+            "silencedBy": [],
+            "state": "active"
+        },
+        "updatedAt": "2026-08-06T15:35:45.461Z",
+        "generatorURL": "http://appsrv:9090/graph?g0.expr=100+-+%28node_filesystem_avail_bytes%7Bmountpoint%3D%22%2F%22%7D+%2F+node_filesystem_size_bytes%7Bmountpoint%3D%22%2F%22%7D+%2A+100%29+%3E+75&g0.tab=1",
+        "labels": {
+            "alertname": "NodeDiskSpaceLow",
+            "device": "/dev/sda1",
+            "fstype": "ext4",
+            "instance": "10.0.0.24:9100",
+            "job": "node",
+            "mountpoint": "/",
+            "service": "node",
+            "severity": "warning"
+        }
+    },
+    {
+        "annotations": {
+            "description": "The target has been unreachable for two minutes. Either the exporter is not running, its port is not published on the interface Prometheus reaches it on, or the address is wrong for the network namespace Prometheus itself runs in.",
+            "summary": "Prometheus cannot scrape prometheus at prometheus:9090"
+        },
+        "endsAt": "2026-08-06T15:39:45.457Z",
+        "fingerprint": "b4cde5fa58d053d4",
+        "receivers": [
+            {
+                "name": "discord"
+            }
+        ],
+        "startsAt": "2026-08-06T15:23:45.457Z",
+        "status": {
+            "inhibitedBy": [],
+            "silencedBy": [],
+            "state": "active"
+        },
+        "updatedAt": "2026-08-06T15:35:45.461Z",
+        "generatorURL": "http://appsrv:9090/graph?g0.expr=up+%3D%3D+0&g0.tab=1",
+        "labels": {
+            "alertname": "TargetDown",
+            "instance": "prometheus:9090",
+            "job": "prometheus",
+            "severity": "warning"
+        }
+    }
+]
