@@ -1,10 +1,15 @@
 import hashlib
+import os
 import sys
 from pathlib import Path
 
 import chromadb
 import pytest
 from chromadb.config import Settings
+
+# Before app is imported: importing it would otherwise start a real poll loop against
+# whatever ALERTMANAGER_URL happens to be set to, on every test run.
+os.environ.setdefault("ALERT_SYNC_ENABLED", "false")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

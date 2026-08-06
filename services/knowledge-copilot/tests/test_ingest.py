@@ -2,7 +2,15 @@ import pytest
 from conftest import DOC
 
 from chunking import Chunk, Document
-from ingest import content_hash, get_collection, ingest, plan_reconcile
+from connectors.alertmanager import AlertmanagerError
+from ingest import (
+    content_hash,
+    existing_hashes,
+    get_collection,
+    ingest,
+    plan_reconcile,
+    sync_alerts,
+)
 
 
 def make_chunks(slug: str, count: int, digest: str) -> list[Chunk]:
@@ -122,3 +130,200 @@ def test_removed_doc_is_deleted_from_the_collection(corpus, backend):
 
     assert plan.to_delete == ["second:0"]
     assert collection.count() == 1
+
+
+# --- Day 12: a second source ------------------------------------------------
+
+ALERT = {
+    "fingerprint": "aaa",
+    "startsAt": "2026-08-06T14:22:11.000Z",
+    "endsAt": "2026-08-06T23:00:00.000Z",
+    "status": {"state": "active"},
+    "labels": {"alertname": "Probe", "severity": "warning"},
+    "annotations": {"summary": "probe is unhappy"},
+}
+OTHER_ALERT = {**ALERT, "fingerprint": "bbb", "labels": {"alertname": "Other"}}
+
+
+def alert_doc(fingerprint: str, status: str = "firing") -> Document:
+    return Document(
+        slug=f"alert-{fingerprint}",
+        text=f"Alert: Probe\nStatus: {status}\nStarted: 2026-08-06T14:22:11.000Z",
+        metadata={
+            "doc_type": "alert",
+            "source": "Probe",
+            "fingerprint": fingerprint,
+            "status": status,
+            "started_at": "2026-08-06T14:22:11.000Z",
+        },
+    )
+
+
+def test_an_alert_sync_does_not_delete_the_corpus(corpus, backend):
+    """The bug this scoping exists for. Unscoped, plan_reconcile deletes every
+    runbook chunk on the first alert poll, because no runbook is in the alert
+    source's desired set."""
+    provider, client = backend
+    ingest(provider=provider, client=client, corpus_dir=corpus)
+    collection = get_collection(client, provider)
+    corpus_chunks = collection.count()
+    assert corpus_chunks > 0
+
+    plan = ingest(
+        docs=[alert_doc("aaa")],
+        where={"doc_type": "alert"},
+        provider=provider,
+        client=client,
+    )
+
+    assert plan.to_delete == []
+    assert collection.count() == corpus_chunks + 1
+
+
+def test_a_corpus_ingest_does_not_delete_alerts(corpus, backend):
+    """The mirror case: re-ingesting the corpus must not evict live alerts."""
+    provider, client = backend
+    ingest(
+        docs=[alert_doc("aaa")],
+        where={"doc_type": "alert"},
+        provider=provider,
+        client=client,
+    )
+    collection = get_collection(client, provider)
+
+    plan = ingest(
+        provider=provider,
+        client=client,
+        corpus_dir=corpus,
+        where={"doc_type": "runbook"},
+    )
+
+    assert plan.to_delete == []
+    assert collection.get(where={"doc_type": "alert"})["ids"] == ["alert-aaa:0"]
+
+
+def test_a_resolved_alert_leaving_the_desired_set_is_deleted(corpus, backend):
+    provider, client = backend
+    ingest(provider=provider, client=client, corpus_dir=corpus)
+    collection = get_collection(client, provider)
+    ingest(
+        docs=[alert_doc("aaa"), alert_doc("bbb")],
+        where={"doc_type": "alert"},
+        provider=provider,
+        client=client,
+    )
+    before = collection.count()
+
+    plan = ingest(
+        docs=[alert_doc("aaa")],
+        where={"doc_type": "alert"},
+        provider=provider,
+        client=client,
+    )
+
+    assert plan.to_delete == ["alert-bbb:0"]
+    assert collection.count() == before - 1
+
+
+def test_existing_hashes_scopes_to_the_filter(corpus, backend):
+    provider, client = backend
+    ingest(provider=provider, client=client, corpus_dir=corpus)
+    ingest(
+        docs=[alert_doc("aaa")],
+        where={"doc_type": "alert"},
+        provider=provider,
+        client=client,
+    )
+    collection = get_collection(client, provider)
+
+    assert set(existing_hashes(collection, {"doc_type": "alert"})) == {"alert-aaa:0"}
+    assert len(existing_hashes(collection)) > 1  # unfiltered still sees everything
+
+
+def test_an_unchanged_alert_embeds_nothing(backend):
+    provider, client = backend
+    ingest(
+        docs=[alert_doc("aaa")],
+        where={"doc_type": "alert"},
+        provider=provider,
+        client=client,
+    )
+    after_first = provider.embed_calls
+
+    plan = ingest(
+        docs=[alert_doc("aaa")],
+        where={"doc_type": "alert"},
+        provider=provider,
+        client=client,
+    )
+
+    assert plan.to_upsert == []
+    assert provider.embed_calls == after_first  # not one vector recomputed
+
+
+def test_sync_writes_live_alerts(corpus, backend):
+    provider, client = backend
+    ingest(provider=provider, client=client, corpus_dir=corpus)
+    collection = get_collection(client, provider)
+    before = collection.count()
+
+    plan = sync_alerts(provider=provider, client=client, fetch=lambda: [ALERT])
+
+    assert [c.id for c in plan.to_add] == ["alert-aaa:0"]
+    assert collection.count() == before + 1
+
+
+def test_sync_marks_a_vanished_alert_resolved_and_keeps_it(backend):
+    provider, client = backend
+    sync_alerts(provider=provider, client=client, fetch=lambda: [ALERT, OTHER_ALERT])
+    collection = get_collection(client, provider)
+
+    sync_alerts(provider=provider, client=client, fetch=lambda: [ALERT])
+
+    stored = collection.get(ids=["alert-bbb:0"], include=["metadatas", "documents"])
+    assert stored["metadatas"][0]["status"] == "resolved"
+    assert "Status: resolved" in stored["documents"][0]
+
+
+def test_a_failed_fetch_leaves_the_collection_untouched(corpus, backend):
+    """The data-loss path. A raising fetch must not be reconciled against, or every
+    indexed alert is marked resolved because the response 'contained' none of them."""
+    provider, client = backend
+    ingest(provider=provider, client=client, corpus_dir=corpus)
+    sync_alerts(provider=provider, client=client, fetch=lambda: [ALERT])
+    collection = get_collection(client, provider)
+    before = collection.count()
+
+    def boom():
+        raise AlertmanagerError("appsrv is down")
+
+    with pytest.raises(AlertmanagerError):
+        sync_alerts(provider=provider, client=client, fetch=boom)
+
+    assert collection.count() == before
+    assert collection.get(ids=["alert-aaa:0"])["metadatas"][0]["status"] == "firing"
+
+
+def test_a_quiet_cluster_is_not_a_failure(backend):
+    """A successful [] is trusted: everything really did resolve."""
+    provider, client = backend
+    sync_alerts(provider=provider, client=client, fetch=lambda: [ALERT])
+    collection = get_collection(client, provider)
+
+    sync_alerts(provider=provider, client=client, fetch=lambda: [])
+
+    assert collection.get(ids=["alert-aaa:0"])["metadatas"][0]["status"] == "resolved"
+
+
+def test_a_resynced_resolved_alert_embeds_nothing(backend):
+    """The churn guard, end to end through Chroma: a resolved alert re-rendered from
+    stored metadata must hash identically or it re-embeds on every poll."""
+    provider, client = backend
+    sync_alerts(provider=provider, client=client, fetch=lambda: [ALERT])
+    sync_alerts(provider=provider, client=client, fetch=lambda: [])
+    after_resolution = provider.embed_calls
+
+    plan = sync_alerts(provider=provider, client=client, fetch=lambda: [])
+
+    assert plan.to_upsert == []
+    assert provider.embed_calls == after_resolution

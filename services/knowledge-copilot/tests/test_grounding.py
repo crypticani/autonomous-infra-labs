@@ -1,4 +1,12 @@
-from app import build_context, extract_markers, ground_answer, strip_markers
+from datetime import datetime, timezone
+
+from app import (
+    build_context,
+    extract_markers,
+    ground_answer,
+    grounded_system_prompt,
+    strip_markers,
+)
 from retrieval import Hit
 
 
@@ -84,3 +92,23 @@ def test_adjacent_citations_resolve_to_both_chunks():
     assert grounded is True
     assert [s.marker for s in sources] == [1, 2]
     assert answer == "one cause, two records [1][2]."
+
+
+# --- Day 12: the clock ------------------------------------------------------
+
+
+def test_the_prompt_states_the_current_time():
+    """Alert chunks carry absolute timestamps, so 'now' has to come from somewhere."""
+    now = datetime(2026, 8, 6, 16, 0, 0, tzinfo=timezone.utc)
+    assert "2026-08-06T16:00:00+00:00" in grounded_system_prompt(now)
+
+
+def test_the_prompt_still_carries_the_grounding_rules():
+    prompt = grounded_system_prompt(datetime.now(timezone.utc))
+    assert "Not covered in the runbooks." in prompt
+    assert "[1], [2]" in prompt
+
+
+def test_the_prompt_distinguishes_alerts_from_runbooks():
+    prompt = grounded_system_prompt(datetime.now(timezone.utc))
+    assert "live infrastructure state" in prompt

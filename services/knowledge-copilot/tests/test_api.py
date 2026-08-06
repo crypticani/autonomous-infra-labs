@@ -237,3 +237,68 @@ def test_health_degrades_instead_of_crashing(monkeypatch):
     assert body["status"] == "degraded"
     assert len(body["issues"]) == 2
     assert body["chunks_indexed"] == 0
+
+
+# --- Day 12: the background sync --------------------------------------------
+
+
+def test_a_changed_sync_clears_the_retrieval_index_cache(monkeypatch):
+    """retrieval's cache is keyed on (name, count). One alert resolving as another
+    fires leaves the count identical and the content completely different, so the app
+    would serve the resolved alert until someone restarted uvicorn."""
+    from ingest import Plan
+    from retrieval import _index_cache
+
+    _index_cache[("stub", 1)] = object()
+    monkeypatch.setattr(app_module, "sync_alerts", lambda: Plan(to_add=["x"]))
+
+    app_module.alert_sync_tick()
+
+    assert _index_cache == {}
+
+
+def test_an_unchanged_sync_leaves_the_cache_alone(monkeypatch):
+    from ingest import Plan
+    from retrieval import _index_cache
+
+    sentinel = object()
+    _index_cache[("stub", 1)] = sentinel
+    monkeypatch.setattr(app_module, "sync_alerts", lambda: Plan(unchanged=["x"]))
+
+    app_module.alert_sync_tick()
+
+    assert _index_cache[("stub", 1)] is sentinel
+
+
+def test_a_deletion_only_sync_still_clears_the_cache(monkeypatch):
+    """An expiring alert changes content without adding anything."""
+    from ingest import Plan
+    from retrieval import _index_cache
+
+    _index_cache[("stub", 1)] = object()
+    monkeypatch.setattr(app_module, "sync_alerts", lambda: Plan(to_delete=["x"]))
+
+    app_module.alert_sync_tick()
+
+    assert _index_cache == {}
+
+
+def test_an_unreachable_alertmanager_does_not_propagate(monkeypatch):
+    """A tick that raises must not kill the loop or reach a request."""
+    from connectors.alertmanager import AlertmanagerError
+
+    def boom():
+        raise AlertmanagerError("appsrv is down")
+
+    monkeypatch.setattr(app_module, "sync_alerts", boom)
+
+    app_module.alert_sync_tick()  # must not raise
+
+
+def test_an_unexpected_sync_error_does_not_propagate(monkeypatch):
+    def boom():
+        raise ValueError("something else entirely")
+
+    monkeypatch.setattr(app_module, "sync_alerts", boom)
+
+    app_module.alert_sync_tick()  # must not raise

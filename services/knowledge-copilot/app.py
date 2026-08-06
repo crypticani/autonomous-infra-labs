@@ -1,6 +1,9 @@
+import asyncio
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Literal
 
 import requests
@@ -9,12 +12,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from connectors.alertmanager import ALERTMANAGER_URL, AlertmanagerError
+from ingest import sync_alerts
 from llm import UpstreamError, get_llm_provider
 from retrieval import (
     DEFAULT_K,
     SIMILARITY_FLOOR,
     EmptyIndexError,
     Hit,
+    _index_cache,
     open_collection,
     retrieve,
 )
@@ -36,11 +42,25 @@ MARKER_RE = re.compile(r"(?<!\w)\[(\d+)\]")
 
 NOT_COVERED = "Not covered in the runbooks."
 
-GROUNDED_SYSTEM_PROMPT = """You are an on-call SRE assistant. Answer operational questions using ONLY the runbook excerpts inside <context>.
+ALERT_SYNC_INTERVAL = int(os.getenv("ALERT_SYNC_INTERVAL", "60"))
+ALERT_SYNC_ENABLED = os.getenv("ALERT_SYNC_ENABLED", "true").lower() == "true"
+
+
+def grounded_system_prompt(now: datetime) -> str:
+    """The grounding rules, plus a clock.
+
+    Retrieved alert chunks carry absolute timestamps -- deliberately, because a
+    relative one would churn the content hash on every poll. That makes "is this
+    happening now" unanswerable unless the prompt says what "now" is.
+    """
+    return f"""You are an on-call SRE assistant. Answer operational questions using ONLY the runbook excerpts inside <context>.
+
+The current time is {now.isoformat()}.
 
 Rules:
 - Use only facts stated in <context>. Never add commands, thresholds, or service names that are not there.
 - Cite every claim with the id of the chunk it came from, written as [1], [2]. Cite chunk ids, never file names.
+- A chunk beginning "Alert:" is live infrastructure state, not a runbook. Say whether it is firing or resolved, and when it started.
 - If <context> does not answer the question, reply with exactly: Not covered in the runbooks.
 - Be concise and practical: what is happening, then what to do. Plain prose, no preamble.
 """
@@ -117,10 +137,59 @@ def ground_answer(raw_answer: str, hits: list[Hit]) -> tuple[str, list[Source], 
     return answer, sources, grounded
 
 
+def alert_sync_tick() -> None:
+    """One sync, blocking. Never raises: a failed poll is logged and retried."""
+    try:
+        plan = sync_alerts()
+    except AlertmanagerError as e:
+        # Expected and recoverable -- appsrv reboots, the tailnet blips. The write was
+        # skipped, so the index still holds the last state we actually observed.
+        logger.warning(f"alert sync skipped: {e}")
+        return
+    except Exception:
+        logger.exception("alert sync failed")
+        return
+
+    if plan.to_upsert or plan.to_delete:
+        # The writer knows when it wrote, which is the whole fix for retrieval's
+        # (name, count) cache key: one alert resolving as another fires leaves the
+        # count identical and the content completely different. The CLI-writes-while-
+        # the-app-runs case keeps its existing "restart after re-ingest" caveat.
+        _index_cache.clear()
+        logger.info(
+            f"alert sync: +{len(plan.to_add)} ~{len(plan.to_update)} "
+            f"-{len(plan.to_delete)} ={len(plan.unchanged)}"
+        )
+
+
+async def alert_sync_loop() -> None:
+    while True:
+        # to_thread, not a direct call: sync_alerts blocks on Ollama embeddings for
+        # seconds at a time, and on the event loop that stalls every concurrent
+        # /ask-runbook request behind it.
+        await asyncio.to_thread(alert_sync_tick)
+        await asyncio.sleep(ALERT_SYNC_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    task = None
+    if ALERT_SYNC_ENABLED:
+        # Single worker assumed: two uvicorn workers means two loops racing on the
+        # same writes. Documented in the Readme rather than solved with a lock -- a
+        # distributed lock for a single-node deployment is machinery for nobody.
+        task = asyncio.create_task(alert_sync_loop())
+        logger.info(f"alert sync every {ALERT_SYNC_INTERVAL}s from {ALERTMANAGER_URL}")
+    yield
+    if task:
+        task.cancel()
+
+
 app = FastAPI(
     title="Knowledge Copilot",
     description="Answers ops questions from the runbook corpus, with citations",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 
@@ -140,7 +209,7 @@ def ask_runbook(request: AskRequest):
             )
 
         raw = get_llm_provider().generate(
-            GROUNDED_SYSTEM_PROMPT,
+            grounded_system_prompt(datetime.now(timezone.utc)),
             f"{build_context(hits)}\n<question>\n{request.question}\n</question>",
         )
     except EmptyIndexError as e:
