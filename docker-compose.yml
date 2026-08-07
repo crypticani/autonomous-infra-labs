@@ -19,3 +19,42 @@ services:
       timeout: 30s
       retries: 3
       start_period: 10s
+
+  knowledge-copilot:
+    build:
+      context: ./services/knowledge-copilot
+      dockerfile: Dockerfile
+    image: knowledge-copilot:latest
+    container_name: knowledge-copilot
+    env_file:
+      - .env
+    environment:
+      # Container-specific, so it overrides .env. OLLAMA_BASE_URL and ALERTMANAGER_URL
+      # are deliberately left to .env instead: on appsrv they are
+      # http://host.docker.internal:11434 and :9093, but from a laptop the tailnet
+      # address in .env already works from inside the container.
+      CHROMA_PATH: /app/chroma_data
+    # A bind mount does NOT inherit the image's ownership the way a named volume does --
+    # the host directory's uid wins. The image's appuser is uid 100, so without this the
+    # container cannot write the index. Running as the host owner of chroma_data also
+    # means the CLI (python ingest.py in a venv) and the container share one index
+    # instead of fighting over its permissions. Override in .env if `id -u` is not 1000.
+    user: "${KC_UID:-1000}:${KC_GID:-1000}"
+    # --workers 1: two workers means two alert-sync loops racing on the same writes.
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7100", "--workers", "1"]
+    ports:
+      # Loopback only. nginx proxies from the same host, and Docker's published ports
+      # install DNAT rules that bypass host firewalls.
+      - "127.0.0.1:7100:7100"
+    volumes:
+      - ./services/knowledge-copilot/corpus:/app/corpus:ro
+      - ./services/knowledge-copilot/chroma_data:/app/chroma_data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7100/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

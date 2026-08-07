@@ -1,0 +1,14 @@
+# The HNSW index is rebuildable from corpus/ and is mounted as a volume at runtime.
+# Without this, COPY . . bakes a stale copy into the image.
+chroma_data/
+
+# Tests stay a local venv activity, as they have since Day 8.
+tests/
+docs/
+
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+.env
