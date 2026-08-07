@@ -668,10 +668,191 @@ The Prometheus rules that produce this data live in
 empty, and a connector that reads Alertmanager cannot be demonstrated against an empty
 Alertmanager.
 
+## Day 13 — Slack interface (`slack_events.py`, `slack_client.py`, `sessions.py`)
+
+Slack acknowledges an event in **three seconds** or resends it. A grounded answer here takes
+**165–204 seconds** on CPU Ollama. Every other decision on this day follows from that ratio being
+roughly seventy to one.
+
+The resolution is that there is no connection to hold open. The acknowledgement and the answer are
+two separate HTTP conversations travelling in opposite directions, using the two Slack secrets for
+opposite jobs.
+
+### The pipeline
+
+```text
+Slack ──HTTPS──▶ Cloudflare ──▶ nginx (LE cert) ──▶ POST /slack/events   (container :7100)
+                              only `location = /slack/events` proxied   │
+                                                                        │ verify HMAC  → 401
+                                                                        │ url_verification → echo
+                                                                        │ seen event_id?   → 200 drop
+                                                                        └ empty 200, same second
+                                                                                  │
+                                                          spawn() ──▶ asyncio task │
+                                                                                  ▼
+                                            post ACK into the thread  ──▶ chat.postMessage
+                                            sessions.history(thread_ts)
+                                            retrieval_query(turns, question)
+                                            answer_question(...)      ← 165–204s, to_thread,
+                                                                        behind Semaphore(1)
+                                            sessions.append(...)
+                                            strip_fence_languages + format_sources
+                                                                      ──▶ chat.postMessage
+```
+
+| Secret | Direction | Job |
+|---|---|---|
+| `SLACK_SIGNING_SECRET` | inbound | Slack never sends a credential — it signs the body and you recompute the HMAC |
+| `SLACK_BOT_TOKEN` | outbound | authenticates *you* to `chat.postMessage` |
+
+The inbound leg is proven by the **Verified** badge on the Request URL. The outbound leg is proven
+by nothing until the first real mention — a wrong or unscoped bot token surfaces there and nowhere
+earlier, as `slack: could not post to the thread`, with the user seeing silence.
+
+### The signature is over the raw bytes
+
+`basestring = f"v0:{timestamp}:{raw_body}"`, HMAC-SHA256, compared with `hmac.compare_digest`. The
+handler takes a `Request` and awaits `request.body()`, because letting FastAPI parse to a model and
+re-serialising changes whitespace and key order, and the HMAC then never matches. Requests older
+than 300 seconds are rejected regardless: the HMAC itself never expires, so without an age check a
+captured request stays replayable forever.
+
+`slack_events.py` reads the secret from a module global rather than a default argument, because a
+default binds once at import and could not be patched in tests.
+
+### Retry dedupe is load control, not tidiness
+
+Slack resends on a non-200 or a response slower than three seconds, up to three times. At ~200
+seconds an answer, an undeduped retry does not merely duplicate work — it puts three jobs on a CPU
+that can just about serve one, so all three then miss the ack window and the failure compounds.
+`is_duplicate(event_id)` is therefore checked **before** any task is spawned.
+
+An unparseable body returns 200 rather than raising, for the same reason: a 500 makes Slack retry a
+body that can never parse.
+
+### A thread is a session
+
+```
+Turn = (question, answer)
+_sessions: thread_ts -> (last_used_at, [Turn, ...])   # in memory, per process
+```
+
+The motivating case is `what's the command to clear it?` — a question with no retrievable content
+of its own. It scores below `SIMILARITY_FLOOR` and comes back `Not covered in the runbooks.`
+Prefixed with the previous question it retrieves what answered turn one.
+
+**History feeds retrieval and generation at two different depths, on purpose.**
+
+| | Turns carried | Why |
+|---|---|---|
+| `retrieval_query()` | 1 | The query is the fragile side. Every extra word shifts BM25's term weighting and drags the dense vector toward the corpus centroid. Only prior *questions* are carried, never answers — an answer is 400 words of prose that would swamp the six words that matter. |
+| `prompt_history()` | 2 | The prompt tolerates more context than the retriever does. |
+
+A refusal is deliberately not remembered. Carrying a question that retrieved nothing would only
+dilute the next turn's query.
+
+Sessions are in memory only, which is the documented tradeoff rather than an oversight: a restart
+forgets every thread, and an in-flight question is lost with no message posted. Persistence for a
+single-node bot is machinery for nobody.
+
+### The thread is never left silent
+
+At 200 seconds a silent bot is indistinguishable from a broken one, and the person waiting has no
+way to tell which. Every terminal state posts:
+
+| Condition | Posted |
+|---|---|
+| answered | the answer, plus an italic source footer |
+| `answer_source: "none"` | `Not covered in the runbooks.` |
+| `EmptyIndexError` | the index is empty, run `ingest.py` |
+| `UpstreamError` | the model is unreachable |
+| question under `MIN_QUESTION_LENGTH` | ask a fuller question — and **no model call**, since a 200-second job is not spent on six characters |
+| any other exception | a generic failure line, plus `logger.exception()` |
+
+`AskRequest` enforces `min_length=10` for HTTP callers, but a 422 has nowhere to go inside a Slack
+thread, so the worker length-checks first.
+
+One answer at a time, behind `asyncio.Semaphore(1)`. CPU Ollama serializes internally anyway and
+the alert-sync loop is already competing for it every 60 seconds; two questions in flight means
+both take 400 seconds instead of one taking 200.
+
+### Slack mrkdwn is not markdown
+
+`**bold**` renders literally, `[text](url)` does nothing, and **triple-backtick fences have no
+language hints** — so ```` ```sh ```` renders as a code block whose first visible line is the word
+`sh`. That appeared in every production answer containing a command, and
+`strip_fence_languages()` removes it. The pattern is anchored per line and requires at least one
+character after the backticks, so closing fences and prose mentioning backticks are left alone.
+
+The source footer is built in Slack's dialect, one italic line per citation:
+
+```text
+_[2] node-disk-pressure.md #2 · 0.659_
+```
+
+### Deployment
+
+The service is containerised (`Dockerfile`, multi-arch amd64/arm64 published to GHCR by
+`knowledge_copilot_ci.yml`) and runs on appsrv behind nginx. The public surface is **one exact
+path**:
+
+```nginx
+location = /slack/events { proxy_pass http://127.0.0.1:7100/slack/events; }
+location / { return 404; }
+```
+
+`/ask-runbook` and `/health` are not proxied at all, which answers most of "auth on the endpoint"
+by having no public endpoint to authenticate. Verified from off-network: `/slack/events` → 401,
+`/health` → 404, `/ask-runbook` → 404. Three layers hold it: the instance NSG admits only 80 and
+443, nginx exposes one path, and the HMAC check with a five-minute replay window gates that path.
+
+`docker-compose.prod.yml` runs the published image instead of building. It is standalone rather
+than a compose override, because compose can add a key to a service but cannot remove one — layering
+it over `docker-compose.yml` would leave `build:` in place and rebuild from the working tree
+instead of running the image you pulled. `pull_policy: always` is set because a moving tag does not
+re-pull just because it moved.
+
+**The server has no repo checkout — only `docker-compose.prod.yml` and `.env`.** Two consequences,
+both learned the hard way:
+
+- The bind mounts are relative paths, so the directories must exist on the host *before* first
+  start. Docker creates a missing bind-mount source as `root:root`, which the container — running
+  as the host uid, since a bind mount keeps the host's ownership rather than inheriting the
+  image's — then cannot write. It surfaces as SQLite `unable to open database file` (code 14).
+- An empty directory mounted over `/app/corpus` silently shadows the runbooks baked into the image.
+  `ingest.py` then reports 0 documents and every question answers `Not covered`, with nothing in
+  the logs and `/health` still reporting `healthy` because the alert sync populated the collection
+  on its own.
+
+So the deploy procedure is: create `services/knowledge-copilot/{corpus,chroma_data}` under the
+compose file, copy the corpus markdown in, `chown` both to the uid the container runs as
+(`KC_UID`/`KC_GID`, default 1000), then `run --rm … python ingest.py` before `up -d`. A successful
+first ingest prints `add (did) 68`.
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `SLACK_SIGNING_SECRET` | — | *Basic Information → Signing Secret* |
+| `SLACK_BOT_TOKEN` | — | *OAuth & Permissions*, `xoxb-…` |
+| `SLACK_ENABLED` | `true` | opt-out flag, mirroring `ALERT_SYNC_ENABLED` |
+| `SLACK_TIMEOUT` | `10` | seconds per `chat.postMessage` |
+| `SESSION_TTL` | `3600` | seconds a thread stays in memory after its last use |
+| `SESSION_MAX_TURNS` | `4` | turns retained per thread |
+| `KC_UID` / `KC_GID` | `1000` | container user, must own the `chroma_data` bind mount |
+
+**Slack is active only when `SLACK_ENABLED` is true *and* both secrets are set.** Otherwise a
+warning is logged at startup and `/slack/events` returns 404 — which is what lets the offline test
+suite and a plain `python app.py` run with no credentials at all. `/health` reports
+`"slack": "active"` or `"disabled"`, never the token.
+
+Slack app requirements are deliberately minimal: bot scopes `app_mentions:read` and `chat:write`,
+one event subscription `app_mention`, `socket_mode_enabled: false`.
+
 ## Testing
 
 ```bash
-python -m pytest tests/ -q     # 112 tests, ~3s, no network
+python -m pytest tests/ -q     # 170 tests, ~20s, no network
 ```
 
 Every test file is offline and deterministic — no embedding call and no model call belongs in a
@@ -1011,17 +1192,88 @@ were also genuinely broken, which is where the first real alerts came from: `pos
 the third removed from monitoring; the self-scrape one is still firing and is a real
 misconfiguration rather than a demo prop.
 
+### Day 13: history depth is invisible next to answer length
+
+The prediction going in was that carrying prior turns in the prompt would make later turns slower —
+two turns is roughly 600 extra prompt tokens, and prompt evaluation dominates on CPU. Measured from
+the production logs, in one thread:
+
+| Turn | Mention → answer | Prior turns in prompt |
+|---|---|---|
+| 1 | 09:43:43 → 09:47:07 = **204s** | none |
+| 2 | 09:55:51 → 09:58:36 = **165s** | one |
+
+Turn 2 was **39 seconds faster** (~19%) while carrying more input. The prediction was wrong, and
+the reason is that **generation dominates, not prompt evaluation**: turn 1 produced a numbered list
+with three code blocks, turn 2 produced a single command. Output length swamps the input-side cost
+of history at this depth.
+
+Read as *unmeasurable at one prior turn*, not *free*. `HISTORY_TURNS_IN_PROMPT` is 2 and nothing
+here exercised two; the honest claim is that history depth is lost in the noise of answer length,
+from a sample of two turns.
+
+The ack posted in the **same second** as the mention on both turns. Sub-second against 204 seconds
+of work is the entire design in one number.
+
+### Day 13: the session layer worked, and it is the day's actual result
+
+Turn 2 was `what's the command to clear it?` and logged `answered grounded=True sources=[2]`,
+citing `node-disk-pressure.md`. That question has no retrievable content of its own — alone it
+scores under the 0.65 floor and returns `Not covered`. Concatenating the previous question into the
+retrieval query is what made it answerable, verified in production rather than only in tests.
+
+### Day 13: a real answer cleared the floor by 0.009
+
+The first production answer cited `node-disk-pressure.md #2` at **0.659**, against
+`SIMILARITY_FLOOR = 0.65`. A correct, well-cited, actionable answer survived by nine thousandths.
+
+Combined with Day 11's numbers — a real answer at 0.643 rejected, the unanswerable Kafka query at
+0.588 — the usable band is narrow and the floor is sitting inside it rather than below it. The
+nearest true negative is 0.588, so there is room to lower the floor to ~0.60. Deliberately not
+changed on the day it was observed: editing a threshold to admit an answer you have already read is
+how an eval stops measuring anything.
+
+### Day 13: two container traps that only a repo-less host finds
+
+Both were invisible on a laptop with the repo checked out, and both came from choosing a bind mount
+over a named volume.
+
+A named volume is seeded from the image's directory *including its ownership*, so `appuser` can
+write it with no setup. A bind mount keeps the **host** directory's uid instead — and Docker creates
+a missing bind-mount source as `root:root`, so the container cannot write the index. Chroma reports
+`unable to open database file`, which reads like corruption rather than permissions.
+
+Worse, the second one is silent. An empty host directory mounted over `/app/corpus` shadows the 11
+runbooks baked into the image. `ingest.py` reports 0 documents; `/health` still says `healthy`
+because the alert sync had populated the collection on its own; and the bot answers live-alert
+questions correctly while returning `Not covered` for every runbook question. Healthy, and useless
+for the thing it exists to do.
+
+### Day 13: Slack renders a fence language hint as code
+
+Slack's `mrkdwn` has no language-hinted fences, so a model emitting ```` ```sh ```` produces a code
+block whose first visible line is the word `sh`. It appeared in every answer containing a command
+and was invisible in tests, because no test asserted on the *rendered* output. Fixed by
+`strip_fence_languages()`.
+
+Related, and unfixed: the grounded prompt says "Plain prose, no preamble" and the model returned a
+numbered list with three code blocks anyway. Better for that question, but it means the formatting
+instruction is not being honoured — which matters the moment anything depends on it.
+
 ## Not built yet
 
 | Capability | Day |
 |---|---|
 | Cross-encoder reranking (needs a GPU; see the MMR finding for why not now) | later |
-| Widen the paraphrase set to separate lexical from hybrid properly | 13 |
-| Calibrate the 0.65 floor against more out-of-corpus queries | 13 |
-| Eval queries that target *live* state, so alert retrieval is measured not demonstrated | 13 |
+| Widen the paraphrase set to separate lexical from hybrid properly | 14 |
+| Lower the floor to ~0.60 — evidence now includes a real answer at 0.659 | 14 |
+| Eval queries that target *live* state, so alert retrieval is measured not demonstrated | 14 |
+| Multi-turn cases in `eval_set.json`, so the session layer is measured too | 14 |
 | Re-measure alert interference at ~100 firing alerts | when it happens |
 | K8s events as a second connector (no cluster attached yet) | later |
 | Webhook-based resolution instead of polling (needs the auth story) | 14 |
-| Slack bot or web chat in front of the service | 13 |
-| `/metrics`, auth, architecture diagram, demo recording | 14 |
-| A CI workflow that runs these 112 tests | overdue |
+| `store.py` / `errors.py` split — `retrieval.py` imports from `ingest.py`, and `UpstreamError` from `llm.py` for an embedding failure | 14 |
+| Session persistence across restarts (in-memory is deliberate for now) | later |
+| Unprefixed thread replies, so a follow-up needs no second @mention | later |
+| LLM query condensation instead of concatenation, measured against it | later |
+| `/metrics`, auth on `/ask-runbook`, architecture diagram, demo recording | 14 |

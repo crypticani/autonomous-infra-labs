@@ -1434,6 +1434,274 @@ your infrastructure is doing.
 
 ---
 
+# Part 6 — A conversation in front of it
+
+## 6.1 Seventy to one
+
+Every design decision on Day 13 comes out of one ratio. Slack acknowledges an event within **three
+seconds** or resends it. A grounded answer from this service takes **165 to 204 seconds** on a
+CPU-only Ollama. The transport's patience and the backend's latency differ by a factor of about
+seventy.
+
+There is no way to make one wait for the other, so the answer is to stop trying. The
+acknowledgement and the answer are two separate HTTP conversations travelling in opposite
+directions:
+
+1. Slack POSTs an event to `https://knowledge-copilot.crypticani.dev/slack/events`. The handler
+   verifies it, returns an empty `200` in under a second, and hands the work to a background task.
+2. Roughly three minutes later that task POSTs the answer to `https://slack.com/api/chat.postMessage`
+   with `thread_ts` set, and the reply appears in the thread.
+
+Nothing is held open. There is no socket, no session, no polling. Which is also why the two Slack
+secrets are not interchangeable: `SLACK_SIGNING_SECRET` verifies direction 1 — Slack never sends a
+credential, it signs the request body and you recompute the HMAC — while `SLACK_BOT_TOKEN`
+authenticates direction 2. One proves Slack is talking to you; the other proves you are allowed to
+talk back.
+
+This is also the argument against the alternative. Socket Mode inverts direction 1: your process
+opens an outbound WebSocket and events arrive down it, so no public URL is needed. Its single
+advantage evaporates when you already own a domain and an nginx, and it costs a framework
+dependency that hides the protocol. `chat.postMessage` beat the other obvious option — a slash
+command's `response_url` — for a plainer reason: `response_url` expires after 30 minutes, and a
+mechanism with an expiry window is a mechanism you can outrun.
+
+## 6.2 The signature is over bytes, not JSON
+
+```python
+basestring = b"v0:" + timestamp.encode("utf-8") + b":" + body
+digest = hmac.new(secret.encode("utf-8"), basestring, hashlib.sha256).hexdigest()
+return hmac.compare_digest(f"v0={digest}", signature)
+```
+
+`body` must be the raw bytes off the wire. This is the detail that catches people: the natural
+FastAPI reflex is to declare a Pydantic model and let the framework parse the request, but any
+round trip through a parser and back changes whitespace and key order, and an HMAC over
+re-serialised JSON will never match. So the handler takes a bare `Request` and awaits
+`request.body()` before touching anything.
+
+The age check matters independently of the signature. An HMAC has no notion of time — a captured
+request stays perfectly valid forever — so a timestamp more than 300 seconds old is rejected even
+when the digest is correct. That is the difference between authenticating a message and
+authenticating *this* delivery of it.
+
+One structural note that is really a testing note. `verify_signature` reads its secret from a
+module global when the caller does not pass one, rather than defaulting to it:
+
+```python
+def verify_signature(body, timestamp, signature, now, secret=None):
+    secret = SLACK_SIGNING_SECRET if secret is None else secret
+```
+
+A default argument binds once, at import. `monkeypatch.setattr(slack_events, "SLACK_SIGNING_SECRET",
+…)` would have had no effect on it, and the entire signature suite would have been untestable
+without real credentials. The same reasoning applies to `slack_active()`, which reads its three
+globals at call time.
+
+## 6.3 A retry is a load-amplification bug
+
+Slack resends an event when it gets a non-200 or waits longer than three seconds, up to three
+times. On a fast service that is a duplicate message. Here it is something worse.
+
+One question takes about 200 seconds. Three concurrent copies of it, on a CPU that can just about
+serve one, means all three run slower than one would have — so all three miss the ack window, and
+Slack has already given up on all of them. The retry mechanism designed to improve reliability
+degrades into a way to guarantee failure under exactly the conditions it was meant to help.
+
+So `is_duplicate(event_id)` is checked **before any task is spawned**, not after. And an unparseable
+body returns `200` rather than raising, for the same reason in miniature: a `500` invites Slack to
+retry a body that can never parse.
+
+`asyncio.Semaphore(1)` closes the other half of it. Even legitimate concurrent questions are
+serialized, because CPU Ollama serializes internally anyway and the Day 12 alert-sync loop is
+already competing for it every 60 seconds. Two questions in flight is not two answers in parallel;
+it is two answers each taking twice as long.
+
+## 6.4 What a session is for
+
+A Slack thread is the session. `thread_ts` is the key, and the history is the prior question-answer
+pairs in that thread.
+
+The case that justifies it:
+
+> **turn 1** — why is appsrv disk space filling?
+> **turn 2** — what's the command to clear it?
+
+Turn 2 has no retrievable content. Embedded on its own it is a question about clearing something,
+matching nothing in particular; it scores below the 0.65 floor and the service correctly refuses.
+The fix is not cleverness in the retriever, it is admitting that the query is incomplete and
+completing it from context.
+
+**The non-obvious part is that history should reach retrieval and generation at different depths.**
+
+```python
+HISTORY_TURNS_IN_QUERY  = 1
+HISTORY_TURNS_IN_PROMPT = 2
+```
+
+The retrieval query is the fragile side. It is a short string whose every token matters twice over:
+BM25 weights terms by corpus frequency, so added words redistribute the lexical score, and the
+dense vector is an average that drifts toward the corpus centroid as the text grows. A query that
+accumulates four turns of history stops being a question about anything.
+
+The prompt has no such sensitivity — it is already thousands of tokens of retrieved context, and
+two more turns changes nothing about how it is read.
+
+For the same reason, `retrieval_query()` carries only prior *questions*, never prior answers. An
+answer is 400 words of prose, and appending it to a six-word follow-up buries the six words.
+
+```python
+def retrieval_query(turns, question):
+    prior = [turn.question for turn in turns[-HISTORY_TURNS_IN_QUERY:]]
+    return " ".join([*prior, question])
+```
+
+A refusal is deliberately not appended to history. A question that retrieved nothing has no value
+as context and would only dilute the next query — so `answer_source == "none"` is posted to the
+thread and forgotten.
+
+Sessions live in a module-level dict with a TTL and a per-thread cap, and nothing else. A restart
+forgets every thread, and a question in flight during a restart is lost with no message posted.
+Both are real limitations, stated rather than engineered around: a durable store for a single-node
+bot with one user is machinery for nobody.
+
+## 6.5 Silence is the worst failure mode
+
+At 200 seconds a user cannot distinguish "working" from "broken", and every path that ends without
+a message looks identical to a crash. So the worker has one invariant — **every exit posts
+something** — and it is enforced by five tests, one per terminal state:
+
+| State | Posted |
+|---|---|
+| answered | the answer, plus an italic source footer |
+| nothing cleared the floor | `Not covered in the runbooks.` |
+| `EmptyIndexError` | the index is empty, run `ingest.py` |
+| `UpstreamError` | the model is unreachable |
+| unexpected exception | a generic failure line, and `logger.exception()` |
+
+There is a sixth, and it is the one an HTTP-first design gets wrong. `AskRequest.question` has
+`min_length=10`, which is correct for an API — a caller sending `disk?` should get a 422. But
+`@copilot disk?` is six characters once the mention is stripped, and a 422 has nowhere to go inside
+a Slack thread. The worker length-checks first and replies in prose, which also means a 200-second
+job is never spent on six characters.
+
+Even the outbound post has to fail quietly-but-loudly: `post()` catches `SlackError` and logs it,
+because a failed `chat.postMessage` must not propagate into the task's traceback and take the rest
+of the handler with it. `slack_client.post_message` raises rather than swallowing — and it checks
+`ok` in the response body, because Slack signals a missing scope or an unknown channel as
+`{"ok": false}` inside an HTTP 200, so `raise_for_status()` alone reports success on a message
+nobody received.
+
+## 6.6 Two bugs asyncio hands you for free
+
+`asyncio.create_task` returns a task the event loop holds only a **weak** reference to. A task
+whose only reference is the local variable in the function that created it can be garbage-collected
+mid-execution. Over 200 seconds that is not a theoretical window.
+
+```python
+_tasks: set[asyncio.Task] = set()
+
+def spawn(mention):
+    task = asyncio.create_task(answer_and_post(mention))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+```
+
+The second is inherited from Day 12 and re-earned here. `answer_question` blocks on Ollama for
+minutes, so calling it directly from the coroutine would stall the event loop — and with it the
+alert sync, the health endpoint, and every other Slack event. It runs through
+`asyncio.to_thread`, exactly as `alert_sync_tick` does.
+
+Keeping `spawn()` as its own named function had a second payoff that was not the motivation:
+the route tests can replace it with a list's `append` and assert on dispatch without ever starting
+an event loop, which is what makes the 401/404/challenge/dedupe tests deterministic.
+
+## 6.7 What the production run actually showed
+
+Three findings, one of which contradicts the prediction that motivated measuring at all.
+
+**History depth did not cost what it was supposed to.** The expectation was that two prior turns —
+roughly 600 extra prompt tokens — would slow later turns down, since prompt evaluation dominates on
+CPU.
+
+| Turn | Mention → answer | Prior turns |
+|---|---|---|
+| 1 | 09:43:43 → 09:47:07 = **204s** | none |
+| 2 | 09:55:51 → 09:58:36 = **165s** | one |
+
+Turn 2 was 39 seconds *faster* while carrying more input. Turn 1 produced a numbered list with
+three code blocks; turn 2 produced a single command. **Generation dominates, not prompt
+evaluation** — output length swamps the input-side cost of history at this depth. The honest
+framing is unmeasurable at one prior turn, from a sample of two turns, not free.
+
+The ack posted in the same second as the mention on both. Sub-second against 204 seconds is the
+whole design in one number.
+
+**The session layer worked, and that is the day's actual result.** Turn 2 logged
+`answered grounded=True sources=[2]`, citing `node-disk-pressure.md` — the chunk that answered turn
+1. The question that alone would have been refused was answered because the previous question was
+prepended to the retrieval query. Verified in production, not only in tests.
+
+**A correct answer cleared the floor by 0.009.** The cited chunk scored **0.659** against
+`SIMILARITY_FLOOR = 0.65`. Set against Day 11's numbers — a real answer at 0.643 rejected, the
+unanswerable Kafka query at 0.588 — the usable band is narrow and the floor sits inside it rather
+than beneath it. There is room to move it to ~0.60, where 0.588 is the nearest true negative. It
+was not moved on the day it was observed: adjusting a threshold to admit an answer you have already
+read is how an eval quietly stops measuring anything.
+
+## 6.8 The two traps of a host without a repo
+
+The service is containerised and published multi-arch to GHCR, and appsrv runs it from
+`docker-compose.prod.yml` and `.env` alone — no checkout. That last detail produced both failures
+of the deployment, and both trace to preferring a bind mount over a named volume.
+
+A named volume is seeded from the image's directory *including its ownership*, so the image's
+`appuser` can write it with no host setup at all. A bind mount does the opposite: it keeps the
+**host** directory's uid. And when the host path does not exist, Docker creates it as `root:root`.
+The container, running as the host uid so that the CLI and the container can share one index, then
+cannot write, and Chroma reports:
+
+```text
+chromadb.errors.InternalError: error returned from database: (code: 14) unable to open database file
+```
+
+Which reads like a corrupt index rather than a permissions problem.
+
+The second trap is worse because it is silent. An empty host directory mounted over `/app/corpus`
+shadows the eleven runbooks baked into the image. `ingest.py` then reports zero documents, and
+nothing anywhere says so — `/health` still returns `healthy`, because the Day 12 alert sync had
+populated the collection on its own. The bot answers "what is firing right now?" perfectly and
+returns `Not covered in the runbooks.` to every runbook question. Healthy, and useless for the
+thing it exists for.
+
+The general lesson is not about Docker. It is that **a health check reporting on the wrong subsystem
+is worse than no health check**, because it converts a loud failure into a confident lie.
+`chunks_indexed` was non-zero and `issues` was empty, and both were true.
+
+## 6.9 The rendered output is part of the contract
+
+Slack's `mrkdwn` is not markdown. `**bold**` renders literally, `[text](url)` does nothing, and —
+the one that mattered — **triple-backtick fences carry no language hint**. A model emitting
+```` ```sh ```` produces a code block whose first visible line is the word `sh`.
+
+Every production answer containing a command had it. Not one of 163 tests caught it, and the reason
+is worth keeping: the suite asserted on the *string the worker posts*, and that string was correct.
+The defect only existed in how a third party rendered it. A test can only fail on a property it
+represents, and "looks right in Slack" was not represented anywhere.
+
+```python
+FENCE_LANG_RE = re.compile(r"^```[A-Za-z0-9_+#.-]+[ \t]*$", re.MULTILINE)
+```
+
+Anchored per line so prose mentioning backticks survives, and requiring at least one character
+after them so closing fences never match.
+
+The related issue is still open. `GROUNDED_SYSTEM_PROMPT` says "Be concise and practical … Plain
+prose, no preamble", and the model returned a four-item numbered list with three code blocks. For
+that question it was the better answer — but a prompt instruction that is not honoured is not a
+constraint, and it will matter the first time something downstream depends on the shape.
+
+---
+
 # Glossary
 
 | Term | Meaning |
