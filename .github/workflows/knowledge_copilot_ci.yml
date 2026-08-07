@@ -38,7 +38,14 @@ jobs:
 
   build-and-push:
     needs: [lint-and-test]
+    # A no-op while `pull_request` sits nested under `push:` above and never fires. It
+    # is here so that fixing that indentation cannot, on its own, start publishing
+    # :latest from unmerged pull-request code.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3

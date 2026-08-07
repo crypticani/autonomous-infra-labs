@@ -32,7 +32,11 @@ services:
     # writes. uvicorn defaults to one, so no flag is needed to get it.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${COPILOT_PORT:-7100}"]
     ports:
-      - "${COPILOT_PORT:-7100}:${COPILOT_PORT:-7100}"
+      # Loopback only: nginx terminates TLS on the same host and proxies to it. Docker
+      # publishes ports via nat/PREROUTING, ahead of any filter/INPUT rule a host
+      # firewall adds, so the bind address is the control that actually holds here.
+      # A cloud NSG still filters before the NIC, but this is the layer under it.
+      - "127.0.0.1:${COPILOT_PORT:-7100}:${COPILOT_PORT:-7100}"
     # log-analyzer is stateless and mounts nothing; this service has a corpus and an
     # index. A bind mount keeps the HOST directory's uid rather than inheriting the
     # image's, and the image runs as appuser (uid 100) -- so the container user is

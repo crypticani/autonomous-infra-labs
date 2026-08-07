@@ -1,0 +1,71 @@
+# Production compose: runs the published GHCR images instead of building from source.
+#
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# Standalone rather than an override. Compose can add to a service but cannot remove a
+# key, so layering this over docker-compose.yml would leave `build:` in place and `up`
+# would rebuild from the working tree instead of running the image you just pulled.
+#
+# A fresh host still needs the copilot's index populated once, before first start:
+#   docker compose -f docker-compose.prod.yml run --rm knowledge-copilot python ingest.py
+#
+# Both services read the same root .env. See .env.example for every key.
+
+services:
+  log-analyzer:
+    image: ghcr.io/crypticani/autonomous-infra-labs/log-analyzer:${LOG_ANALYZER_TAG:-latest}
+    # A moving tag does not re-pull just because it moved: if an image with the same tag
+    # is already local, `up` reuses it and the host quietly keeps serving the old build.
+    pull_policy: always
+    container_name: log-analyzer
+    env_file:
+      - .env
+    command: ["uvicorn", "log_analyzer:app", "--host", "0.0.0.0", "--port", "${PORT:-7000}"]
+    ports:
+      - "${PORT:-7000}:${PORT:-7000}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:$PORT/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 10s
+
+  knowledge-copilot:
+    image: ghcr.io/crypticani/autonomous-infra-labs/knowledge-copilot:${KNOWLEDGE_COPILOT_TAG:-latest}
+    pull_policy: always
+    container_name: knowledge-copilot
+    env_file:
+      - .env
+    # Single worker on purpose -- two would run two alert-sync loops racing on the same
+    # writes. uvicorn defaults to one, so no flag is needed to get it.
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${COPILOT_PORT:-7100}"]
+    ports:
+      # Loopback only: nginx terminates TLS on the same host and proxies to it, and
+      # nothing else needs the port. Docker publishes via nat/PREROUTING, ahead of any
+      # filter/INPUT rule a host firewall adds, so the bind address is the control that
+      # actually holds here. A cloud NSG still filters before the NIC; this is the layer
+      # underneath it.
+      - "127.0.0.1:${COPILOT_PORT:-7100}:${COPILOT_PORT:-7100}"
+    # A bind mount keeps the HOST directory's uid rather than inheriting the image's,
+    # and the image runs as appuser (uid 100) -- so the container user is overridden to
+    # the host owner of chroma_data, which also lets the CLI and the container share one
+    # index. Override in .env if `id -u` is not 1000 on this host.
+    user: "${KC_UID:-1000}:${KC_GID:-1000}"
+    volumes:
+      # Both bind mounts, so a runbook edit or a re-ingest needs no new image.
+      - ./services/knowledge-copilot/corpus:/app/corpus:ro
+      - ./services/knowledge-copilot/chroma_data:/app/chroma_data
+    extra_hosts:
+      # Ollama, Alertmanager and Prometheus run on the host, not in this project.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:$COPILOT_PORT/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 10s
