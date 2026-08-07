@@ -11,6 +11,12 @@ from chromadb.config import Settings
 # whatever ALERTMANAGER_URL happens to be set to, on every test run.
 os.environ.setdefault("ALERT_SYNC_ENABLED", "false")
 
+# Before app is imported, and for the same reason: once real SLACK_* keys land in .env,
+# load_dotenv() would make the route genuinely active and the "not configured" test
+# would get a 401 instead of a 404. setdefault is enough -- load_dotenv does not
+# override an existing environment variable.
+os.environ.setdefault("SLACK_ENABLED", "false")
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 DOC = """---
@@ -56,6 +62,21 @@ def clear_index_cache():
     _index_cache.clear()
     yield
     _index_cache.clear()
+
+
+@pytest.fixture(autouse=True)
+def clear_slack_state():
+    # Same leak as _index_cache above: sessions and the dedupe set are module-level
+    # dicts, so one test's thread history or accepted event_id would otherwise be
+    # visible to the next.
+    import sessions
+    from slack_events import _seen_events
+
+    sessions._sessions.clear()
+    _seen_events.clear()
+    yield
+    sessions._sessions.clear()
+    _seen_events.clear()
 
 
 @pytest.fixture

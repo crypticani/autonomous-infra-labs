@@ -1,7 +1,10 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import time
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
@@ -9,12 +12,23 @@ from typing import Literal
 import requests
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
+import sessions
 from connectors.alertmanager import ALERTMANAGER_URL, AlertmanagerError
 from ingest import sync_alerts
 from llm import UpstreamError, get_llm_provider
+from sessions import Turn
+from slack_client import SlackError, post_message
+from slack_events import (
+    MIN_QUESTION_LENGTH,
+    Mention,
+    is_duplicate,
+    parse_mention,
+    slack_active,
+    verify_signature,
+)
 from retrieval import (
     DEFAULT_K,
     SIMILARITY_FLOOR,
@@ -41,6 +55,21 @@ logger = logging.getLogger(__name__)
 MARKER_RE = re.compile(r"(?<!\w)\[(\d+)\]")
 
 NOT_COVERED = "Not covered in the runbooks."
+
+ACK_TEXT = "Looking through the runbooks — this takes a couple of minutes on CPU."
+TOO_SHORT = "Ask me a fuller question and I'll search the runbooks."
+INDEX_EMPTY = "The runbook index is empty — someone needs to run ingest.py."
+MODEL_DOWN = "The model is unreachable, so I can't answer that right now."
+FAILED = "Something went wrong answering that — check the service logs."
+
+# One answer at a time. CPU Ollama serializes internally anyway and alert_sync_loop is
+# already competing for it every 60 seconds, so two questions in flight means both take
+# 400s instead of one taking 195s. The ack message covers the wait.
+ANSWER_LOCK = asyncio.Semaphore(1)
+
+# asyncio holds only a weak reference to a task, so a task with no strong reference of
+# its own can be garbage-collected mid-answer. This set is that reference.
+_tasks: set[asyncio.Task] = set()
 
 ALERT_SYNC_INTERVAL = int(os.getenv("ALERT_SYNC_INTERVAL", "60"))
 ALERT_SYNC_ENABLED = os.getenv("ALERT_SYNC_ENABLED", "true").lower() == "true"
@@ -180,6 +209,8 @@ async def lifespan(_: FastAPI):
         # distributed lock for a single-node deployment is machinery for nobody.
         task = asyncio.create_task(alert_sync_loop())
         logger.info(f"alert sync every {ALERT_SYNC_INTERVAL}s from {ALERTMANAGER_URL}")
+    if not slack_active():
+        logger.warning("slack disabled: SLACK_ENABLED off, or a secret is unset")
     yield
     if task:
         task.cancel()
@@ -193,25 +224,45 @@ app = FastAPI(
 )
 
 
+def answer_question(
+    question: str, k: int = DEFAULT_K, turns: Sequence[Turn] = ()
+) -> AskResponse:
+    """Retrieve, ground, answer. Raises for the caller to map to its own protocol.
+
+    `question` is always the raw new question. History shapes what gets retrieved and
+    what gets prompted at two different depths -- see sessions.py. With no history both
+    reduce to identity, which is why /ask-runbook's behaviour is unchanged.
+    """
+    provider, collection = open_collection()
+    hits = retrieve(
+        sessions.retrieval_query(list(turns), question),
+        provider=provider,
+        collection=collection,
+        k=k,
+    )
+    if not hits:
+        logger.info("nothing cleared the similarity floor; refusing")
+        return AskResponse(
+            answer=NOT_COVERED, sources=[], grounded=False, answer_source="none"
+        )
+
+    raw = get_llm_provider().generate(
+        grounded_system_prompt(datetime.now(timezone.utc)),
+        f"{sessions.prompt_history(list(turns))}{build_context(hits)}\n"
+        f"<question>\n{question}\n</question>",
+    )
+    answer, sources, grounded = ground_answer(raw, hits)
+    logger.info(f"answered grounded={grounded} sources={[s.marker for s in sources]}")
+    return AskResponse(
+        answer=answer, sources=sources, grounded=grounded, answer_source="runbooks"
+    )
+
+
 @app.post("/ask-runbook", response_model=AskResponse)
 def ask_runbook(request: AskRequest):
     logger.info(f"/ask-runbook k={request.k} q={request.question!r}")
-
     try:
-        provider, collection = open_collection()
-        hits = retrieve(
-            request.question, provider=provider, collection=collection, k=request.k
-        )
-        if not hits:
-            logger.info("nothing cleared the similarity floor; refusing")
-            return AskResponse(
-                answer=NOT_COVERED, sources=[], grounded=False, answer_source="none"
-            )
-
-        raw = get_llm_provider().generate(
-            grounded_system_prompt(datetime.now(timezone.utc)),
-            f"{build_context(hits)}\n<question>\n{request.question}\n</question>",
-        )
+        return answer_question(request.question, k=request.k)
     except EmptyIndexError as e:
         logger.error(f"{e}")
         raise HTTPException(status_code=503, detail=f"{e}")
@@ -219,11 +270,118 @@ def ask_runbook(request: AskRequest):
         logger.warning(f"{e}")
         raise HTTPException(status_code=e.status, detail=str(e))
 
-    answer, sources, grounded = ground_answer(raw, hits)
-    logger.info(f"answered grounded={grounded} sources={[s.marker for s in sources]}")
-    return AskResponse(
-        answer=answer, sources=sources, grounded=grounded, answer_source="runbooks"
-    )
+
+def format_sources(sources: list[Source]) -> str:
+    """Slack mrkdwn, not markdown: underscores italicise and link syntax does nothing."""
+    if not sources:
+        return ""
+    lines = [f"_[{s.marker}] {s.source} #{s.chunk_index} · {s.score}_" for s in sources]
+    return "\n" + "\n".join(lines)
+
+
+async def post(mention: Mention, text: str) -> None:
+    """Post, and never let a Slack failure escape into the task's traceback."""
+    try:
+        await asyncio.to_thread(post_message, mention.channel, mention.thread_ts, text)
+    except SlackError:
+        logger.exception("slack: could not post to the thread")
+
+
+async def answer_and_post(mention: Mention) -> None:
+    """The slow half, off the request path.
+
+    Every exit posts something. At 195 seconds a silent bot is indistinguishable from a
+    broken one, and the person waiting has no way to tell which.
+    """
+    if len(mention.question) < MIN_QUESTION_LENGTH:
+        await post(mention, TOO_SHORT)
+        return
+
+    await post(mention, ACK_TEXT)
+    turns = sessions.history(mention.thread_ts, now=time.time())
+
+    try:
+        async with ANSWER_LOCK:
+            # to_thread, not a direct call: answer_question blocks on Ollama for three
+            # minutes, and on the event loop that stalls the alert sync and every other
+            # request behind it.
+            result = await asyncio.to_thread(
+                answer_question, mention.question, DEFAULT_K, turns
+            )
+    except EmptyIndexError:
+        logger.exception("slack: index empty")
+        await post(mention, INDEX_EMPTY)
+        return
+    except UpstreamError:
+        logger.exception("slack: upstream failed")
+        await post(mention, MODEL_DOWN)
+        return
+    except Exception:
+        logger.exception("slack: unexpected failure")
+        await post(mention, FAILED)
+        return
+
+    if result.answer_source == "runbooks":
+        # A refusal is deliberately not remembered: carrying a question that retrieved
+        # nothing would only dilute the next turn's retrieval query.
+        sessions.append(
+            mention.thread_ts,
+            Turn(mention.question, result.answer),
+            now=time.time(),
+        )
+    await post(mention, result.answer + format_sources(result.sources))
+
+
+def spawn(mention: Mention) -> None:
+    """Fire the slow half and keep a strong reference to it -- see _tasks."""
+    task = asyncio.create_task(answer_and_post(mention))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+@app.post("/slack/events")
+async def slack_events(request: Request):
+    if not slack_active():
+        raise HTTPException(status_code=404, detail="Slack is not configured")
+
+    # The raw bytes, before any parsing: re-serialising changes whitespace and key
+    # order, and the HMAC then never matches.
+    body = await request.body()
+    if not verify_signature(
+        body,
+        request.headers.get("X-Slack-Request-Timestamp", ""),
+        request.headers.get("X-Slack-Signature", ""),
+        now=time.time(),
+    ):
+        logger.warning("slack: rejected an unsigned, forged or stale request")
+        raise HTTPException(status_code=401, detail="bad signature")
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        # 200, because a 500 makes Slack retry a body that can never parse.
+        logger.warning("slack: unparseable body")
+        return Response(status_code=200)
+
+    # Slack's one-time handshake when the Request URL is saved in the app config.
+    if payload.get("type") == "url_verification":
+        return {"challenge": payload.get("challenge", "")}
+
+    event = payload.get("event", {})
+    if event.get("type") != "app_mention":
+        return Response(status_code=200)
+
+    # Before any work is spawned, not after: the point is to never start the second
+    # and third 195-second job.
+    event_id = payload.get("event_id", "")
+    if is_duplicate(event_id, now=time.time()):
+        logger.info(f"slack: duplicate event {event_id}, dropped")
+        return Response(status_code=200)
+
+    if mention := parse_mention(event):
+        logger.info(f"slack: {mention.thread_ts} q={mention.question!r}")
+        spawn(mention)
+    return Response(status_code=200)
 
 
 @app.get("/health")
@@ -269,6 +427,7 @@ def health_check():
         "collection": collection_name,
         "chunks_indexed": indexed,
         "similarity_floor": SIMILARITY_FLOOR,
+        "slack": "active" if slack_active() else "disabled",
         "issues": issues,
     }
 

@@ -161,6 +161,7 @@ def test_health_reports_both_upstreams(monkeypatch, provider):
     assert body["chunks_indexed"] == 42
     assert (body["provider"], body["model"]) == ("spy", "spy-model")
     assert body["embedding_provider"] == "fake"
+    assert body["slack"] == "disabled"  # conftest forces it off
 
 
 class FakeOllama(SpyLLM):
