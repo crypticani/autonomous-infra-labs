@@ -1,0 +1,92 @@
+name: Knowledge Copilot CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - 'services/knowledge-copilot/**'
+      - '.github/workflows/knowledge_copilot_ci.yml'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'services/knowledge-copilot/**'
+      - '.github/workflows/knowledge_copilot_ci.yml'
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The image ships 3.12 and development runs 3.14. A suite that only runs on one
+        # of them is not testing what deploys.
+        python-version: ['3.12', '3.14']
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+          cache-dependency-path: services/knowledge-copilot/requirements.txt
+
+      - name: Install Dependencies
+        # black and pytest are already pinned in requirements.txt, unlike log-analyzer's.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r services/knowledge-copilot/requirements.txt
+
+      - name: Run Linting
+        run: black --check services/knowledge-copilot
+
+      - name: Run Tests
+        working-directory: services/knowledge-copilot
+        # Offline by design: conftest disables the alert poll loop and Slack before app is
+        # imported, and every upstream is monkeypatched. No Ollama, no Slack, no network.
+        # Run from the service directory -- from the repo root, log-analyzer's test_api.py
+        # collides with this service's on basename and collection fails.
+        run: python -m pytest tests/ -q
+
+  build-and-push:
+    needs: lint-and-test
+    # Never on a pull request: that would publish :latest from unmerged code.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Explicit, because a repository whose default GITHUB_TOKEN is read-only fails the
+      # push with a 403 that reads like a credentials problem.
+      packages: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Required for the linux/arm64 leg on an amd64 runner. setup-buildx alone does not
+      # register the emulator, whatever a step named "Set up Qemu and Docker Buildx" implies.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./services/knowledge-copilot
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}/knowledge-copilot:latest
+            ghcr.io/${{ github.repository }}/knowledge-copilot:${{ github.sha }}
+          # chroma-hnswlib has no arm64 wheel and compiles from source under emulation.
+          # Without a cache every run pays that cost again.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
