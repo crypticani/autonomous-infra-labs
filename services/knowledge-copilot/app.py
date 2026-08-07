@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 # left an unresolvable marker in the prose while `grounded` still claimed true.
 MARKER_RE = re.compile(r"(?<!\w)\[(\d+)\]")
 
+# A fence carrying a language hint, on its own line. Anchored per-line so a stray ``` in
+# prose is left alone, and requiring one or more characters so a closing fence never matches.
+FENCE_LANG_RE = re.compile(r"^```[A-Za-z0-9_+#.-]+[ \t]*$", re.MULTILINE)
+
 NOT_COVERED = "Not covered in the runbooks."
 
 ACK_TEXT = "Looking through the runbooks — this takes a couple of minutes on CPU."
@@ -271,6 +275,17 @@ def ask_runbook(request: AskRequest):
         raise HTTPException(status_code=e.status, detail=str(e))
 
 
+def strip_fence_languages(text: str) -> str:
+    """Drop the language hint from code fences.
+
+    Slack's mrkdwn has no language-hinted fences, so ```sh renders as a code block whose
+    first visible line is the word "sh". That showed up in every answer containing a
+    command. Closing fences are bare and stay untouched: the pattern requires at least
+    one character after the backticks.
+    """
+    return FENCE_LANG_RE.sub("```", text)
+
+
 def format_sources(sources: list[Source]) -> str:
     """Slack mrkdwn, not markdown: underscores italicise and link syntax does nothing."""
     if not sources:
@@ -329,7 +344,10 @@ async def answer_and_post(mention: Mention) -> None:
             Turn(mention.question, result.answer),
             now=time.time(),
         )
-    await post(mention, result.answer + format_sources(result.sources))
+    await post(
+        mention,
+        strip_fence_languages(result.answer) + format_sources(result.sources),
+    )
 
 
 def spawn(mention: Mention) -> None:

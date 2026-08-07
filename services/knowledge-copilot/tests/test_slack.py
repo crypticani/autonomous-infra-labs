@@ -488,6 +488,49 @@ def test_sources_render_as_slack_mrkdwn(posts, monkeypatch):
     assert "_[1] disk-pressure.md #2 · 0.81_" in posts[-1][2]
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Observed in production: Slack rendered "sh" as the first line of the block.
+        ("```sh\ncrictl rmi --prune\n```", "```\ncrictl rmi --prune\n```"),
+        (
+            "```yaml\ncontainerLogMaxSize: 50Mi\n```",
+            "```\ncontainerLogMaxSize: 50Mi\n```",
+        ),
+        ("```\nalready bare\n```", "```\nalready bare\n```"),
+        # Two fenced blocks in one answer, which is the common shape.
+        (
+            "```sh\na\n```\ntext\n```yaml\nb: 1\n```",
+            "```\na\n```\ntext\n```\nb: 1\n```",
+        ),
+        # Inline code is a different construct and Slack renders it correctly.
+        (
+            "set `containerLogMaxSize` in the kubelet config",
+            "set `containerLogMaxSize` in the kubelet config",
+        ),
+        # Prose that merely mentions backticks must not be rewritten.
+        ("use ``` to open a block", "use ``` to open a block"),
+    ],
+)
+def test_strip_fence_languages(raw, expected):
+    assert app_module.strip_fence_languages(raw) == expected
+
+
+def test_the_posted_answer_has_no_fence_languages(posts, monkeypatch):
+    monkeypatch.setattr(
+        app_module,
+        "answer_question",
+        lambda *a, **k: answered(
+            "Reclaim space [1]:\n```sh\njournalctl --vacuum-size=200M\n```", [SOURCE]
+        ),
+    )
+
+    run_worker()
+
+    assert "```sh" not in posts[-1][2]
+    assert "journalctl --vacuum-size=200M" in posts[-1][2]
+
+
 def test_a_failed_slack_post_does_not_crash_the_worker(monkeypatch):
     def boom(*args, **kwargs):
         raise SlackError("channel_not_found")
