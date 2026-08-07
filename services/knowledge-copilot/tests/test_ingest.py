@@ -137,7 +137,12 @@ def test_removed_doc_is_deleted_from_the_collection(corpus, backend):
 ALERT = {
     "fingerprint": "aaa",
     "startsAt": "2026-08-06T14:22:11.000Z",
-    "endsAt": "2026-08-06T23:00:00.000Z",
+    # Far future, because these tests do not pin sync_alerts' `now`. An active alert's
+    # endsAt is startsAt + resolve_timeout and therefore always ahead of the clock; a
+    # fixed past value made live_status read "resolved" from the day after it was
+    # written, and the "still firing" assertion below began failing on its own.
+    # Resolution is tested by absence (fetch=lambda: []), never through endsAt.
+    "endsAt": "2099-12-31T23:59:59.000Z",
     "status": {"state": "active"},
     "labels": {"alertname": "Probe", "severity": "warning"},
     "annotations": {"summary": "probe is unhappy"},
