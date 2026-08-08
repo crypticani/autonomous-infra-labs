@@ -17,8 +17,9 @@ from pydantic import BaseModel, Field
 
 import sessions
 from connectors.alertmanager import ALERTMANAGER_URL, AlertmanagerError
+from errors import UpstreamError
 from ingest import sync_alerts
-from llm import UpstreamError, get_llm_provider
+from llm import get_llm_provider
 from sessions import Turn
 from slack_client import SlackError, post_message
 from slack_events import (

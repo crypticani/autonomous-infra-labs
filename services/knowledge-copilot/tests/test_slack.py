@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 from app import ACK_TEXT, FAILED, INDEX_EMPTY, MODEL_DOWN, TOO_SHORT, app
-from llm import UpstreamError
+from errors import UpstreamError
 from retrieval import EmptyIndexError
 from slack_client import SlackError, post_message
 from slack_events import (

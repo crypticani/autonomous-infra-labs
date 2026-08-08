@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors as genai_errors
 
+from errors import UpstreamError
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -16,12 +18,6 @@ logger = logging.getLogger(__name__)
 # qwen2.5:7b-instruct on appsrv, which serves from CPU (api/ps reports size_vram 0).
 # Prompt eval over four ~512-char chunks is what costs it, so this scales with k.
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "300"))
-
-
-class UpstreamError(RuntimeError):
-    def __init__(self, message: str, status: int) -> None:
-        super().__init__(message)
-        self.status = status
 
 
 class BaseLLMProvider(ABC):
@@ -59,17 +55,25 @@ class OllamaProvider(BaseLLMProvider):
             )
             response.raise_for_status()
         except requests.exceptions.Timeout as e:
-            raise UpstreamError("the model took too long to answer", 504) from e
+            raise UpstreamError(
+                "the model took too long to answer", 504, provider=self.name
+            ) from e
         except requests.exceptions.HTTPError as e:
             raise UpstreamError(
-                f"the model backend rejected the request: {e}", 502
+                f"the model backend rejected the request: {e}",
+                502,
+                provider=self.name,
             ) from e
         except requests.exceptions.RequestException as e:
-            raise UpstreamError(f"the model backend is unreachable: {e}", 503) from e
+            raise UpstreamError(
+                f"the model backend is unreachable: {e}", 503, provider=self.name
+            ) from e
 
         answer = (response.json().get("response") or "").strip()
         if not answer:
-            raise UpstreamError("the model returned an empty response", 502)
+            raise UpstreamError(
+                "the model returned an empty response", 502, provider=self.name
+            )
         return answer
 
 
@@ -96,10 +100,14 @@ class GeminiProvider(BaseLLMProvider):
                 },
             )
         except genai_errors.APIError as e:
-            raise UpstreamError(f"the model API returned an error: {e}", 502) from e
+            raise UpstreamError(
+                f"the model API returned an error: {e}", 502, provider=self.name
+            ) from e
         answer = (response.text or "").strip()
         if not answer:
-            raise UpstreamError("the model returned an empty response", 502)
+            raise UpstreamError(
+                "the model returned an empty response", 502, provider=self.name
+            )
         return answer
 
 

@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 from app import NOT_COVERED, app
-from llm import UpstreamError
+from errors import UpstreamError
 from retrieval import EmptyIndexError, Hit
 
 client = TestClient(app)

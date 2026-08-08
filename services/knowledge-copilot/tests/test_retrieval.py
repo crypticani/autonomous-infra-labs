@@ -1,10 +1,10 @@
 import pytest
 import requests
 
+from errors import EmbeddingError, UpstreamError
 from ingest import ingest
-from store import get_collection
-from llm import UpstreamError
 from retrieval import CANDIDATE_POOL, EmptyIndexError, retrieve
+from store import get_collection
 
 
 class StubCollection:
@@ -110,7 +110,7 @@ def test_floor_is_overridable(provider):
         (RuntimeError("the gemini sdk blew up"), 503),
     ],
 )
-def test_embedding_failures_become_upstream_errors(error, status):
+def test_embedding_failures_become_embedding_errors(error, status):
     class Failing:
         name = "failing"
 
@@ -118,11 +118,29 @@ def test_embedding_failures_become_upstream_errors(error, status):
             raise error
 
     collection = StubCollection([("x", meta("x.md"), 0.1)])
-    with pytest.raises(UpstreamError) as caught:
+    with pytest.raises(EmbeddingError) as caught:
         retrieve(QUESTION, provider=Failing(), collection=collection)
 
     # A Gemini embedding error used to escape app.py entirely as a 500.
     assert caught.value.status == status
+    # And then it escaped as an *LLM* error, which sent whoever read the log to the
+    # wrong service. The label is the whole point of the subclass.
+    assert caught.value.provider == "embeddings"
+
+
+def test_an_embedding_error_is_still_an_upstream_error():
+    """app.py catches UpstreamError and maps .status. That handler must keep working
+    unchanged: the subclass exists to add information, not to reroute the path."""
+
+    class Failing:
+        name = "failing"
+
+        def embed_query(self, text):
+            raise RuntimeError("backend exploded")
+
+    collection = StubCollection([("x", meta("x.md"), 0.1)])
+    with pytest.raises(UpstreamError):
+        retrieve(QUESTION, provider=Failing(), collection=collection)
 
 
 def test_bm25_rescues_a_chunk_the_dense_pool_missed(provider):

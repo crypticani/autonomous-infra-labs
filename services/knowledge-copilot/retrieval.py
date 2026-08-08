@@ -7,8 +7,8 @@ import requests
 from dotenv import load_dotenv
 
 from embeddings import BaseEmbeddingProvider
+from errors import EmbeddingError
 from hybrid import bm25_scores, mmr, rank_relevance, rrf, tokenize
-from llm import UpstreamError
 
 load_dotenv()
 
@@ -156,11 +156,11 @@ def retrieve(
     try:
         query_vector = provider.embed_query(question)
     except requests.exceptions.Timeout as e:
-        raise UpstreamError("embedding the question took too long", 504) from e
+        raise EmbeddingError("embedding the question took too long", 504) from e
     except Exception as e:
         # Every provider raises its own SDK error here; the caller only needs to
         # know the embedding backend failed. `from e` keeps the real traceback.
-        raise UpstreamError(f"the embedding backend failed: {e}", 503) from e
+        raise EmbeddingError(f"the embedding backend failed: {e}", 503) from e
 
     # Loaded only when something needs it, so dense + lam=1.0 stays exactly the
     # Day 10 path: one Chroma query and nothing else.

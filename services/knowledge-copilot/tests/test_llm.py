@@ -1,7 +1,8 @@
 import pytest
 import requests
 
-from llm import OllamaProvider, UpstreamError
+from errors import UpstreamError
+from llm import OllamaProvider
 
 
 class FakeResponse:
