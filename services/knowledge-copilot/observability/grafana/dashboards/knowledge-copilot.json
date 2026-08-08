@@ -1,0 +1,448 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Select your existing Prometheus datasource on import.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "9.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)"
+      }
+    ]
+  },
+  "editable": true,
+  "id": null,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Answers by outcome (per hour)",
+      "description": "increase over 1h, not rate over 5m: this bot answers a handful of questions a day and a 5m rate reads zero almost always. 'refused' means nothing cleared the similarity floor; 'ungrounded' means the model answered but cited nothing resolvable.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (outcome) (increase(kc_answers_total[1h]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Answer latency p95 by stage (s)",
+      "description": "The load-bearing panel. Retrieval is milliseconds and generation is 165-204s against CPU-only Ollama, so these two lines should sit three orders of magnitude apart. If retrieval ever approaches generation, the index has grown past what a single node can scan.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.95, sum by (le, stage) (rate(kc_answer_duration_seconds_bucket[6h])))",
+          "legendFormat": "p95 {{stage}}"
+        },
+        {
+          "refId": "B",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.50, sum by (le, stage) (rate(kc_answer_duration_seconds_bucket[6h])))",
+          "legendFormat": "p50 {{stage}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Top similarity vs the floor",
+      "description": "Where real questions land relative to SIMILARITY_FLOOR (0.64, set offline from 21 cases). If p50 drifts below the floor the corpus has stopped covering what people ask; if p10 sits well above it, the floor is doing nothing.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(kc_retrieval_top_similarity_bucket[6h])))",
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.10, sum by (le) (rate(kc_retrieval_top_similarity_bucket[6h])))",
+          "legendFormat": "p10"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Near-miss band 0.60-0.64 (%)",
+      "description": "Share of questions whose best chunk fell just under the floor. These are what lowering the floor to 0.60 would newly admit -- the offline sweep said 7 of 10 unanswerable questions live in this band, so a rising number here is an argument for holding the floor, not dropping it.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 15
+              },
+              {
+                "color": "red",
+                "value": 35
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * (sum(increase(kc_retrieval_top_similarity_bucket{le=\"0.64\"}[24h])) - sum(increase(kc_retrieval_top_similarity_bucket{le=\"0.6\"}[24h]))) / clamp_min(sum(increase(kc_retrieval_top_similarity_count[24h])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Refusal rate (%)",
+      "description": "Share of questions the service declined over 24h. High is not automatically bad -- refusing beats inventing -- but a sustained climb means the corpus has drifted away from what people are asking.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 40
+              },
+              {
+                "color": "red",
+                "value": 70
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * sum(increase(kc_answers_total{outcome=\"refused\"}[24h])) / clamp_min(sum(increase(kc_answers_total[24h])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Slack events by outcome (per hour)",
+      "description": "deduped_retry counts Slack's own retries suppressed before a second 195s job could start. bad_signature is a request that failed HMAC verification -- a steady trickle means something is probing the endpoint.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (outcome) (increase(kc_slack_events_total[1h]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Upstream errors by provider (per hour)",
+      "description": "Which dependency broke, not just that something did. 'embeddings' is separated from 'ollama' deliberately: before day 14 an embedding failure reported itself as an LLM error and sent whoever read the log to the wrong service.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (provider) (increase(kc_upstream_errors_total[1h]))",
+          "legendFormat": "{{provider}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Chunks indexed",
+      "description": "Read from the collection at scrape time, never tracked incrementally. This is the canary for the incident where /health reported healthy while an empty bind mount shadowed every runbook -- alert-sync chunks kept the count non-zero, so only the absolute number gives it away. Below ~60 means the runbooks are missing.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 60
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "kc_chunks_indexed"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Alert sync age (s)",
+      "description": "Seconds since the last successful Alertmanager poll, which runs every 60s. Shows 'No data' rather than 0 when a sync has never succeeded: a fabricated 0 would read as the freshest possible value and hide a loop that never once completed.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 180
+              },
+              {
+                "color": "red",
+                "value": 600
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "kc_alert_sync_age_seconds"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Active Slack sessions",
+      "description": "Threads with unexpired history. In-memory by design, so this drops to zero on every restart -- a step change here is a redeploy, not lost users.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "kc_sessions_active"
+        }
+      ]
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": [
+    "knowledge-copilot",
+    "rag",
+    "llm"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "title": "Knowledge Copilot \u2014 Answers, Retrieval Quality & Upstreams",
+  "uid": "knowledge-copilot-overview",
+  "version": 1
+}
