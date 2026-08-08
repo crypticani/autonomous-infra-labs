@@ -5,10 +5,10 @@ on:
     branches: ["main"]
     paths:
       - 'services/log-analyzer/**'
-    pull_request:
-      branches: ["main"]
-      paths:
-        - 'services/log-analyzer/**'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'services/log-analyzer/**'
 
 jobs:
   lint-and-test:
@@ -52,9 +52,10 @@ jobs:
       
   build-and-push:
     needs: [lint-and-test, validate-manifests]
-    # A no-op while `pull_request` sits nested under `push:` above and never fires. It
-    # is here so that fixing that indentation cannot, on its own, start publishing
-    # :latest from unmerged pull-request code.
+    # Load-bearing since the `pull_request` indentation was fixed on day 14. It was
+    # added a day earlier, while that trigger still never fired, precisely so the fix
+    # could not on its own start publishing :latest from unmerged pull-request code.
+    # Removing this re-opens that hole.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
