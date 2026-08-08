@@ -3,11 +3,56 @@
 A RAG service that answers ops questions — "what's the usual fix for X" — over runbooks,
 postmortems, and live infra signals, with citations back to the source document.
 
-This is **Project 2 (Week 2)** of the [30-day AI-Native DevOps challenge](../../docs/ai-devops-30-day-challenge.md) — in progress.
+This is **Project 2 (Week 2)** of the [30-day AI-Native DevOps challenge](../../docs/ai-devops-30-day-challenge.md) — complete, Days 8–14.
 
 > New to embeddings and vector search? [**docs/knowledge-copilot.md**](../../docs/knowledge-copilot.md)
 > explains the concepts from the ground up and walks through what every part of the code is doing
 > and why. This README is the *what and how much*; that one is the *why*.
+
+**Status (through Day 14 — final):** the service is live in production, answering in Slack
+threads, and now says what it is doing while it does it. `GET /metrics` exposes answer
+outcomes, per-stage latency and the retrieval-similarity distribution to Prometheus, with a
+Grafana dashboard built on them. `POST /ask-runbook` takes a bearer token. The similarity floor
+is no longer a guess — it was **measured** at 0.64, and the measurement overturned the
+assumption that had been sitting in the backlog. See [Day 14](#day-14--metrics-auth-and-a-measured-floor).
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    slack["Slack workspace"]
+    cf["Cloudflare proxy<br/>knowledge-copilot.crypticani.dev"]
+    nginx["nginx on appsrv<br/>location = /slack/events only<br/>everything else 404"]
+    prom["Prometheus<br/>on appsrv"]
+
+    subgraph container["container :7100 — one uvicorn worker"]
+        events["POST /slack/events<br/>HMAC verify · dedupe · spawn"]
+        ask["POST /ask-runbook<br/>bearer token"]
+        scrape["GET /metrics · /health<br/>no auth, loopback only"]
+        answer["answer_question<br/>retrieve → ground → cite"]
+        sync["alert sync loop<br/>every 60s"]
+    end
+
+    chroma[("Chroma<br/>runbooks + live alerts")]
+    ollama["Ollama on appsrv<br/>CPU only"]
+    am["Alertmanager"]
+
+    slack -->|"app_mention"| cf --> nginx --> events
+    events -->|"200 ack — under 3s"| slack
+    events --> answer
+    ask --> answer
+    answer --> chroma
+    answer -->|"embed + generate"| ollama
+    answer -.->|"chat.postMessage — 165-204s later"| slack
+    sync -->|"poll"| am
+    sync --> chroma
+    prom -->|"scrape"| scrape
+```
+
+The dashed arrow is the whole trick. Slack allows **3 seconds** to acknowledge an event, and a
+grounded answer takes **165–204 seconds** on CPU. So the ack and the answer are two separate
+HTTP conversations travelling in opposite directions: the inbound one is authenticated by
+Slack's HMAC signature, the outbound one by the bot token. Everything below is the detail.
 
 **Status (through Day 12):** the index is no longer just a corpus. Alongside eleven runbooks and
 postmortems it now holds **live Alertmanager alerts**, synced every 60 seconds by a background
@@ -849,10 +894,157 @@ suite and a plain `python app.py` run with no credentials at all. `/health` repo
 Slack app requirements are deliberately minimal: bot scopes `app_mentions:read` and `chat:write`,
 one event subscription `app_mention`, `socket_mode_enabled: false`.
 
+## Day 14 — metrics, auth, and a measured floor
+
+Four things, plus a refactor that had been owed since Day 10.
+
+### `store.py` and `errors.py` — two seams that were in the wrong place
+
+`retrieval.py` imported `CHROMA_PATH` and `get_collection` from `ingest.py`: the query path
+depending on the write path, purely because that is where the plumbing happened to be written
+first. Both modules also built their own `PersistentClient` with identical settings.
+`store.py` now owns everything that opens a collection, and is a leaf — it imports `chunking`
+and `embeddings` and nothing else from this service, so neither direction of that dependency
+can grow back without a circular import making it obvious. A test asserts the seam directly,
+because the behaviour was always correct and only the coupling was the defect:
+
+```python
+assert "from ingest import" not in (Path(__file__).parents[1] / "retrieval.py").read_text()
+```
+
+The second seam was subtler. `UpstreamError` lived in `llm.py`, and `retrieval.py` imported it
+to report a failure of the **embedding** backend — so a caller catching `UpstreamError` could
+not tell whether generation had failed or embedding had. Two different outages, two different
+fixes, one exception. `errors.py` now holds `UpstreamError` and `EmbeddingError(UpstreamError)`,
+and every raise site carries a `provider` label. `app.py`'s `except UpstreamError` is unchanged
+and still maps `.status` — the subclass adds information rather than rerouting the path, which
+is what let this land without touching a single existing status-mapping test.
+
+### The similarity floor, measured — and the backlog was wrong
+
+The floor had been `0.65` since Day 10, chosen by hand. The backlog said to lower it to ~0.60,
+on the strength of three observations: a real answer at 0.659, a Day 11 rejection at 0.643, and
+an unanswerable question at 0.588. An n of 3 with no negative class is not a threshold.
+
+`eval_set.json` already had the schema for measuring this properly — `{"kind": "absent",
+"primary": null}`, with `score()` collapsing every metric onto *did it refuse*. It had exactly
+one such case. Nine more were added (plausible ops questions this corpus genuinely does not
+answer), and `eval_retrieval.py --floor-sweep` retrieves each case once with `floor=0.0`,
+records the best cosine, then sweeps sixteen candidate floors over those numbers in memory.
+Sixteen floors, one embedding pass — the floor only filters what retrieval already scored.
+
+```
+        floor sweep -- 11 answerable, 10 absent
+┏━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━┓
+┃ floor ┃ false rejects ┃ false accepts ┃ total errors ┃
+┡━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━┩
+│ 0.58  │             0 │             8 │            8 │
+│ 0.60  │             0 │             7 │            7 │
+│ 0.62  │             0 │             4 │            4 │
+│ 0.64  │             0 │             1 │            1 │  ← set here
+│ 0.65  │             1 │             1 │            2 │  ← was here
+│ 0.67  │             2 │             1 │            3 │
+│ 0.70  │             4 │             0 │            4 │
+└───────┴───────────────┴───────────────┴──────────────┘
+```
+
+**Dropping to 0.60 would have been a mistake.** The 0.659 answer that seemed to argue for it
+clears 0.64 comfortably; 0.60 would have admitted 7 of the 10 unanswerable questions instead of
+1, for no gain at all — false rejections are already zero at 0.64. The single false rejection
+that disappears between 0.65 and 0.64 is almost certainly Day 11's 0.643 case: the sweep
+reproduced that anecdote independently and then corrected the conclusion drawn from it.
+
+The honest caveat: the answerable questions are authored, not sampled from real traffic, so
+that half of the curve is optimistic. The absent half is the trustworthy one — a question the
+corpus cannot answer is a fact about the corpus, not about the phrasing. Which is why
+`kc_retrieval_top_similarity` now ships to Prometheus: production traffic gets a vote in the
+same question, and the near-miss panel on the dashboard is exactly that argument, live.
+
+### `GET /metrics`
+
+Eight metric families, chosen because each one would have caught something that actually went
+wrong on this project rather than because they were easy to emit.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `kc_answers_total` | counter | `outcome` = `answered` / `ungrounded` / `refused` |
+| `kc_answer_duration_seconds` | histogram | `stage` = `retrieval` / `generation` |
+| `kc_retrieval_top_similarity` | histogram | buckets straddling 0.60 and 0.64 |
+| `kc_slack_events_total` | counter | `outcome` = `accepted` / `deduped_retry` / `bad_signature` / `not_a_mention` |
+| `kc_upstream_errors_total` | counter | `provider` = `ollama` / `gemini` / `embeddings` / `slack` / `alertmanager` |
+| `kc_chunks_indexed` | gauge | — |
+| `kc_sessions_active` | gauge | — |
+| `kc_alert_sync_age_seconds` | gauge | — |
+
+Three details worth the words:
+
+**The gauges are read at scrape time, never incremented.** An incrementally-tracked chunk count
+drifts from reality, and drift is the exact failure this metric exists to catch — `/health` once
+reported healthy while an empty bind mount shadowed every runbook, because alert-sync chunks
+kept the count non-zero. A gauge that asks the collection on every scrape cannot lie that way.
+
+**`kc_alert_sync_age_seconds` reports `NaN`, not `0`, when no sync has ever succeeded.**
+`prometheus_client` initialises an unlabelled gauge to 0 and exposes it from the first scrape,
+so the naive version published *zero seconds since last sync* — the freshest possible reading,
+and the precise opposite of the truth. This was caught by scraping the endpoint and reading it,
+not by the tests, which were all passing. The follow-on bug was worse: setting the gauge only
+in the known case left it holding its previous value forever, which surfaced as an
+order-dependent test. It is now set unconditionally on every scrape.
+
+**`kc_retrieval_top_similarity` is observed inside `retrieve()`**, at the one point in the
+codebase that has `best` in scope. `retrieve` computes it, logs it, and does not return it.
+
+The registry is in-process, which is only coherent because this service runs a **single uvicorn
+worker** — the same constraint that stops two alert-sync loops racing on the same writes. Two
+workers would mean two registries and Prometheus scraping whichever one it reached.
+
+`/metrics` is deliberately unauthenticated: Prometheus scrapes it over loopback on appsrv, and a
+bearer token in a scrape config is a secret in a third place buying nothing.
+
+### The Grafana dashboard
+
+[`observability/grafana/dashboards/knowledge-copilot.json`](./observability/grafana/dashboards/knowledge-copilot.json),
+imported the same way as log-analyzer's — **Dashboards → New → Import**, then pick your
+Prometheus datasource when it prompts for `DS_PROMETHEUS`.
+
+Ten panels. The windows are wide on purpose: this bot answers a handful of questions a day, so
+`rate(...[5m])` reads zero almost always, and the panels use `increase(...[1h])` for counts and
+`[6h]` for histogram quantiles. Two are worth calling out — *Answer latency p95 by stage*, where
+retrieval and generation should sit three orders of magnitude apart, and *Near-miss band
+0.60–0.64*, which shows what lowering the floor would newly admit and is the live continuation
+of the sweep above.
+
+### Bearer auth on `/ask-runbook`
+
+`KC_API_TOKEN` from the environment. Set, and `Authorization: Bearer <token>` is required,
+compared with `hmac.compare_digest` — not `==`, which returns as soon as it finds a differing
+byte and leaks how much of the prefix was right. Unset, and the endpoint is open **and
+`/health` reports `"auth": "disabled"`**, which is the point of that branch: a deploy that
+forgot the variable is visible where someone already looks, instead of quietly open.
+
+`/slack/events` is deliberately exempt — Slack authenticates with its own HMAC signature and
+cannot send a bearer token, so requiring one would take the bot offline. A test asserts exactly
+that, because it is the kind of thing a later refactor breaks silently.
+
+Framed honestly: the container binds `127.0.0.1:7100` and nginx proxies `= /slack/events` only,
+returning 404 for everything else, so `/ask-runbook` was never reachable from the internet. This
+token is the second layer, not the first.
+
+### CI ran on pull requests for the first time
+
+Both workflows had `pull_request:` indented one level too deep, nested under `push:`, where YAML
+reads it as a branch-filter key rather than a trigger. No pull request had ever run CI in this
+repo. Two lines in each file.
+
+The guard added on Day 13 — `if: github.event_name == 'push' && github.ref == 'refs/heads/main'`
+on the GHCR publish step — was written while that trigger still never fired, specifically so
+that fixing the indentation could not on its own start publishing `:latest` from unmerged
+pull-request code. It went from decorative to load-bearing the moment this landed.
+
 ## Testing
 
 ```bash
-python -m pytest tests/ -q     # 170 tests, ~20s, no network
+python -m pytest tests/ -q     # 193 tests, ~20s, no network
 ```
 
 Every test file is offline and deterministic — no embedding call and no model call belongs in a
@@ -1262,18 +1454,19 @@ instruction is not being honoured — which matters the moment anything depends 
 
 ## Not built yet
 
-| Capability | Day |
+The project ends at Day 14, so nothing here says "next week". These are the things a
+follow-on would pick up, and why each was left.
+
+| Capability | Why not |
 |---|---|
-| Cross-encoder reranking (needs a GPU; see the MMR finding for why not now) | later |
-| Widen the paraphrase set to separate lexical from hybrid properly | 14 |
-| Lower the floor to ~0.60 — evidence now includes a real answer at 0.659 | 14 |
-| Eval queries that target *live* state, so alert retrieval is measured not demonstrated | 14 |
-| Multi-turn cases in `eval_set.json`, so the session layer is measured too | 14 |
-| Re-measure alert interference at ~100 firing alerts | when it happens |
-| K8s events as a second connector (no cluster attached yet) | later |
-| Webhook-based resolution instead of polling (needs the auth story) | 14 |
-| `store.py` / `errors.py` split — `retrieval.py` imports from `ingest.py`, and `UpstreamError` from `llm.py` for an embedding failure | 14 |
-| Session persistence across restarts (in-memory is deliberate for now) | later |
-| Unprefixed thread replies, so a follow-up needs no second @mention | later |
-| LLM query condensation instead of concatenation, measured against it | later |
-| `/metrics`, auth on `/ask-runbook`, architecture diagram, demo recording | 14 |
+| Demo recording | Scoped out on the last day in favour of the dashboard, which is reusable evidence rather than a one-off artefact |
+| Cross-encoder reranking | Needs a GPU; the MMR finding explains why the current embedding space cannot support it either |
+| Widen the paraphrase set to separate lexical from hybrid properly | The floor sweep consumed the eval-authoring budget, and it bought more |
+| Eval queries that target *live* state, so alert retrieval is measured not demonstrated | Real gap: alert retrieval is the one capability shown but never scored |
+| Multi-turn cases in `eval_set.json`, so the session layer is measured too | Same gap, one layer up — turn 2 was measured once, by hand |
+| Re-measure alert interference at ~100 firing alerts | Needs an incident, or a synthetic one worth building |
+| Webhook-based resolution instead of polling | Needs an inbound auth story; `KC_API_TOKEN` is now the obvious foundation for it |
+| K8s events as a second connector | No cluster attached |
+| Session persistence across restarts | In-memory is deliberate for a single-node bot; the `kc_sessions_active` gauge makes the cost visible |
+| Unprefixed thread replies, so a follow-up needs no second @mention | Ergonomics, not capability |
+| LLM query condensation instead of concatenation, measured against it | Would need its own eval to justify, and the sweep showed how much that costs |
