@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ from typing import Literal
 import requests
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
@@ -89,10 +90,34 @@ _tasks: set[asyncio.Task] = set()
 ALERT_SYNC_INTERVAL = int(os.getenv("ALERT_SYNC_INTERVAL", "60"))
 ALERT_SYNC_ENABLED = os.getenv("ALERT_SYNC_ENABLED", "true").lower() == "true"
 
-# None until the first successful sync. Exported as the *absence* of the gauge rather
-# than as 0, because zero seconds since last sync is the healthiest possible reading and
-# would say the exact opposite of the truth.
+# None until the first successful sync. Reported as NaN rather than 0, because zero
+# seconds since last sync is the healthiest possible reading and would say the exact
+# opposite of the truth.
 _last_alert_sync: float | None = None
+
+# Defence in depth, not the first line of it: the container binds 127.0.0.1:7100 and
+# nginx proxies `= /slack/events` only, so this endpoint is already unreachable from the
+# internet. The token covers whatever is already on the host or the tailnet.
+KC_API_TOKEN = os.getenv("KC_API_TOKEN", "")
+
+
+def require_token(request: Request) -> None:
+    """Bearer auth for /ask-runbook. No token configured means no check.
+
+    Reads the module global at call time rather than closing over it, which is what lets
+    the tests swap it with monkeypatch.
+    """
+    if not KC_API_TOKEN:
+        return
+    scheme, _, presented = request.headers.get("Authorization", "").partition(" ")
+    # compare_digest, not ==: string equality returns as soon as it finds a differing
+    # byte, and how long that took says how much of the prefix was right.
+    if scheme != "Bearer" or not hmac.compare_digest(presented, KC_API_TOKEN):
+        raise HTTPException(
+            status_code=401,
+            detail="a valid bearer token is required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
 
 def grounded_system_prompt(now: datetime) -> str:
@@ -293,7 +318,11 @@ def answer_question(
     )
 
 
-@app.post("/ask-runbook", response_model=AskResponse)
+@app.post(
+    "/ask-runbook",
+    response_model=AskResponse,
+    dependencies=[Depends(require_token)],
+)
 def ask_runbook(request: AskRequest):
     logger.info(f"/ask-runbook k={request.k} q={request.question!r}")
     try:
@@ -509,6 +538,9 @@ def health_check():
         "chunks_indexed": indexed,
         "similarity_floor": SIMILARITY_FLOOR,
         "slack": "active" if slack_active() else "disabled",
+        # The point of the unset branch: a deploy that forgot KC_API_TOKEN is visible
+        # here, rather than being quietly open.
+        "auth": "required" if KC_API_TOKEN else "disabled",
         "issues": issues,
     }
 

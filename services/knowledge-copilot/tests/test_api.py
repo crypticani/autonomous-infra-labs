@@ -270,3 +270,73 @@ def test_an_unexpected_sync_error_does_not_propagate(monkeypatch):
     monkeypatch.setattr(app_module, "sync_alerts", boom)
 
     app_module.alert_sync_tick()  # must not raise
+
+
+def test_no_token_configured_leaves_the_endpoint_open(monkeypatch, wire):
+    """The default deployment has no token, and must keep working."""
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "")
+    wire([])
+    assert client.post("/ask-runbook", json=OOM_QUESTION).status_code == 200
+
+
+def test_missing_header_is_rejected(monkeypatch):
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    response = client.post("/ask-runbook", json=OOM_QUESTION)
+    assert response.status_code == 401
+    assert response.headers["www-authenticate"] == "Bearer"
+
+
+def test_malformed_header_is_rejected(monkeypatch):
+    """A bare token with no scheme, so the scheme check is what has to catch it."""
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    response = client.post(
+        "/ask-runbook", json=OOM_QUESTION, headers={"Authorization": "s3cret"}
+    )
+    assert response.status_code == 401
+
+
+def test_wrong_token_is_rejected(monkeypatch):
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    response = client.post(
+        "/ask-runbook", json=OOM_QUESTION, headers={"Authorization": "Bearer wrong"}
+    )
+    assert response.status_code == 401
+
+
+def test_correct_token_is_accepted(monkeypatch, wire):
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    wire([])
+    response = client.post(
+        "/ask-runbook", json=OOM_QUESTION, headers={"Authorization": "Bearer s3cret"}
+    )
+    assert response.status_code == 200
+
+
+def test_health_reports_auth_disabled_when_no_token(monkeypatch):
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "")
+    assert client.get("/health").json()["auth"] == "disabled"
+
+
+def test_health_reports_auth_required_when_token_set(monkeypatch):
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    assert client.get("/health").json()["auth"] == "required"
+
+
+def test_metrics_needs_no_token(monkeypatch):
+    """Prometheus scrapes over loopback and cannot carry a bearer token."""
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    assert client.get("/metrics").status_code == 200
+
+
+def test_slack_route_does_not_require_a_bearer_token(monkeypatch):
+    """Slack authenticates with an HMAC signature and cannot send a bearer token.
+    Requiring one here would take the bot offline."""
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    monkeypatch.setattr(app_module, "slack_active", lambda: True)
+    response = client.post(
+        "/slack/events",
+        content=b"{}",
+        headers={"X-Slack-Request-Timestamp": "1", "X-Slack-Signature": "v0=nope"},
+    )
+    assert response.status_code == 401
+    assert "www-authenticate" not in response.headers  # rejected by HMAC, not by token
