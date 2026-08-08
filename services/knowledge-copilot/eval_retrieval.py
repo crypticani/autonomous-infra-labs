@@ -14,7 +14,8 @@ from rich.console import Console
 from rich.table import Table
 
 from hybrid import MMR_LAMBDA
-from retrieval import DEFAULT_K, MODES, open_collection, retrieve
+from retrieval import DEFAULT_K, MODES, retrieve
+from store import open_collection
 
 EVAL_SET = Path(__file__).parent / "eval_set.json"
 console = Console()

@@ -1,7 +1,8 @@
 import pytest
 import requests
 
-from ingest import get_collection, ingest
+from ingest import ingest
+from store import get_collection
 from llm import UpstreamError
 from retrieval import CANDIDATE_POOL, EmptyIndexError, retrieve
 

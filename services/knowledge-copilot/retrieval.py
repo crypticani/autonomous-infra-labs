@@ -1,17 +1,13 @@
 import logging
 import os
 from dataclasses import dataclass
-from functools import lru_cache
 from math import sumprod
 
-import chromadb
 import requests
-from chromadb.config import Settings
 from dotenv import load_dotenv
 
-from embeddings import BaseEmbeddingProvider, get_embedding_provider
+from embeddings import BaseEmbeddingProvider
 from hybrid import bm25_scores, mmr, rank_relevance, rrf, tokenize
-from ingest import CHROMA_PATH, get_collection
 from llm import UpstreamError
 
 load_dotenv()
@@ -68,15 +64,6 @@ class LexicalIndex:
     metadatas: list[dict]
     embeddings: list[list[float]]
     tokens: list[list[str]]
-
-
-@lru_cache(maxsize=1)
-def open_collection():
-    provider = get_embedding_provider()
-    client = chromadb.PersistentClient(
-        path=CHROMA_PATH, settings=Settings(anonymized_telemetry=False)
-    )
-    return provider, get_collection(client, provider)
 
 
 # ponytail: keyed on (name, count), so an in-place content update won't bust it.

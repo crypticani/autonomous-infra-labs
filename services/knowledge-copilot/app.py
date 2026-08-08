@@ -35,9 +35,9 @@ from retrieval import (
     EmptyIndexError,
     Hit,
     _index_cache,
-    open_collection,
     retrieve,
 )
+from store import open_collection
 
 load_dotenv()
 

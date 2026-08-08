@@ -4,6 +4,11 @@ from pathlib import Path
 
 CORPUS_DIR = Path(__file__).parent / "corpus"
 
+# Chunking parameters, and therefore part of a collection's identity: store.py builds
+# the collection name from them, so a re-chunk at different values lands in a different
+# collection rather than silently mixing two geometries.
+SIZE, OVERLAP = 512, 64
+
 FRONT_MATTER_RE = re.compile(r"\A---\n(.*?)\n---\n", re.DOTALL)
 
 

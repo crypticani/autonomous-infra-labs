@@ -6,11 +6,11 @@ from connectors.alertmanager import AlertmanagerError
 from ingest import (
     content_hash,
     existing_hashes,
-    get_collection,
     ingest,
     plan_reconcile,
     sync_alerts,
 )
+from store import get_collection
 
 
 def make_chunks(slug: str, count: int, digest: str) -> list[Chunk]:

@@ -8,13 +8,20 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import chromadb
-from chromadb.config import Settings
 from chromadb.errors import NotFoundError
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 
-from chunking import CORPUS_DIR, Chunk, Document, chunk_corpus, load_corpus
+from chunking import (
+    CORPUS_DIR,
+    OVERLAP,
+    SIZE,
+    Chunk,
+    Document,
+    chunk_corpus,
+    load_corpus,
+)
 from connectors.alertmanager import (
     ALERT_DOC_TYPE,
     AlertmanagerError,
@@ -22,6 +29,7 @@ from connectors.alertmanager import (
     merge,
 )
 from embeddings import BaseEmbeddingProvider, get_embedding_provider
+from store import collection_name, default_client, get_collection
 
 load_dotenv()
 
@@ -32,10 +40,6 @@ logging.basicConfig(
 )
 
 console = Console()
-
-CHROMA_PATH = os.getenv("CHROMA_PATH", str(Path(__file__).parent / "chroma_data"))
-
-SIZE, OVERLAP = 512, 64
 
 
 def content_hash(doc: Document) -> str:
@@ -88,18 +92,6 @@ def plan_reconcile(desired: list[Chunk], existing: dict[str, str]) -> Plan:
     return plan
 
 
-def collection_name(provider: BaseEmbeddingProvider) -> str:
-    return f"knowledge_{provider.name}_{SIZE}_{OVERLAP}"
-
-
-def get_collection(client: chromadb.ClientAPI, provider: BaseEmbeddingProvider):
-    return client.get_or_create_collection(
-        name=collection_name(provider),
-        configuration={"hnsw": {"space": "cosine"}},
-        embedding_function=None,
-    )
-
-
 def existing_hashes(collection, where: dict | None = None) -> dict[str, str]:
     """Stored content hashes, optionally scoped to one source's documents.
 
@@ -136,10 +128,7 @@ def ingest(
         raise ValueError("reset drops the collection; it is never a dry run")
 
     provider = provider or get_embedding_provider()
-    client = client or chromadb.PersistentClient(
-        path=CHROMA_PATH,
-        settings=Settings(anonymized_telemetry=False),
-    )
+    client = client or default_client()
 
     if reset:
         try:
@@ -202,10 +191,7 @@ def sync_alerts(
     alert set, because merge() would then resolve every alert in the index at once.
     """
     provider = provider or get_embedding_provider()
-    client = client or chromadb.PersistentClient(
-        path=CHROMA_PATH,
-        settings=Settings(anonymized_telemetry=False),
-    )
+    client = client or default_client()
     collection = get_collection(client, provider)
 
     live = fetch()  # raises before anything is read or written
@@ -266,10 +252,7 @@ def main() -> None:
 
     provider = get_embedding_provider()
 
-    client = chromadb.PersistentClient(
-        path=CHROMA_PATH,
-        settings=Settings(anonymized_telemetry=False),
-    )
+    client = default_client()
     if args.source == "alerts":
         try:
             plan = sync_alerts(provider=provider, client=client, dry_run=args.dry_run)
