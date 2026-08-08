@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from embeddings import BaseEmbeddingProvider
 from errors import EmbeddingError
 from hybrid import bm25_scores, mmr, rank_relevance, rrf, tokenize
+from metrics import TOP_SIMILARITY
 
 load_dotenv()
 
@@ -200,6 +201,11 @@ def retrieve(
         best = max(best, score)
         if score >= floor:
             kept.append((doc_id, text, meta, score))
+
+    # Observed here because this is the only scope that has `best`. Every production
+    # question therefore becomes a data point for the same curve --floor-sweep drew
+    # offline, which is the part of that measurement that outlives the day it was made.
+    TOP_SIMILARITY.observe(best)
 
     if not kept:
         # The margin matters: 0.64 is a floor that is slightly too high, 0.30 is

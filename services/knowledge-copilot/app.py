@@ -13,6 +13,7 @@ import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 import sessions
@@ -20,6 +21,15 @@ from connectors.alertmanager import ALERTMANAGER_URL, AlertmanagerError
 from errors import UpstreamError
 from ingest import sync_alerts
 from llm import get_llm_provider
+from metrics import (
+    ALERT_SYNC_AGE,
+    ANSWER_DURATION,
+    ANSWERS,
+    CHUNKS_INDEXED,
+    SESSIONS_ACTIVE,
+    SLACK_EVENTS,
+    UPSTREAM_ERRORS,
+)
 from sessions import Turn
 from slack_client import SlackError, post_message
 from slack_events import (
@@ -78,6 +88,11 @@ _tasks: set[asyncio.Task] = set()
 
 ALERT_SYNC_INTERVAL = int(os.getenv("ALERT_SYNC_INTERVAL", "60"))
 ALERT_SYNC_ENABLED = os.getenv("ALERT_SYNC_ENABLED", "true").lower() == "true"
+
+# None until the first successful sync. Exported as the *absence* of the gauge rather
+# than as 0, because zero seconds since last sync is the healthiest possible reading and
+# would say the exact opposite of the truth.
+_last_alert_sync: float | None = None
 
 
 def grounded_system_prompt(now: datetime) -> str:
@@ -173,16 +188,22 @@ def ground_answer(raw_answer: str, hits: list[Hit]) -> tuple[str, list[Source], 
 
 def alert_sync_tick() -> None:
     """One sync, blocking. Never raises: a failed poll is logged and retried."""
+    global _last_alert_sync
     try:
         plan = sync_alerts()
     except AlertmanagerError as e:
         # Expected and recoverable -- appsrv reboots, the tailnet blips. The write was
         # skipped, so the index still holds the last state we actually observed.
+        UPSTREAM_ERRORS.labels(provider="alertmanager").inc()
         logger.warning(f"alert sync skipped: {e}")
         return
     except Exception:
         logger.exception("alert sync failed")
         return
+
+    # Set before the write check, not after: a poll that found nothing to change still
+    # observed live state, and is not a stale sync.
+    _last_alert_sync = time.time()
 
     if plan.to_upsert or plan.to_delete:
         # The writer knows when it wrote, which is the whole fix for retrieval's
@@ -239,24 +260,33 @@ def answer_question(
     reduce to identity, which is why /ask-runbook's behaviour is unchanged.
     """
     provider, collection = open_collection()
+
+    started = time.perf_counter()
     hits = retrieve(
         sessions.retrieval_query(list(turns), question),
         provider=provider,
         collection=collection,
         k=k,
     )
+    ANSWER_DURATION.labels(stage="retrieval").observe(time.perf_counter() - started)
+
     if not hits:
         logger.info("nothing cleared the similarity floor; refusing")
+        ANSWERS.labels(outcome="refused").inc()
         return AskResponse(
             answer=NOT_COVERED, sources=[], grounded=False, answer_source="none"
         )
 
+    started = time.perf_counter()
     raw = get_llm_provider().generate(
         grounded_system_prompt(datetime.now(timezone.utc)),
         f"{sessions.prompt_history(list(turns))}{build_context(hits)}\n"
         f"<question>\n{question}\n</question>",
     )
+    ANSWER_DURATION.labels(stage="generation").observe(time.perf_counter() - started)
+
     answer, sources, grounded = ground_answer(raw, hits)
+    ANSWERS.labels(outcome="answered" if grounded else "ungrounded").inc()
     logger.info(f"answered grounded={grounded} sources={[s.marker for s in sources]}")
     return AskResponse(
         answer=answer, sources=sources, grounded=grounded, answer_source="runbooks"
@@ -272,6 +302,7 @@ def ask_runbook(request: AskRequest):
         logger.error(f"{e}")
         raise HTTPException(status_code=503, detail=f"{e}")
     except UpstreamError as e:
+        UPSTREAM_ERRORS.labels(provider=e.provider).inc()
         logger.warning(f"{e}")
         raise HTTPException(status_code=e.status, detail=str(e))
 
@@ -300,6 +331,7 @@ async def post(mention: Mention, text: str) -> None:
     try:
         await asyncio.to_thread(post_message, mention.channel, mention.thread_ts, text)
     except SlackError:
+        UPSTREAM_ERRORS.labels(provider="slack").inc()
         logger.exception("slack: could not post to the thread")
 
 
@@ -372,6 +404,7 @@ async def slack_events(request: Request):
         request.headers.get("X-Slack-Signature", ""),
         now=time.time(),
     ):
+        SLACK_EVENTS.labels(outcome="bad_signature").inc()
         logger.warning("slack: rejected an unsigned, forged or stale request")
         raise HTTPException(status_code=401, detail="bad signature")
 
@@ -388,19 +421,48 @@ async def slack_events(request: Request):
 
     event = payload.get("event", {})
     if event.get("type") != "app_mention":
+        SLACK_EVENTS.labels(outcome="not_a_mention").inc()
         return Response(status_code=200)
 
     # Before any work is spawned, not after: the point is to never start the second
     # and third 195-second job.
     event_id = payload.get("event_id", "")
     if is_duplicate(event_id, now=time.time()):
+        SLACK_EVENTS.labels(outcome="deduped_retry").inc()
         logger.info(f"slack: duplicate event {event_id}, dropped")
         return Response(status_code=200)
 
     if mention := parse_mention(event):
+        SLACK_EVENTS.labels(outcome="accepted").inc()
         logger.info(f"slack: {mention.thread_ts} q={mention.question!r}")
         spawn(mention)
     return Response(status_code=200)
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus scrape target.
+
+    Unauthenticated on purpose: Prometheus reaches this over loopback on appsrv, and a
+    bearer token in a scrape config is a secret in a third place buying nothing.
+    """
+    try:
+        _, collection = open_collection()
+        CHUNKS_INDEXED.set(collection.count())
+    except Exception:
+        # A scrape must never 500. An unreachable collection is what /health is for;
+        # here it only means this one gauge has nothing to say this time round.
+        logger.exception("metrics: collection unavailable")
+
+    SESSIONS_ACTIVE.set(sessions.active_count(time.time()))
+    # Set on every scrape, including the unknown case. Skipping the set would leave the
+    # gauge holding whatever it last reported, which is how a stale reading outlives the
+    # state that produced it. NaN is Prometheus's "no data".
+    ALERT_SYNC_AGE.set(
+        float("nan") if _last_alert_sync is None else time.time() - _last_alert_sync
+    )
+
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")

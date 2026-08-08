@@ -40,6 +40,13 @@ def evict(now: float, ttl: int = SESSION_TTL) -> None:
         del _sessions[thread_ts]
 
 
+def active_count(now: float) -> int:
+    """Unexpired sessions. Evicts first: without that this counts threads that are
+    already dead, which is the opposite of what a gauge named `active` should say."""
+    evict(now)
+    return len(_sessions)
+
+
 def history(thread_ts: str, now: float) -> list[Turn]:
     evict(now)
     entry = _sessions.get(thread_ts)

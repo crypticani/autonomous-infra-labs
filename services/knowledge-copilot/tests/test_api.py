@@ -1,5 +1,6 @@
 import pytest
 import requests
+from conftest import SpyLLM
 from fastapi.testclient import TestClient
 
 import app as app_module
@@ -28,40 +29,6 @@ HITS = [
 
 OOM_QUESTION = {"question": "why do my pods get OOMKilled after a deploy"}
 IAM_QUESTION = {"question": "how do I rotate an IAM access key"}
-
-
-class SpyLLM:
-    """Counts calls, because 'we skipped the model' can only be proven this way."""
-
-    name = "spy"
-    model_name = "spy-model"
-
-    def __init__(self, answer="", error=None):
-        self.answer = answer
-        self.error = error
-        self.calls = 0
-        self.last_prompts = ()
-
-    def generate(self, system_prompt, user_prompt, temperature=0.1) -> str:
-        self.calls += 1
-        self.last_prompts = (system_prompt, user_prompt)
-        if self.error:
-            raise self.error
-        return self.answer
-
-
-@pytest.fixture
-def wire(monkeypatch):
-    """Replace both upstreams: no Chroma client, no model, no network."""
-
-    def _wire(hits, answer="", error=None):
-        spy = SpyLLM(answer=answer, error=error)
-        monkeypatch.setattr(app_module, "get_llm_provider", lambda: spy)
-        monkeypatch.setattr(app_module, "open_collection", lambda: (None, None))
-        monkeypatch.setattr(app_module, "retrieve", lambda *args, **kwargs: hits)
-        return spy
-
-    return _wire
 
 
 def test_grounded_answer_returns_sources(wire):
