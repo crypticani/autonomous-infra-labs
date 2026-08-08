@@ -84,5 +84,68 @@
         "primary": null,
         "acceptable": [],
         "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "how do I rotate the Postgres logical replication slot",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "what is our Terraform state locking backend",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "the Redis cluster failed over, what is the runbook",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "what is the escalation path for a sev-1 incident",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "which team owns the billing pipeline on call",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "how do I roll back an Elasticsearch index mapping change",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "what is the retention policy for S3 access logs",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "how do I drain a RabbitMQ queue safely",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
+    },
+    {
+        "kind": "absent",
+        "question": "steps to add a new node to the Consul cluster",
+        "primary": null,
+        "acceptable": [],
+        "must_contain": null
     }
 ]

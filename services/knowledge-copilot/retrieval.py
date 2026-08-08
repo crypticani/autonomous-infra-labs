@@ -14,7 +14,12 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-SIMILARITY_FLOOR = float(os.getenv("SIMILARITY_FLOOR", "0.65"))
+# Set by eval_retrieval.py --floor-sweep on 2026-08-08 over 11 answerable and 10 absent
+# cases: 0.64 is the unique minimum at 1 total error (0 false rejects, 1 false accept),
+# against 2 at the old 0.65. The backlog wanted ~0.60 on the strength of one real answer
+# scoring 0.659 -- but 0.659 clears 0.64 comfortably, and 0.60 would have admitted 7 of
+# the 10 unanswerable questions instead of 1. Measuring the negatives is what caught it.
+SIMILARITY_FLOOR = float(os.getenv("SIMILARITY_FLOOR", "0.64"))
 DEFAULT_K = 4
 CANDIDATE_POOL = 15
 MODES = ("dense", "lexical", "hybrid")

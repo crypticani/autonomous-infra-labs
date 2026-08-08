@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from hybrid import MMR_LAMBDA
-from retrieval import DEFAULT_K, MODES, retrieve
+from retrieval import CANDIDATE_POOL, DEFAULT_K, MODES, retrieve
 from store import open_collection
 
 EVAL_SET = Path(__file__).parent / "eval_set.json"
@@ -188,6 +188,49 @@ def by_kind_table(results: list[tuple[str, list[Outcome]]]) -> Table:
     return table
 
 
+def best_similarity(question: str, provider, collection) -> float:
+    """The highest cosine any chunk scored for this question.
+
+    floor=0.0 keeps every fused candidate, and k=2*CANDIDATE_POOL is larger than
+    hybrid's two rankings can produce, so kept[:k] truncates nothing. The max over what
+    comes back is therefore exactly the `best` that retrieve() computes internally and
+    logs but does not return. Taking hits[0].score instead would be wrong: that is the
+    first *fused* hit, and RRF order is not cosine order.
+    """
+    hits = retrieve(question, provider, collection, k=2 * CANDIDATE_POOL, floor=0.0)
+    return max((hit.score for hit in hits), default=0.0)
+
+
+def sweep_counts(
+    answerable: list[float], absent: list[float], floor: float
+) -> tuple[int, int]:
+    """(false rejections, false acceptances) at one candidate floor.
+
+    Pure arithmetic over numbers gathered once, which is what makes sweeping sixteen
+    floors cost one embedding pass instead of sixteen.
+    """
+    false_rejects = sum(1 for best in answerable if best < floor)
+    false_accepts = sum(1 for best in absent if best >= floor)
+    return false_rejects, false_accepts
+
+
+def floor_sweep_table(answerable: list[float], absent: list[float]) -> Table:
+    title = f"floor sweep -- {len(answerable)} answerable, {len(absent)} absent"
+    table = Table(title=title)
+    table.add_column("floor")
+    table.add_column("false rejects", justify="right")
+    table.add_column("false accepts", justify="right")
+    table.add_column("total errors", justify="right")
+
+    for step in range(55, 71):
+        floor = step / 100
+        rejects, accepts = sweep_counts(answerable, absent, floor)
+        table.add_row(
+            f"{floor:.2f}", str(rejects), str(accepts), str(rejects + accepts)
+        )
+    return table
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Day 11: retrieval quality sweep")
     parser.add_argument("--k", type=int, default=DEFAULT_K)
@@ -204,6 +247,11 @@ def main() -> None:
         action="store_true",
         help="also run each config with each query's `where` applied",
     )
+    parser.add_argument(
+        "--floor-sweep",
+        action="store_true",
+        help="measure where the similarity floor should sit, then exit",
+    )
     args = parser.parse_args()
 
     cases = json.loads(EVAL_SET.read_text(encoding="utf-8"))
@@ -215,6 +263,17 @@ def main() -> None:
     # which is an artefact of sweep order rather than a property of the config.
     for case in cases:
         provider.embed_query(case["question"])
+
+    if args.floor_sweep:
+        # One retrieval pass per case, then sixteen floors swept over the numbers it
+        # produced. Re-retrieving per floor would be sixteen times the work for
+        # identical results, since the floor only filters what retrieval already scored.
+        answerable, absent = [], []
+        for case in cases:
+            best = best_similarity(case["question"], provider, collection)
+            (absent if case["primary"] is None else answerable).append(best)
+        console.print(floor_sweep_table(answerable, absent))
+        return
 
     results = []
     for mode in args.modes:
