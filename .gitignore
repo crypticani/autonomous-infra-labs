@@ -219,6 +219,7 @@ __marimo__/
 
 # Generated artifacts (docs are tracked; build output and exported PDFs are not)
 docs/_build/
+docs/superpowers/
 *.pdf
 
 # Chroma persistent index — rebuildable from corpus/, never committed.

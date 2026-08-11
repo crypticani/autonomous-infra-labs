@@ -9,8 +9,8 @@ Each service here started as a learning exercise, but is built to a standard whe
 | Service | What it does | Status |
 |---|---|---|
 | [`services/log-analyzer`](./services/log-analyzer) | Turns a raw error log into strict, typed `{severity, likely_cause, suggested_fix, confidence}` output via a pluggable LLM provider (Ollama or Gemini). Containerized FastAPI service with `/analyze-log`, `/health`, and Prometheus `/metrics`; golden-set eval harness, mocked-provider tests, CI, and K8s manifests | ✅ Complete |
-| [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data. Retrieval layer built: pluggable embedding provider (Ollama / Gemini) → hand-written chunker → Chroma in cosine space | 🚧 In progress |
-| [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | Planned |
+| [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data — now live in production, taking questions in Slack, with a measured similarity floor and bearer-token auth | ✅ Complete |
+| [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | 🚧 In progress |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, tfsec/Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings. Proposes fixes as diffs — never auto-applies them | Planned |
 | [`gateway`](./gateway) | Single FastAPI entrypoint tying the services above into one AI DevOps copilot | Planned |
 
@@ -24,6 +24,7 @@ exposure to the AI side — they build up the concepts from scratch, then walk t
 |---|---|
 | [`docs/log-analyzer.md`](./docs/log-analyzer.md) | Tokens, context windows, temperature, system vs. user prompts, constrained decoding, why `def` beats `async def` here, and how to test a non-deterministic system |
 | [`docs/knowledge-copilot.md`](./docs/knowledge-copilot.md) | Embeddings, cosine similarity, chunk size and overlap, what a vector database actually buys you, and why queries and documents are embedded differently |
+| [`docs/self-healing-agent.md`](./docs/self-healing-agent.md) | What a tool call actually is, why RAG's one-shot retrieval can't diagnose a live problem, and how an observe-think-act loop knows when to stop |
 
 ## Architecture
 
@@ -166,13 +167,25 @@ This repository follows a scaffolded 30-day learning path.
 * [x] **Day 11: Retrieval quality** — a 12-query eval set built to *fail*, then one technique at a time kept only if it moved a number. Relevance is a set (`primary` + `acceptable`) plus one substring the winning chunk must contain, which is the chunk-level check for the price of an `in` test. Hybrid ships — hand-written BM25 fused with dense by Reciprocal Rank Fusion, on ranks because cosine's 0.65–0.90 and BM25's unbounded scale cannot be added — and takes hit@1 from 8/12 to 9/12 for 2ms. Fusion only ever reorders; the 0.65 floor stays on **cosine**, so a keyword match can rescue a chunk dense search ranked 20th without smuggling it past the refusal guard.
 * **The finding:** **BM25 alone beat semantic search on three of four metrics** — on a service whose premise is that `grep` fails because it matches characters instead of meaning. The corpus is full of *identifiers* (`137`, `too many clients already`, `x509`), and embedding a token whose value is being precisely itself is exactly the wrong operation. Hybrid shipped anyway, over the better headline number: the differences are 1–2 queries out of 12, and BM25-only needs shared vocabulary — a failure the eval has only two paraphrase queries to see.
 * **Also worth keeping:** MMR reranking changed *nothing* on all 12 queries, so the embedding space got measured — same-document chunk pairs average 0.787 cosine, different-document 0.699. Separation **0.088**, while MMR at `lam=0.7` needs a gap above **0.156** to move one rank. Day 8's "unrelated text scores 0.59" looked like a threshold-calibration nuisance; it is the same anisotropy, and it decides whether an entire technique can function. Metadata filters cost recall (0.85 → 0.81) and bought nothing, because the filter removed a document the query's own `acceptable` set wanted. And the eval repeated the mistake it was built to fix: the June postmortem outranks the OOM runbook at 0.796 on the exit-137 query, containing the literal string `Code 137)`, and still scores a miss because `acceptable` was drawn too tightly — a label change worth making in a decision separate from the run that exposed it.
-* [ ] **Day 12: Live infra signals** — connector ingesting Prometheus alerts / K8s events.
-* [ ] **Day 13: Conversational interface** — Slack bot or web chat in front of the service.
-* [ ] **Day 14: Capstone polish** — auth, architecture diagram, demo recording. Project 2.
+* [x] **Day 12: Live infra signals** — `connectors/alertmanager.py` polls Alertmanager's v2 API every 60s and reconciles firing/resolved alerts into the index (retained 24h after resolution), rendered as prose rather than JSON because the embedding model was trained on text. Resolution is detected by *absence* — Alertmanager only returns active alerts, so an indexed fingerprint a poll no longer mentions is what "resolved" means.
+* **The finding:** live data broke two assumptions the static-corpus design rested on. Rendering "firing for 47 minutes" would change an alert's text — and its `content_hash` — on every single poll, reconciling the whole set as an update against a CPU-only Ollama every 60 seconds; every timestamp had to be absolute instead. And Chroma's `upsert` *merges* metadata rather than replacing it, so a flapping alert (resolve, re-fire, resolve again) would read back its *first* resolution timestamp forever unless `resolved_at` is explicitly gated on `status` each poll.
+* [x] **Day 13: Conversational interface** — a Slack bot (`slack_events.py`, `sessions.py`) answering in-thread, with per-thread session history and HMAC-verified events.
+* **The finding:** Slack allows 3 seconds to acknowledge an event; a grounded answer takes 165–204s on CPU. The ack and the answer became two separate HTTP conversations traveling in opposite directions — an inbound one authenticated by Slack's signature, an outbound `chat.postMessage` authenticated by the bot token — rather than one request held open for three minutes.
+* [x] **Day 14: Capstone polish** — `GET /metrics` (answer outcomes, per-stage latency, retrieval-similarity distribution) with a Grafana dashboard; bearer-token auth on `POST /ask-runbook`; `retrieval.py` no longer imports from `ingest.py` (new `store.py` seam); both CI workflows actually trigger on pull requests. Project 2 complete.
+* **The finding:** the `SIMILARITY_FLOOR` of 0.65 had been set from three anecdotes and no negative class. A `--floor-sweep` mode measured it properly — 9 more deliberately-unanswerable questions added to the eval set, every candidate floor swept from one recorded embedding pass per case — and the honest floor turned out to be **0.64**, the unique minimum at 1 total error against 2 at 0.65.
+
+### Phase 3: Self-Healing Infra Agent
+
+* [X] **Day 15: RAG vs. agents** — the observe → think → act loop, and the model-provider seam (`provider.py`) with automatic function calling explicitly disabled, verified against a live Gemini call.
+* [ ] **Day 16: Safe tools** — `get_pod_logs`, `get_recent_alerts`, `get_recent_deploys`, `restart_pod`, `scale_deployment` as individually schema'd functions, plus `search_runbooks` over HTTP into knowledge-copilot.
+* [ ] **Day 17: The reasoning loop** — read-only diagnosis, `POST /diagnose`, terminating on a `submit_diagnosis` tool call rather than parsed prose.
+* [ ] **Day 18: Human-in-the-loop** — Slack approval buttons gate every write tool; an append-only audit log.
+* [ ] **Day 19: Guardrails** — namespace allowlist, replica floor, action rate limit, circuit breaker, LLM call cap.
+* [ ] **Day 20: Closing the loop** — Alertmanager webhook → `/diagnose` → Slack approval → k8s write, end to end in the sandbox cluster.
+* [ ] **Day 21: Capstone polish** — inject a real failure, record detect → diagnose → approve → fix. Project 3.
 
 ### Future Phases
 
-* [ ] **Self-Healing Agent** — diagnose-and-propose remediation for K8s issues, with approval gating.
 * [ ] **Security Triage** — AI-triaged output from existing security scanners.
 * [ ] **Gateway** — unified entrypoint across all four services.
 
