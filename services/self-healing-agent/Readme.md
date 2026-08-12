@@ -11,8 +11,9 @@ This is **Project 3 (Week 3)** of the
 > and how the loop knows when to stop. This README is the *what and how much*; that one is the
 > *why*.
 
-**Status (Day 15):** the model-provider seam is built and tested against real Gemini. Nothing in
-this service can reach a Kubernetes cluster yet — that starts Day 16.
+**Status (Day 16):** all seven tools exist as schema'd functions with a real Kubernetes client
+seam and RBAC manifests scoped verb-for-verb to what they need. Nothing dispatches them yet —
+there is no loop and no `/diagnose` endpoint. That's Day 17.
 
 ## Why this is an agent and not another RAG service
 
@@ -48,17 +49,17 @@ fixes on a citation regex before it was right. The fix here is structural instea
 model ends the loop by calling a schema'd function, which the SDK validates, rather than by
 writing JSON in prose for us to parse.
 
-## The tool table (target shape — none of these exist yet)
+## The tool table
 
-| Tool | Reads | Write? | Why it's narrow |
-|---|---|---|---|
-| `get_pod_logs(namespace, pod, container?, tail_lines)` | pod logs | no | `tail_lines` clamped server-side; no label selector — one pod, so the audit log names one pod |
-| `get_recent_alerts(service?, since_minutes)` | Alertmanager v2 | no | same source knowledge-copilot already polls |
-| `get_recent_deploys(namespace, deployment)` | ReplicaSet revisions | no | real rollout history, not a hand-written changelog |
-| `restart_pod(namespace, pod)` | — | **yes** | deletes one pod by exact name; the ReplicaSet recreates it |
-| `scale_deployment(namespace, deployment, replicas)` | — | **yes** | clamped by `SHA_MIN_REPLICAS` / `SHA_MAX_REPLICAS` |
-| `search_runbooks(question, k)` | knowledge-copilot, over HTTP | no | retrieval only — the call never reaches a generator |
-| `submit_diagnosis(summary, evidence, proposed_action, confidence)` | — | terminal | the loop's exit condition |
+| Tool | Reads | Write? | RBAC verb | Why it's narrow |
+|---|---|---|---|---|
+| `get_pod_logs(namespace, pod, container?, tail_lines)` | pod logs | no | `pods/log:get` | `tail_lines` clamped server-side to 2000; no label selector — one pod, so the audit log names one pod |
+| `get_recent_alerts(service?, since_minutes)` | Alertmanager v2 | no | — (HTTP) | same source knowledge-copilot already polls |
+| `get_recent_deploys(namespace, deployment)` | ReplicaSet revisions | no | `replicasets:list` | real rollout history, not a hand-written changelog; filtered by ownerReferences so it never needs `deployments:get` |
+| `restart_pod(namespace, pod)` | — | **yes** | `pods:delete` | deletes one pod by exact name; the ReplicaSet recreates it |
+| `scale_deployment(namespace, deployment, replicas)` | — | **yes** | `deployments/scale:patch` | clamped to `SHA_MIN_REPLICAS`–`SHA_MAX_REPLICAS`, not rejected — Day 19's guardrail is the hard stop |
+| `search_runbooks(question, k)` | knowledge-copilot, over HTTP | no | — (HTTP) | retrieval only — the call never reaches a generator |
+| `submit_diagnosis(summary, evidence, proposed_action, confidence)` | — | terminal | — | the loop's exit condition (Day 17 dispatches it specially) |
 
 `restart_pod` deletes a pod rather than issuing a rollout restart deliberately: a rollout restart
 needs `patch` on `deployments` — the same verb that can change an image — while deleting one pod
@@ -92,15 +93,55 @@ minutes for one diagnosis has no consumer yet, so it isn't built speculatively.
 nothing upstream failed when a guardrail refuses an action, and collapsing "refused" into "broke"
 would make a working safety check look like an outage.
 
+## `k8s_client.py` and `tools/` — the Day 16 additions
+
+`k8s_client.py` is one function, `get_apis()`, `@lru_cache(maxsize=1)`: it chooses
+`load_incluster_config()` when the ServiceAccount token file exists and `load_kube_config()`
+otherwise, and returns the `(CoreV1Api, AppsV1Api)` pair. Every tool takes that pair as its first
+argument rather than importing this module — the same seam `store.py` plays for the copilot — so
+every tool test passes a fake pair and none needs a cluster.
+
+`tools/k8s.py` holds the four cluster-touching functions; `tools/external.py` holds the two that
+reach out over HTTP (Alertmanager, knowledge-copilot); `tools/__init__.py` holds the registry
+itself:
+
+```python
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    schema: dict          # JSON Schema for the arguments object
+    fn: Callable[..., dict]
+    write: bool
+    needs: tuple[str, ...] = ()   # RBAC verbs this tool requires
+```
+
+`REGISTRY` holds all seven `ToolSpec`s; `READ_ONLY` and `ALL` are the two name-tuples Day 17 and
+Day 18 will pass as `agent.py`'s `allowed` set — no signature changes between the two days, per the
+week's design doc. `needs` exists only so `tests/test_rbac.py` can compare the registry against
+`k8s/rbac.yaml`'s actual verbs; the two are written in different files and would otherwise drift
+silently until a 403 surfaced it live.
+
+None of the tools wrap their return value as `{"output": ...}` / `{"error": ...}` — that
+convention belongs to the loop's dispatch (Day 17), applied uniformly to whatever a tool returns
+or raises. A tool here either returns its data or raises `K8sError` / `RunbookError` /
+`UpstreamError`.
+
+`k8s/rbac.yaml` — `ServiceAccount` + `Role` + `RoleBinding`, scoped to the `sandbox` namespace and
+to exactly four rules: `pods/log:get`, `pods:delete`, `replicasets:list` (`apps`),
+`deployments/scale:patch` (`apps`). No cluster is available in this environment to run
+`kubectl apply` or `kubectl auth can-i` against, so the manifest is verified only by
+`tests/test_rbac.py`'s drift check today — the live `can-i` check is Day 21's capstone item.
+
 ## Tests
 
-10 tests, `tests/test_provider.py`, fully offline against a recording stand-in for
-`client.models`. The one that matters most: `test_automatic_function_calling_is_always_disabled`
-— it is the assertion that keeps Day 18's approval gate meaningful rather than decorative.
+21 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`
+(fakes for `CoreV1Api`/`AppsV1Api`, and `requests` monkeypatches for the two HTTP tools), 1 in
+`tests/test_rbac.py`. Fully offline — no test needs a cluster, a key, or a network call.
 
 ```bash
 cd services/self-healing-agent
-python -m pytest tests/ -q      # 10 passed
+python -m pytest tests/ -q      # 21 passed
 black --check .                 # clean
 ```
 
@@ -111,8 +152,6 @@ loop must dispatch, with nothing executed by the SDK itself.
 
 ## Not built yet
 
-- `tools/` — the five infrastructure tools plus `search_runbooks`, and the RBAC manifests that
-  must match them verb-for-verb — `later` (Day 16)
 - `agent.py` — the loop itself, `MAX_ITERATIONS`, `POST /diagnose` — `later` (Day 17)
 - Approval workflow, audit log, Slack interactive buttons — `later` (Day 18)
 - Guardrails: namespace allowlist, replica floor, rate limit, circuit breaker, LLM call cap —

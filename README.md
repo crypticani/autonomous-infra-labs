@@ -177,7 +177,7 @@ This repository follows a scaffolded 30-day learning path.
 ### Phase 3: Self-Healing Infra Agent
 
 * [X] **Day 15: RAG vs. agents** — the observe → think → act loop, and the model-provider seam (`provider.py`) with automatic function calling explicitly disabled, verified against a live Gemini call.
-* [ ] **Day 16: Safe tools** — `get_pod_logs`, `get_recent_alerts`, `get_recent_deploys`, `restart_pod`, `scale_deployment` as individually schema'd functions, plus `search_runbooks` over HTTP into knowledge-copilot.
+* [X] **Day 16: Safe tools** — `get_pod_logs`, `get_recent_alerts`, `get_recent_deploys`, `restart_pod`, `scale_deployment` as individually schema'd functions, plus `search_runbooks` over HTTP into knowledge-copilot; RBAC `Role` scoped verb-for-verb, checked against the tool registry by a drift test.
 * [ ] **Day 17: The reasoning loop** — read-only diagnosis, `POST /diagnose`, terminating on a `submit_diagnosis` tool call rather than parsed prose.
 * [ ] **Day 18: Human-in-the-loop** — Slack approval buttons gate every write tool; an append-only audit log.
 * [ ] **Day 19: Guardrails** — namespace allowlist, replica floor, action rate limit, circuit breaker, LLM call cap.

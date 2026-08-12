@@ -162,6 +162,26 @@ class AskResponse(BaseModel):
     answer_source: Literal["runbooks", "none"]
 
 
+class SearchRequest(BaseModel):
+    # Not AskRequest's min_length=10: the caller here is an agent naming a symptom
+    # ("OOMKilled after deploy"), not a person typing a sentence. A 422 is a dead end
+    # for a model, which cannot see why the call was rejected.
+    question: str = Field(min_length=3, description="What to look for in the runbooks")
+    k: int = Field(default=DEFAULT_K, ge=1, le=10)
+
+
+class SearchHit(BaseModel):
+    text: str
+    source: str
+    chunk_index: int
+    doc_type: str
+    score: float
+
+
+class SearchResponse(BaseModel):
+    hits: list[SearchHit]
+
+
 def build_context(hits: list[Hit]) -> str:
     blocks = [
         f'<chunk id="{marker}" source="{hit.source}" chunk_index="{hit.chunk_index}">\n'
@@ -334,6 +354,56 @@ def ask_runbook(request: AskRequest):
         UPSTREAM_ERRORS.labels(provider=e.provider).inc()
         logger.warning(f"{e}")
         raise HTTPException(status_code=e.status, detail=str(e))
+
+
+@app.post(
+    "/search-runbooks",
+    response_model=SearchResponse,
+    dependencies=[Depends(require_token)],
+)
+def search_runbooks(request: SearchRequest):
+    """Retrieval only. The self-healing agent's `search_runbooks` tool calls this.
+
+    `get_llm_provider` must never appear on this path. The agent has its own model and
+    its own transcript; a second model writing prose here would arrive as an
+    unattributed opinion inside the agent's evidence. Chunks, and let the caller reason.
+
+    HTTP rather than the agent importing retrieval.py: Chroma's PersistentClient is not
+    safe for multi-process access, and this process writes to that index every 60
+    seconds. A second process holding its own HNSW index would read stale vectors.
+
+    The similarity floor still applies, so a question the corpus cannot answer returns
+    no hits rather than three bad chunks -- the same refusal /ask-runbook makes, minus
+    the sentence.
+    """
+    logger.info(f"/search-runbooks k={request.k} q={request.question!r}")
+    started = time.perf_counter()
+    try:
+        provider, collection = open_collection()
+        hits = retrieve(
+            request.question, provider=provider, collection=collection, k=request.k
+        )
+    except EmptyIndexError as e:
+        logger.error(f"{e}")
+        raise HTTPException(status_code=503, detail=f"{e}")
+    except UpstreamError as e:
+        UPSTREAM_ERRORS.labels(provider=e.provider).inc()
+        logger.warning(f"{e}")
+        raise HTTPException(status_code=e.status, detail=str(e))
+    ANSWER_DURATION.labels(stage="retrieval").observe(time.perf_counter() - started)
+
+    return SearchResponse(
+        hits=[
+            SearchHit(
+                text=hit.text,
+                source=hit.source,
+                chunk_index=hit.chunk_index,
+                doc_type=hit.doc_type,
+                score=round(hit.score, 3),
+            )
+            for hit in hits
+        ]
+    )
 
 
 def strip_fence_languages(text: str) -> str:

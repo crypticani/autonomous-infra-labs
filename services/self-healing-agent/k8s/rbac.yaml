@@ -1,0 +1,46 @@
+# Scoped to the sandbox namespace and to exactly the verbs tools/ needs -- nothing more.
+# A bug in guardrails.py (Day 19) must not be sufficient to reach kube-system, and a
+# leaked token must not be sufficient to delete a Deployment. tests/test_rbac.py checks
+# these rules against tools.REGISTRY's `needs` so the two cannot drift silently.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: self-healing-agent
+  namespace: sandbox
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: self-healing-agent
+  namespace: sandbox
+rules:
+  # get_pod_logs
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # restart_pod
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["delete"]
+  # get_recent_deploys
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    verbs: ["list"]
+  # scale_deployment
+  - apiGroups: ["apps"]
+    resources: ["deployments/scale"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: self-healing-agent
+  namespace: sandbox
+subjects:
+  - kind: ServiceAccount
+    name: self-healing-agent
+    namespace: sandbox
+roleRef:
+  kind: Role
+  name: self-healing-agent
+  apiGroup: rbac.authorization.k8s.io

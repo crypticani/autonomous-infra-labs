@@ -340,3 +340,48 @@ def test_slack_route_does_not_require_a_bearer_token(monkeypatch):
     )
     assert response.status_code == 401
     assert "www-authenticate" not in response.headers  # rejected by HMAC, not by token
+
+
+SEARCH = {"question": "why do my pods get OOMKilled after a deploy"}
+
+
+def test_search_runbooks_returns_chunks_and_never_calls_the_model(wire):
+    """The assertion the whole endpoint exists for: retrieval, no generation.
+
+    Counting the spy's calls is the only way to prove a model was skipped -- the same
+    check that keeps the refusal path honest.
+    """
+    spy = wire(HITS)
+    response = client.post("/search-runbooks", json=SEARCH)
+
+    assert response.status_code == 200
+    hits = response.json()["hits"]
+    assert [h["source"] for h in hits] == [
+        "oomkilled-pod.md",
+        "postmortem-2026-06-checkout-oom-outage.md",
+    ]
+    assert hits[0]["doc_type"] == "runbook"
+    assert hits[0]["score"] == 0.781
+    assert spy.calls == 0
+
+
+def test_search_runbooks_returns_nothing_rather_than_bad_chunks(wire):
+    """Nothing cleared the floor. The agent gets an empty list, not three near-misses."""
+    wire([])
+    assert client.post("/search-runbooks", json=SEARCH).json()["hits"] == []
+
+
+def test_search_runbooks_empty_index_is_a_503(monkeypatch, wire):
+    wire([])
+
+    def boom(*args, **kwargs):
+        raise EmptyIndexError("collection 'stub' is empty: run ingest.py")
+
+    monkeypatch.setattr(app_module, "retrieve", boom)
+    assert client.post("/search-runbooks", json=SEARCH).status_code == 503
+
+
+def test_search_runbooks_requires_the_token(monkeypatch):
+    """Same door as /ask-runbook. A new endpoint is how auth quietly gets a hole."""
+    monkeypatch.setattr(app_module, "KC_API_TOKEN", "s3cret")
+    assert client.post("/search-runbooks", json=SEARCH).status_code == 401
