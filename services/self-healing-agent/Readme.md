@@ -11,9 +11,8 @@ This is **Project 3 (Week 3)** of the
 > and how the loop knows when to stop. This README is the *what and how much*; that one is the
 > *why*.
 
-**Status (Day 16):** all seven tools exist as schema'd functions with a real Kubernetes client
-seam and RBAC manifests scoped verb-for-verb to what they need. Nothing dispatches them yet —
-there is no loop and no `/diagnose` endpoint. That's Day 17.
+**Status (Day 17):** the loop dispatches tools, terminates on `submit_diagnosis`, and is reachable
+over `POST /diagnose`. Live-verified against a real alert and a real Gemini call — see below.
 
 ## Why this is an agent and not another RAG service
 
@@ -133,26 +132,56 @@ to exactly four rules: `pods/log:get`, `pods:delete`, `replicasets:list` (`apps`
 `kubectl apply` or `kubectl auth can-i` against, so the manifest is verified only by
 `tests/test_rbac.py`'s drift check today — the live `can-i` check is Day 21's capstone item.
 
+## `agent.py` — the loop, and `app.py` — the endpoint
+
+`diagnose(alert, provider, allowed=READ_ONLY) -> Diagnosis` is the whole loop: build the initial
+transcript, call `provider.chat()`, and for every tool call the model asks for, either dispatch it
+or refuse it. `submit_diagnosis` is intercepted by name before generic dispatch — it's the loop's
+exit condition, not a tool that does anything. `MAX_ITERATIONS` (default 6, `SHA_MAX_ITERATIONS`)
+is the backstop: a loop that exhausts it without seeing `submit_diagnosis` returns
+`confidence=None, incomplete=True` rather than inventing a number.
+
+The allowlist check (`tool_call.name not in allowed`) is enforced here, in the loop, not only via
+Gemini's `VALIDATED` tool-calling mode — Ollama's `/api/chat` has no equivalent, and a bug in a
+provider's own constraint must not be the only thing standing between the model and a tool it
+wasn't offered. A refusal is fed back to the model as a tool *error*, so the transcript shows the
+refusal happened rather than silently dropping the call.
+
+`app.py` adds `POST /diagnose`, gated by `require_token` — copied from knowledge-copilot's, bearer
+auth from the first commit rather than bolted on at capstone.
+
+**A live smoke test found a real bug.** `_dispatch` originally called `k8s_client.get_apis()`
+unconditionally for every tool, including `get_recent_alerts` and `search_runbooks`, which never
+touch the cluster and ignore the argument. On a box with no kubeconfig at all, every tool failed
+with the same "invalid kube-config" error — including the two that had no reason to. The fix:
+`_dispatch` only fetches a real client when `ToolSpec.needs` says the tool is one of the four that
+touch Kubernetes; everything else gets a placeholder it was already ignoring. Re-running the same
+alert afterward, `get_recent_alerts` genuinely reached the tailnet's Alertmanager (confirmed
+separately with a bare `curl`, `200`) instead of failing on an unrelated error.
+
 ## Tests
 
-21 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`
-(fakes for `CoreV1Api`/`AppsV1Api`, and `requests` monkeypatches for the two HTTP tools), 1 in
-`tests/test_rbac.py`. Fully offline — no test needs a cluster, a key, or a network call.
+24 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
+`tests/test_rbac.py`, 3 in `tests/test_agent.py` — a refused tool stays refused and the loop keeps
+going, `MAX_ITERATIONS` exhausted produces no fabricated diagnosis, and an allowed tool's result
+round-trips back into the transcript. Fully offline — no test needs a cluster, a key, or a network
+call; `FakeAgentProvider` scripts the model's turns and `k8s_client.get_apis` is monkeypatched
+wherever a test dispatches a real tool.
 
 ```bash
 cd services/self-healing-agent
-python -m pytest tests/ -q      # 21 passed
+python -m pytest tests/ -q      # 24 passed
 black --check .                 # clean
 ```
 
-Live-verified separately (not part of the offline suite, needs `GEMINI_API_KEY`): a declared
-`get_pod_logs` tool, given "pod api-7f9 in namespace sandbox is crashlooping", comes back as
-`ToolCall(name='get_pod_logs', args={'namespace': 'sandbox', 'pod': 'api-7f9'})` — a request the
-loop must dispatch, with nothing executed by the SDK itself.
+Live-verified separately (not part of the offline suite, needs `GEMINI_API_KEY` and the app
+actually running): a `PodOOMKilled` alert for `checkout-api`, posted to `/diagnose`, drove 6 real
+tool-calling turns against Gemini and ended in `submit_diagnosis` with `confidence: 0.95` and a
+proposed action to raise the memory limit — reasoning correctly around the fact that no Kubernetes
+cluster is reachable from this sandbox at all.
 
 ## Not built yet
 
-- `agent.py` — the loop itself, `MAX_ITERATIONS`, `POST /diagnose` — `later` (Day 17)
 - Approval workflow, audit log, Slack interactive buttons — `later` (Day 18)
 - Guardrails: namespace allowlist, replica floor, rate limit, circuit breaker, LLM call cap —
   `later` (Day 19)
