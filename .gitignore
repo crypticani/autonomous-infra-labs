@@ -226,3 +226,8 @@ docs/superpowers/
 # Unanchored (**/) on purpose: a relative CHROMA_PATH resolves against the shell's
 # cwd, so the index can land at a nested path an anchored rule would miss.
 **/chroma_data/
+
+# The agent's audit log: a real record of real decisions against a real cluster, so it
+# is never committed. The directory itself IS tracked (via .gitkeep), because compose
+# bind-mounts it and Docker would otherwise create it root-owned on a fresh host.
+**/audit/*.jsonl

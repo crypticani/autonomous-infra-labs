@@ -1,0 +1,3 @@
+# Tracked so the bind mount in docker-compose has a directory that already exists and
+# is owned by the host user. Without it, Docker creates this path root-owned on a fresh
+# host and the container -- which runs as a non-root uid -- cannot write the audit log.

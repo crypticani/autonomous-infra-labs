@@ -11,8 +11,10 @@ This is **Project 3 (Week 3)** of the
 > and how the loop knows when to stop. This README is the *what and how much*; that one is the
 > *why*.
 
-**Status (Day 17):** the loop dispatches tools, terminates on `submit_diagnosis`, and is reachable
-over `POST /diagnose`. Live-verified against a real alert and a real Gemini call — see below.
+**Status (Day 18):** the loop dispatches tools, terminates on `submit_diagnosis`, and is reachable
+over `POST /diagnose`. A diagnosis carrying a write action now becomes a Slack proposal with
+Approve/Reject buttons, and `POST /slack/interactive` is the only path by which a write tool runs.
+Live-verified against a real alert and a real Gemini call — see below.
 
 ## Why this is an agent and not another RAG service
 
@@ -159,18 +161,86 @@ touch Kubernetes; everything else gets a placeholder it was already ignoring. Re
 alert afterward, `get_recent_alerts` genuinely reached the tailnet's Alertmanager (confirmed
 separately with a bare `curl`, `200`) instead of failing on an unrelated error.
 
+## `approvals.py`, `audit.py`, `slack.py` — the Day 18 gate
+
+The write path is a separate path, and it starts where the loop ends:
+
+```
+alert → diagnose() → proposed_action → approvals.propose() → audit + Slack buttons
+                                                                      ↓
+                            k8s write ← approvals.decide() ← POST /slack/interactive
+```
+
+`agent.py` is unchanged and still passes `READ_ONLY`. `approvals.py` re-dispatches in three lines
+rather than importing `agent._dispatch`, so there is no import edge at all from the reasoning loop
+to a cluster mutation — a structural guarantee rather than a convention to remember. (`_dispatch`
+also wraps every failure into a dict for the model to read; here a failure has to arrive as an
+exception, so the audit line says `failed` instead of recording a success with an error inside it.)
+
+**`_validate` is the first gate.** `proposed_action`'s schema is `{"type": ["object", "null"]}` —
+the model can put anything there, including prose. Only a dict naming a **write** tool in
+`REGISTRY`, with a dict of arguments, becomes a button. Read-only tools are refused too: there is
+nothing to approve about reading a log, and offering it would train the on-call to click Approve
+without reading.
+
+**`decide()` checks four things in an order that is not rearrangeable** — unknown id, then expired,
+then already-decided, then act. Expiry is checked *before* state so a stale proposal can never be
+approved (`SHA_PROPOSAL_TTL`, default 3600; an approval clicked the next morning is not consent for
+the cluster as it is now). And on approve, `state = APPROVED` happens *before* `_execute()`, so a
+second click arriving while the first is still talking to the API server finds a non-`proposed`
+state and refuses. That check-then-set ordering is the whole defence against one alert restarting a
+pod twice.
+
+**`audit.py` is fifteen lines and one idea.** `record()` writes a JSON line, then `flush()`, then
+`os.fsync()`. Without the fsync the line sits in a kernel buffer, and a crash between deciding and
+acting loses exactly the record the log exists for — afterwards you have to tell "never ran" from
+"ran and died", and only a line already on disk tells you that. It has **no `try/except`**: if the
+write fails, the `OSError` propagates and stops the approve handler *before* it touches the
+cluster. No record, no action.
+
+**`slack.py`'s new part is the wire format.** `verify_signature` is a deliberate copy of the
+copilot's — two services in two containers, and the alternative to copying thirty lines is a shared
+package that couples their deploys. What differs from Day 13 is that interactive components post
+**form-encoded**, with the whole interaction JSON-encoded under a single `payload=` key, so parsing
+is `parse_qs` → `json.loads` → `actions[0]`. The proposal id rides in the button's `value`, so the
+click identifies itself without the handler guessing from the channel or the message text.
+`replace_message` is the one place in the module that swallows an error, and deliberately: by the
+time it runs the decision is made, audited and executed, so raising would turn a cosmetic failure
+into a 500 on a request whose real work succeeded.
+
+`POST /slack/interactive` carries no bearer token. The HMAC **is** the authentication, exactly as
+on the copilot's `/slack/events` — Slack cannot send a bearer token, and adding one would only put
+a shared secret in a URL somewhere. `await request.body()` comes first and nothing re-serialises
+it, because the signature covers the raw bytes. Once the signature checks out the answer is always
+`200`: a non-200 makes Slack retry, and a retried click is a second attempt at a cluster write.
+
 ## Tests
 
-24 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
+51 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
 `tests/test_rbac.py`, 3 in `tests/test_agent.py` — a refused tool stays refused and the loop keeps
 going, `MAX_ITERATIONS` exhausted produces no fabricated diagnosis, and an allowed tool's result
-round-trips back into the transcript. Fully offline — no test needs a cluster, a key, or a network
-call; `FakeAgentProvider` scripts the model's turns and `k8s_client.get_apis` is monkeypatched
-wherever a test dispatches a real tool.
+round-trips back into the transcript. Day 18 adds 9 in `tests/test_approvals.py` and 18 in
+`tests/test_slack.py`.
+
+The two that carry the most weight:
+
+- **a second Approve executes nothing.** Two people see the same alert and both click; the pod is
+  deleted once. `decide()` flips state before executing, so the second call finds a proposal that
+  is no longer `proposed`. Reverse those two lines and this test is what fails.
+- **the decision is on disk before the action that failed.** With a tool that raises, the audit log
+  must still read `proposed → approved → failed`. Were the record written after the call instead, a
+  crash mid-write and a call that never happened would be indistinguishable afterwards — and this
+  is the test that would go green anyway.
+
+Fully offline — no test needs a cluster, a key, or a network call. `FakeAgentProvider` scripts the
+model's turns, the registry is data so a fake write tool is a `dataclasses.replace` rather than a
+mock framework, and `k8s_client.get_apis` is monkeypatched wherever a test dispatches a real tool.
+Every Slack request is fabricated and signed in-test, which is the only honest way to check that a
+forged one is rejected.
 
 ```bash
 cd services/self-healing-agent
-python -m pytest tests/ -q      # 24 passed
+python -m pytest tests/ -q      # 51 passed
 black --check .                 # clean
 ```
 
@@ -180,9 +250,57 @@ tool-calling turns against Gemini and ended in `submit_diagnosis` with `confiden
 proposed action to raise the memory limit — reasoning correctly around the fact that no Kubernetes
 cluster is reachable from this sandbox at all.
 
+## Deployment
+
+Same shape as the other two services: a multi-stage `Dockerfile`, a CI workflow that lints, tests,
+validates `k8s/` with kubeconform and pushes a multi-arch image to GHCR, and a compose entry that
+binds to loopback while nginx terminates TLS in front of it.
+
+Two constraints are specific to this service, and both are load-bearing:
+
+**One worker, always.** `approvals._proposals` is in-process memory. With two uvicorn workers,
+Slack's click can land on the worker that does not hold the proposal, and a legitimate Approve
+comes back "expired or unknown". The copilot also runs `--workers 1`, but for an unrelated reason
+(two alert-sync loops racing on the same writes) — the same flag, two different failures.
+
+**The audit log needs a mount.** `SHA_AUDIT_PATH` points at `/app/audit/audit.jsonl`, and compose
+bind-mounts `services/self-healing-agent/audit` over it. An append-only record that dies with the
+container cannot answer "who approved that restart" a week later, which is the only question it
+exists to answer.
+
+Slack reaches `/slack/interactive` through the nginx that already fronts the copilot, so the agent
+needs a second `location` in that server block rather than its own subdomain and certificate:
+
+```nginx
+# Day 13 -- the copilot's events endpoint, on port 7100.
+location = /slack/events {
+    proxy_pass http://127.0.0.1:7100;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+
+# Day 18 -- the agent's approval buttons, on port 7200. A separate service behind the
+# same hostname, because Slack allows exactly one Interactivity Request URL per app and
+# this app is shared with the copilot.
+location = /slack/interactive {
+    proxy_pass http://127.0.0.1:7200;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+Both are `location =` — an exact match, so everything else on the host still 404s rather than
+reaching a service that was never meant to be public. Nothing here strips or rewrites the body:
+the HMAC is computed over the raw bytes, and a proxy that re-encoded the form would break every
+signature.
+
+Then set the Slack app's **Interactivity & Shortcuts → Request URL** to
+`https://<host>/slack/interactive`. That setting is global to the app, so pointing it at the agent
+is a one-way choice for the app the copilot also uses — safe today only because the copilot uses
+events and never interactivity.
+
 ## Not built yet
 
-- Approval workflow, audit log, Slack interactive buttons — `later` (Day 18)
 - Guardrails: namespace allowlist, replica floor, rate limit, circuit breaker, LLM call cap —
   `later` (Day 19)
 - Alertmanager webhook, `/metrics`, agent Deployment manifest — `later` (Day 20)

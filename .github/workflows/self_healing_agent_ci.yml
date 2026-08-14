@@ -1,0 +1,83 @@
+name: Self-Healing Agent CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - 'services/self-healing-agent/**'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'services/self-healing-agent/**'
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r services/self-healing-agent/requirements.txt
+          pip install pytest httpx
+
+      - name: Run Linting
+        run: |
+          black --check services/self-healing-agent
+
+      - name: Run Tests
+        working-directory: services/self-healing-agent
+        run: python -m pytest tests/ -q
+
+  validate-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.4.0/kubeconform-linux-amd64.tar.gz \
+            | tar xz kubeconform && sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate Kubernetes Manifests
+        run: kubeconform -strict -summary services/self-healing-agent/k8s/
+
+  build-and-push:
+    needs: [lint-and-test, validate-manifests]
+    # Same guard as the other two workflows: without it, fixing the `pull_request`
+    # trigger would start publishing :latest from unmerged pull-request code. This
+    # service can delete pods, so the hole is worse here than it was on day 13.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Github Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Qemu and Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/self-healing-agent
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ github.repository }}/self-healing-agent:latest

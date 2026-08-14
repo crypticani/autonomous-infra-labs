@@ -55,3 +55,43 @@ services:
       timeout: 30s
       retries: 3
       start_period: 10s
+
+  self-healing-agent:
+    build:
+      context: ./services/self-healing-agent
+      dockerfile: Dockerfile
+    image: self-healing-agent:latest
+    container_name: self-healing-agent
+    env_file:
+      - .env
+    # --workers 1 for a different reason than the copilot's: approvals._proposals is
+    # in-process memory, so a second worker means Slack's click can land on the worker
+    # that does not hold the proposal, and a valid Approve returns "expired or unknown".
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${SHA_PORT:-7200}", "--workers", "1"]
+    ports:
+      # Loopback only, same reasoning as the copilot: nginx terminates TLS on this host
+      # and proxies to it. Slack reaches /slack/interactive through nginx, never here.
+      - "127.0.0.1:${SHA_PORT:-7200}:${SHA_PORT:-7200}"
+    # Same uid problem as chroma_data: a bind mount keeps the HOST directory's owner
+    # rather than inheriting the image's, and the image runs as appuser (uid 100).
+    user: "${SHA_UID:-1000}:${SHA_GID:-1000}"
+    volumes:
+      # The audit log is a safety control and has to outlive the container. Without
+      # this mount, "who approved that restart" is answerable only until the next
+      # `docker compose up`.
+      - ./services/self-healing-agent/audit:/app/audit
+      # No cluster exists yet (the Week 3 blocker). When one does, either mount a
+      # kubeconfig here read-only, or run this service in-cluster and let
+      # k8s_client.get_apis() find the ServiceAccount token instead -- it already
+      # detects which case it is in. Day 20 picks one.
+      # - ${KUBECONFIG:-~/.kube/config}:/home/appuser/.kube/config:ro
+    extra_hosts:
+      # knowledge-copilot's /search-runbooks, and Alertmanager, both run on the host.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:$SHA_PORT/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 10s
