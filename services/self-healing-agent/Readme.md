@@ -268,36 +268,52 @@ bind-mounts `services/self-healing-agent/audit` over it. An append-only record t
 container cannot answer "who approved that restart" a week later, which is the only question it
 exists to answer.
 
-Slack reaches `/slack/interactive` through the nginx that already fronts the copilot, so the agent
-needs a second `location` in that server block rather than its own subdomain and certificate:
+**Its own subdomain, not a `location` on the copilot's.** `sha.crypticani.dev` gets its own server
+block, sharing a certificate with `knowledge-copilot.crypticani.dev` via `certbot --expand`. The
+tempting alternative — one more `location` in the copilot's existing block — was rejected: this
+service can delete pods, and its public surface should be structurally isolated rather than one
+mis-scoped `location` away from being served under the copilot's hostname. It also keeps the
+deployment consistent with everything else here, where a service means one directory, one image,
+one compose entry, one CI workflow, one hostname.
 
 ```nginx
-# Day 13 -- the copilot's events endpoint, on port 7100.
-location = /slack/events {
-    proxy_pass http://127.0.0.1:7100;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-}
+server {
+    server_name sha.crypticani.dev;
 
-# Day 18 -- the agent's approval buttons, on port 7200. A separate service behind the
-# same hostname, because Slack allows exactly one Interactivity Request URL per app and
-# this app is shared with the copilot.
-location = /slack/interactive {
-    proxy_pass http://127.0.0.1:7200;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
+    # The agent's only public endpoint. An exact match, so everything else 404s:
+    # /diagnose is bearer-authed but has no reason to be reachable from the internet,
+    # and Day 20's /metrics and alert webhook are both reached over loopback from
+    # Prometheus and Alertmanager on this same host.
+    location = /slack/interactive {
+        proxy_pass http://127.0.0.1:7200;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    location / { return 404; }
+
+    # certbot --nginx fills in listen 443 / ssl_certificate / etc.
 }
 ```
 
-Both are `location =` — an exact match, so everything else on the host still 404s rather than
-reaching a service that was never meant to be public. Nothing here strips or rewrites the body:
-the HMAC is computed over the raw bytes, and a proxy that re-encoded the form would break every
-signature.
+Nothing strips or rewrites the body: the HMAC is computed over the raw bytes, and a proxy that
+re-encoded the form would break every signature.
+
+Verify nginx before touching Slack, because Slack will not tell you:
+
+```bash
+curl -i https://sha.crypticani.dev/slack/interactive -X POST -d 'payload={}'   # expect 401
+```
+
+`401` is nginx reaching the agent and the agent rejecting an unsigned request — the whole path
+working. `502` means the container is down; `404` means the `location` did not match.
 
 Then set the Slack app's **Interactivity & Shortcuts → Request URL** to
-`https://<host>/slack/interactive`. That setting is global to the app, so pointing it at the agent
-is a one-way choice for the app the copilot also uses — safe today only because the copilot uses
-events and never interactivity.
+`https://sha.crypticani.dev/slack/interactive`. Two things about that setting: it is global to the
+app, so it is a one-way choice for the app the copilot also uses (safe today only because the
+copilot uses events and never interactivity) — and unlike Event Subscriptions, Slack does **not**
+send a verification challenge when saving it. A successful save proves nothing, which is why the
+`curl` above comes first.
 
 ## Not built yet
 
