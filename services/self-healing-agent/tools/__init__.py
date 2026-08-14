@@ -140,6 +140,15 @@ _SPECS = [
         write=False,
         needs=(),
     ),
+]
+
+# Derived, never written twice. submit_diagnosis's schema constrains `proposed_action.tool`
+# to these by enum, so Day 19 adding a write tool cannot leave the model still being offered
+# Day 18's list -- the failure that would cause is silent, because an unknown tool name is
+# refused by approvals._validate() and simply never becomes a button.
+WRITE: tuple[str, ...] = tuple(spec.name for spec in _SPECS if spec.write)
+
+_SPECS.append(
     ToolSpec(
         name="submit_diagnosis",
         description="End the loop with a diagnosis: what's wrong, the evidence for it, "
@@ -149,7 +158,30 @@ _SPECS = [
             "properties": {
                 "summary": {"type": "string"},
                 "evidence": {"type": "array", "items": {"type": "string"}},
-                "proposed_action": {"type": ["object", "null"]},
+                # The shape is stated in both the schema and its description on purpose.
+                # The enum is the real constraint where the provider honours it; the prose
+                # is what survives a provider that treats nested schemas loosely. Before
+                # this existed the field was a bare {"object", "null"} and the model was
+                # never told the gate's vocabulary -- it answered "raise the memory limit",
+                # which is not a tool, so the proposal was refused and no button appeared.
+                "proposed_action": {
+                    "type": ["object", "null"],
+                    "description": (
+                        "The single remediation to propose for human approval, as "
+                        '{"tool": <one of ' + ", ".join(WRITE) + '>, "args": {...}}, '
+                        "where args match that tool's own schema. Use null when no tool "
+                        "in that list would fix this -- null is a correct answer, not a "
+                        "failure to find one."
+                    ),
+                    "properties": {
+                        "tool": {"type": "string", "enum": list(WRITE)},
+                        "args": {
+                            "type": "object",
+                            "description": "Arguments for `tool`, matching its schema.",
+                        },
+                    },
+                    "required": ["tool", "args"],
+                },
                 "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
             },
             "required": ["summary", "evidence", "confidence"],
@@ -157,8 +189,8 @@ _SPECS = [
         fn=submit_diagnosis,
         write=False,
         needs=(),
-    ),
-]
+    )
+)
 
 REGISTRY: dict[str, ToolSpec] = {spec.name: spec for spec in _SPECS}
 READ_ONLY: tuple[str, ...] = tuple(

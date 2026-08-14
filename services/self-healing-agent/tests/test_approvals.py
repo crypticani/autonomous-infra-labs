@@ -16,6 +16,7 @@ import approvals
 import audit
 from agent import Diagnosis
 from errors import K8sError
+from tools import REGISTRY
 
 RESTART = {
     "tool": "restart_pod",
@@ -183,6 +184,52 @@ def test_a_failed_execution_is_not_retryable_by_clicking_again(spy_tool, audit_l
 
     assert not outcome.ok
     assert spy_tool == []
+
+
+def test_the_shape_submit_diagnosis_asks_for_is_the_shape_propose_accepts(
+    audit_log, spy_tool
+):
+    """The two ends of the contract, checked against each other.
+
+    approvals._validate() and submit_diagnosis's schema were written a day apart, and
+    for that day they disagreed: the schema said `proposed_action` was a bare object, so
+    the model answered in prose, and every proposal was refused before it could become a
+    button. Nothing failed loudly -- the gate simply never opened. This is the test that
+    would have caught it.
+    """
+    schema = REGISTRY["submit_diagnosis"].schema["properties"]["proposed_action"]
+    tool = schema["properties"]["tool"]["enum"][0]
+
+    # Built the way the schema describes, not the way _validate happens to parse.
+    action = {"tool": tool, "args": {"namespace": "sandbox", "pod": "checkout-api-1"}}
+    proposal = approvals.propose(diagnosis(action), {})
+
+    assert proposal is not None
+    assert proposal.tool == tool
+
+
+def test_every_tool_the_schema_offers_is_a_write_tool_that_actually_exists():
+    """Drift guard, the same shape as test_rbac.py's.
+
+    The enum is derived from the registry today. If it is ever hand-edited back to a
+    literal -- or a tool is renamed -- this fails here rather than as a proposal that
+    is silently refused in production.
+    """
+    schema = REGISTRY["submit_diagnosis"].schema["properties"]["proposed_action"]
+    offered = schema["properties"]["tool"]["enum"]
+
+    assert offered, "submit_diagnosis offers no action tools at all"
+    for name in offered:
+        assert name in REGISTRY, f"schema offers {name!r}, which is not a tool"
+        assert REGISTRY[name].write, f"schema offers {name!r}, which is read-only"
+    assert set(offered) == {n for n, s in REGISTRY.items() if s.write}
+
+
+def test_null_is_a_valid_answer_and_produces_no_proposal(audit_log):
+    """The prompt tells the model that null is correct when no offered tool fits. That
+    path must stay quiet: no audit line, no button, no error."""
+    assert approvals.propose(diagnosis(None), {}) is None
+    assert audit_log() == []
 
 
 def test_the_audit_line_carries_the_arguments_that_will_run(audit_log, spy_tool):

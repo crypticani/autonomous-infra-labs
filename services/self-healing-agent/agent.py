@@ -31,7 +31,15 @@ deciding the next call.
 
 When you have enough evidence, end the diagnosis by calling submit_diagnosis exactly
 once, with your summary, the evidence you gathered, an optional proposed_action, and a
-confidence score from 0 to 1. Do not guess at a fix without evidence for it."""
+confidence score from 0 to 1. Do not guess at a fix without evidence for it.
+
+proposed_action is not free text. It goes to a human as a button that executes exactly
+what it says, so it must name one of the action tools you were offered and give that
+tool's arguments. If the fix this alert really needs is not among those tools -- an
+OOMKill usually wants a higher memory limit, and nothing here can change one -- then
+set proposed_action to null and say so in the summary. Proposing a restart because the
+field exists is worse than proposing nothing: it puts a real action in front of a
+human at 3am that will not fix their problem."""
 
 
 @dataclass(frozen=True)

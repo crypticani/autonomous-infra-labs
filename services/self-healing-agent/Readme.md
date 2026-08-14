@@ -177,11 +177,21 @@ to a cluster mutation — a structural guarantee rather than a convention to rem
 also wraps every failure into a dict for the model to read; here a failure has to arrive as an
 exception, so the audit line says `failed` instead of recording a success with an error inside it.)
 
-**`_validate` is the first gate.** `proposed_action`'s schema is `{"type": ["object", "null"]}` —
-the model can put anything there, including prose. Only a dict naming a **write** tool in
-`REGISTRY`, with a dict of arguments, becomes a button. Read-only tools are refused too: there is
-nothing to approve about reading a log, and offering it would train the on-call to click Approve
-without reading.
+**`_validate` is the first gate.** Only a dict naming a **write** tool in `REGISTRY`, with a dict
+of arguments, becomes a button. Read-only tools are refused too: there is nothing to approve about
+reading a log, and offering it would train the on-call to click Approve without reading.
+
+**The gate needed a sending end.** `proposed_action` was originally declared as a bare
+`{"type": ["object", "null"]}`, so the model was never told the vocabulary `_validate` expects —
+Day 17's live test answered *"raise the memory limit"*, which is not a tool, and would have been
+refused before it could become a button. Nothing would have failed loudly; the gate simply never
+opens. `submit_diagnosis`'s schema now constrains `proposed_action.tool` by an `enum` **derived
+from the registry**, so Day 19 adding a write tool cannot leave the model working from Day 18's
+list, and a drift test asserts the enum and the registry's write tools stay the same set.
+
+The system prompt carries the other half: null is an explicitly correct answer. An OOMKill usually
+wants a higher memory limit, and nothing here can change one — proposing a restart because the
+field exists puts a real action in front of a human at 3am that will not fix their problem.
 
 **`decide()` checks four things in an order that is not rearrangeable** — unknown id, then expired,
 then already-decided, then act. Expiry is checked *before* state so a stale proposal can never be
@@ -216,10 +226,10 @@ it, because the signature covers the raw bytes. Once the signature checks out th
 
 ## Tests
 
-51 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
+54 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
 `tests/test_rbac.py`, 3 in `tests/test_agent.py` — a refused tool stays refused and the loop keeps
 going, `MAX_ITERATIONS` exhausted produces no fabricated diagnosis, and an allowed tool's result
-round-trips back into the transcript. Day 18 adds 9 in `tests/test_approvals.py` and 18 in
+round-trips back into the transcript. Day 18 adds 12 in `tests/test_approvals.py` and 18 in
 `tests/test_slack.py`.
 
 The two that carry the most weight:
@@ -240,7 +250,7 @@ forged one is rejected.
 
 ```bash
 cd services/self-healing-agent
-python -m pytest tests/ -q      # 51 passed
+python -m pytest tests/ -q      # 54 passed
 black --check .                 # clean
 ```
 
