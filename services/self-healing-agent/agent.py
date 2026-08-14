@@ -19,9 +19,13 @@ from tools import READ_ONLY, REGISTRY, as_model_tools
 
 logger = logging.getLogger(__name__)
 
-# Five tools plus submit_diagnosis: one pass through everything read-only, with nothing
-# wasted. Raise on evidence -- a real diagnosis that needed a seventh call -- not before.
-MAX_ITERATIONS = int(os.getenv("SHA_MAX_ITERATIONS", "6"))
+# Was 6 -- four read-only tools plus submit_diagnosis, one pass with a single turn spare.
+# Raised on the evidence that comment asked for: a live HighRequestLatency diagnosis on
+# 2026-08-14 spent all six turns on tool calls and never reached submit_diagnosis, so the
+# loop returned incomplete. One spare turn is not slack, it is a rounding error -- a single
+# retry of a failing tool consumes it, and two of the four read-only tools fail whenever no
+# cluster is reachable. 10 leaves room to gather, retry once, and still conclude.
+MAX_ITERATIONS = int(os.getenv("SHA_MAX_ITERATIONS", "10"))
 
 SYSTEM_PROMPT = """You are an on-call SRE agent. You will be shown one alert.
 
@@ -86,7 +90,14 @@ def diagnose(
     for iteration in range(1, MAX_ITERATIONS + 1):
         turn = provider.chat(SYSTEM_PROMPT, contents, tools, allowed=allowed)
         contents.append(turn.raw)
-        logger.info(f"iteration {iteration}: {len(turn.tool_calls)} tool call(s)")
+        # Names, not just a count. When this loop exhausts MAX_ITERATIONS the only useful
+        # question is *what it spent the turns on* -- retrying a dead tool, or asking the
+        # runbooks four different questions -- and a count cannot answer either. Learned
+        # from an incomplete diagnosis whose logs said "1 tool call" six times over.
+        logger.info(
+            f"iteration {iteration}/{MAX_ITERATIONS}: "
+            f"{[c.name for c in turn.tool_calls] or 'no tool calls'}"
+        )
 
         for tool_call in turn.tool_calls:
             if tool_call.name == "submit_diagnosis":
