@@ -26,10 +26,12 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["list"]
-  # scale_deployment
+  # scale_deployment -- `get` is for guardrails.py's execute-time check, which compares
+  # an approved replica count against the live one. The scale subresource carries the
+  # replica count and nothing else, so this reads no image, env var or secret.
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
-    verbs: ["patch"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

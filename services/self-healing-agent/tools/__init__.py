@@ -123,7 +123,10 @@ _SPECS = [
         },
         fn=scale_deployment,
         write=True,
-        needs=("apps/deployments/scale:patch",),
+        # `get` belongs to this tool even though scale_deployment never calls it: it is
+        # what guardrails.py reads before letting this tool run, and test_rbac.py compares
+        # this tuple against the Role for exact equality.
+        needs=("apps/deployments/scale:get", "apps/deployments/scale:patch"),
     ),
     ToolSpec(
         name="search_runbooks",

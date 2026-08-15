@@ -13,6 +13,7 @@ import logging
 import os
 from dataclasses import dataclass
 
+import guardrails
 import k8s_client
 from provider import BaseAgentProvider
 from tools import READ_ONLY, REGISTRY, as_model_tools
@@ -88,6 +89,11 @@ def diagnose(
     tools = as_model_tools(allowed)
 
     for iteration in range(1, MAX_ITERATIONS + 1):
+        # Here rather than inside provider.chat(): one call site covers every backend, and
+        # no provider implementation has to remember to ask. MAX_ITERATIONS is the cap
+        # within one diagnosis; this is the cap across all of them, which is the one that
+        # matters once Alertmanager is calling /diagnose with nobody watching.
+        guardrails.check_llm_call()
         turn = provider.chat(SYSTEM_PROMPT, contents, tools, allowed=allowed)
         contents.append(turn.raw)
         # Names, not just a count. When this loop exhausts MAX_ITERATIONS the only useful

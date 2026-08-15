@@ -6,14 +6,12 @@ which is the only substitution needed: the registry is data, so a fake write too
 `dataclasses.replace` rather than a mock framework.
 """
 
-import json
 import time
 from dataclasses import replace
 
 import pytest
 
 import approvals
-import audit
 from agent import Diagnosis
 from errors import K8sError
 from tools import REGISTRY
@@ -32,24 +30,6 @@ def diagnosis(action) -> Diagnosis:
         confidence=0.91,
         incomplete=False,
     )
-
-
-@pytest.fixture
-def audit_log(tmp_path, monkeypatch):
-    """Reads back what actually landed on disk, rather than what a mock was told.
-
-    audit.record writes and fsyncs, so by the time a call returns the line is readable
-    here -- which is the property the fail-before-acting test depends on.
-    """
-    path = tmp_path / "audit.jsonl"
-    monkeypatch.setattr(audit, "AUDIT_PATH", str(path))
-
-    def events() -> list[dict]:
-        if not path.exists():
-            return []
-        return [json.loads(line) for line in path.read_text().splitlines()]
-
-    return events
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +73,9 @@ def spy_tool(monkeypatch):
         {"tool": "get_pod_logs", "args": {}},  # read-only: nothing to approve
         {"tool": "rm_minus_rf", "args": {}},  # not a tool at all
         {"tool": "restart_pod", "args": "sandbox/checkout"},  # args not an object
+        # Required arguments missing: a button whose click would die on a TypeError
+        # inside _execute and be audited as FAILED, as if the cluster had refused.
+        {"tool": "scale_deployment", "args": {"namespace": "sandbox"}},
     ],
 )
 def test_only_a_real_write_tool_call_becomes_a_proposal(action, audit_log):

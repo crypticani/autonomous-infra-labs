@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 from pathlib import Path
@@ -11,7 +12,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # instantiated to test its translation logic, and that runs the constructor.
 os.environ.setdefault("GEMINI_API_KEY", "test-key-never-sent")
 
+import audit  # noqa: E402
+import guardrails  # noqa: E402
 from provider import AgentTurn, ToolCall  # noqa: E402
+
+
+@pytest.fixture
+def audit_log(tmp_path, monkeypatch):
+    """Reads back what actually landed on disk, rather than what a mock was told.
+
+    audit.record writes and fsyncs, so by the time a call returns the line is readable
+    here -- which is the property the fail-before-acting test depends on. Shared with
+    test_guardrails.py, whose rate limit and breaker read the same file as evidence.
+    """
+    path = tmp_path / "audit.jsonl"
+    monkeypatch.setattr(audit, "AUDIT_PATH", str(path))
+
+    def events() -> list[dict]:
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    return events
+
+
+@pytest.fixture(autouse=True)
+def fresh_llm_budget():
+    """guardrails._llm_calls is module state and diagnose() appends to it every turn.
+    Without this, the thirty-first turn in the whole suite fails a guardrail instead of
+    the loop under test -- test order deciding test outcome, in a file nobody suspects.
+    """
+    guardrails._llm_calls.clear()
+    yield
+    guardrails._llm_calls.clear()
 
 
 class FakeAgentProvider:

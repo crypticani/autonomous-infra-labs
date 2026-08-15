@@ -120,10 +120,37 @@ def restart_pod(apis, *, namespace: str, pod: str) -> dict:
     return {"namespace": namespace, "pod": pod}
 
 
+def current_replicas(apis, *, namespace: str, deployment: str) -> int:
+    """Not a tool -- it is not in _SPECS, so the model never sees it. guardrails.py calls
+    it to compare an approved scale against the cluster as it is at click time.
+
+    Reads the scale subresource rather than the Deployment, which is why the Role can
+    grant `get` on deployments/scale and still expose no image, no env var, no mounted
+    secret. The one number a guardrail needs is the only number this can read.
+    """
+    _, apps = apis
+    try:
+        scale = apps.read_namespaced_deployment_scale(
+            name=deployment, namespace=namespace
+        )
+    except ApiException as e:
+        raise K8sError(
+            f"could not read scale for deployment {deployment!r} in {namespace!r}: "
+            f"{e.reason}",
+            status=e.status or 502,
+        ) from e
+    return int(scale.spec.replicas or 0)
+
+
 def scale_deployment(apis, *, namespace: str, deployment: str, replicas: int) -> dict:
     """Clamped, not rejected: a model-chosen replica count outside the sane range is
     corrected to the nearest bound rather than failing the whole diagnosis over it.
-    Day 19's guardrail is the harder stop that re-checks this at execute time."""
+
+    The clamp is for a number the model invented; guardrails._check_replica_floor is the
+    harder stop for a number a human is about to approve, and it refuses rather than
+    corrects -- silently turning "scale to 0" into "scale to 1" would execute something
+    nobody clicked.
+    """
     _, apps = apis
     clamped = max(MIN_REPLICAS, min(replicas, MAX_REPLICAS))
     try:

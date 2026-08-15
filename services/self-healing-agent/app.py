@@ -18,12 +18,14 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
+import agent
 import approvals
 import audit
+import guardrails
 import k8s_client
 import slack
 from agent import diagnose
-from errors import UpstreamError
+from errors import GuardrailViolation, UpstreamError
 from provider import get_agent_provider
 
 load_dotenv()
@@ -86,6 +88,12 @@ def diagnose_alert(request: DiagnoseRequest):
     logger.info(f"/diagnose alert={request.alert!r}")
     try:
         result = diagnose(request.alert, get_agent_provider())
+    except GuardrailViolation as e:
+        # 429, not 500: nothing is broken. The model-call budget this deploy was given is
+        # spent, and the honest answer to "diagnose this now" is "not until the window
+        # rolls" -- which is also a status code Alertmanager's webhook will retry on.
+        logger.warning(f"guardrail {e.guard!r} refused this diagnosis: {e}")
+        raise HTTPException(status_code=429, detail=str(e))
     except UpstreamError as e:
         logger.warning(f"{e}")
         raise HTTPException(status_code=e.status, detail=str(e))
@@ -156,6 +164,17 @@ def health_check():
         "audit_path": audit.AUDIT_PATH,
         "pending_proposals": len(approvals._proposals),
         "proposal_ttl": approvals.PROPOSAL_TTL,
+        # The limits this process actually loaded, not the ones the image ships. appsrv's
+        # .env overrides image defaults, and on Day 18 that cost an evening to a
+        # SHA_MAX_ITERATIONS still set to 6 -- invisible until it truncated a diagnosis.
+        "guards": {
+            "namespaces": list(guardrails.NAMESPACES),
+            "max_actions_per_hour": guardrails.MAX_ACTIONS_PER_HOUR,
+            "breaker_threshold": guardrails.BREAKER_THRESHOLD,
+            "max_llm_calls": guardrails.MAX_LLM_CALLS,
+            "window": guardrails.WINDOW,
+            "max_iterations": agent.MAX_ITERATIONS,
+        },
         # The point of the unset branch: a deploy that forgot SHA_API_TOKEN is visible
         # here, rather than being quietly open.
         "auth": "required" if SHA_API_TOKEN else "disabled",

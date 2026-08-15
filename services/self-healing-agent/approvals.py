@@ -18,8 +18,10 @@ import uuid
 from dataclasses import dataclass
 
 import audit
+import guardrails
 import k8s_client
 import slack
+from errors import GuardrailViolation
 from tools import REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -34,6 +36,9 @@ EXECUTED = "executed"
 REJECTED = "rejected"
 EXPIRED = "expired"
 FAILED = "failed"
+# Day 19. Not FAILED: nothing broke, the agent refused. Terminal like the other two, so a
+# blocked proposal cannot be clicked into a second attempt.
+BLOCKED = "blocked"
 
 
 @dataclass
@@ -81,6 +86,11 @@ def _validate(action) -> tuple[str, dict] | None:
     spec = REGISTRY.get(tool) if isinstance(tool, str) else None
     if spec is None or not spec.write or not isinstance(args, dict):
         return None
+    # The tool's own schema says what it needs. Without this a proposal missing an
+    # argument still becomes a button, and the click reaches _execute() and dies on a
+    # TypeError -- audited as FAILED, indistinguishable from a cluster that refused.
+    if any(field not in args for field in spec.schema.get("required", [])):
+        return None
     return tool, args
 
 
@@ -97,6 +107,16 @@ def propose(diagnosis, alert: dict, now: float | None = None) -> Proposal | None
         return None
 
     tool, args = validated
+    # Before the proposal exists, so a refused action never becomes a button at all. The
+    # cluster is not read here (no `apis`): the model has just finished reading it, and the
+    # check that needs live state is the one decide() runs at click time.
+    try:
+        guardrails.check(tool, args)
+    except GuardrailViolation as e:
+        audit.record(BLOCKED, tool=tool, args=args, guard=e.guard, reason=str(e))
+        logger.warning(f"guardrail {e.guard!r} refused {tool}: {e}")
+        return None
+
     proposal = Proposal(
         id=uuid.uuid4().hex[:12],
         tool=tool,
@@ -132,13 +152,19 @@ def _sweep(now: float) -> None:
             del _proposals[proposal.id]
 
 
-def _execute(proposal: Proposal) -> dict:
+def _apis_for(proposal: Proposal):
+    """Fetched once and handed to both the guardrail and the tool. get_apis is lru_cached
+    so this is not about cost -- it is that the check and the write have to be looking at
+    the same cluster."""
+    spec = REGISTRY[proposal.tool]
+    return k8s_client.get_apis() if spec.needs else (None, None)
+
+
+def _execute(proposal: Proposal, apis) -> dict:
     """Deliberately not agent._dispatch. That function wraps every failure into a dict
     for the model to read; here a failure has to reach decide() as an exception, so the
     audit line says FAILED instead of recording a success with an error inside it."""
-    spec = REGISTRY[proposal.tool]
-    apis = k8s_client.get_apis() if spec.needs else (None, None)
-    return spec.fn(apis, **proposal.args)
+    return REGISTRY[proposal.tool].fn(apis, **proposal.args)
 
 
 def decide(
@@ -172,8 +198,28 @@ def decide(
         APPROVED, id=proposal.id, tool=proposal.tool, args=proposal.args, user=user
     )
 
+    # Day 19: the second checkpoint, and the one that matters. It sits after the state
+    # flip so the double-click defence is untouched, and after the `approved` line so the
+    # log reads approved -> blocked -- a human did click yes, and the machine refused
+    # anyway. A guard evaluated only at propose time would have said nothing here.
+    # One try for both, so that loading a client, refusing, and failing all end up
+    # somewhere deliberate. GuardrailViolation is caught first and separately: it is the
+    # only one of the three where nothing was attempted.
     try:
-        result = _execute(proposal)
+        apis = _apis_for(proposal)
+        guardrails.check(proposal.tool, proposal.args, apis=apis)
+        result = _execute(proposal, apis)
+    except GuardrailViolation as e:
+        proposal.state = BLOCKED
+        audit.record(
+            BLOCKED, id=proposal.id, tool=proposal.tool, guard=e.guard, reason=str(e)
+        )
+        logger.warning(
+            f"guardrail {e.guard!r} refused {proposal.tool} after approval: {e}"
+        )
+        return Decision(
+            False, f"Approved by {user}, but the `{e.guard}` guardrail refused it: {e}"
+        )
     except Exception as e:
         proposal.state = FAILED
         audit.record(FAILED, id=proposal.id, tool=proposal.tool, error=str(e))

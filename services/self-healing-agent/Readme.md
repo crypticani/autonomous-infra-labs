@@ -58,7 +58,7 @@ writing JSON in prose for us to parse.
 | `get_recent_alerts(service?, since_minutes)` | Alertmanager v2 | no | — (HTTP) | same source knowledge-copilot already polls |
 | `get_recent_deploys(namespace, deployment)` | ReplicaSet revisions | no | `replicasets:list` | real rollout history, not a hand-written changelog; filtered by ownerReferences so it never needs `deployments:get` |
 | `restart_pod(namespace, pod)` | — | **yes** | `pods:delete` | deletes one pod by exact name; the ReplicaSet recreates it |
-| `scale_deployment(namespace, deployment, replicas)` | — | **yes** | `deployments/scale:patch` | clamped to `SHA_MIN_REPLICAS`–`SHA_MAX_REPLICAS`, not rejected — Day 19's guardrail is the hard stop |
+| `scale_deployment(namespace, deployment, replicas)` | — | **yes** | `deployments/scale:get,patch` | clamped to `SHA_MIN_REPLICAS`–`SHA_MAX_REPLICAS`, not rejected — Day 19's guardrail is the hard stop, and `get` is what it reads to compare against the live count |
 | `search_runbooks(question, k)` | knowledge-copilot, over HTTP | no | — (HTTP) | retrieval only — the call never reaches a generator |
 | `submit_diagnosis(summary, evidence, proposed_action, confidence)` | — | terminal | — | the loop's exit condition (Day 17 dispatches it specially) |
 
@@ -139,9 +139,11 @@ to exactly four rules: `pods/log:get`, `pods:delete`, `replicasets:list` (`apps`
 `diagnose(alert, provider, allowed=READ_ONLY) -> Diagnosis` is the whole loop: build the initial
 transcript, call `provider.chat()`, and for every tool call the model asks for, either dispatch it
 or refuse it. `submit_diagnosis` is intercepted by name before generic dispatch — it's the loop's
-exit condition, not a tool that does anything. `MAX_ITERATIONS` (default 6, `SHA_MAX_ITERATIONS`)
+exit condition, not a tool that does anything. `MAX_ITERATIONS` (default 10, `SHA_MAX_ITERATIONS`)
 is the backstop: a loop that exhausts it without seeing `submit_diagnosis` returns
-`confidence=None, incomplete=True` rather than inventing a number.
+`confidence=None, incomplete=True` rather than inventing a number. It was 6 until a live
+`HighRequestLatency` diagnosis spent all six turns gathering evidence and never reached
+`submit_diagnosis` — one spare turn is a rounding error, not slack.
 
 The allowlist check (`tool_call.name not in allowed`) is enforced here, in the loop, not only via
 Gemini's `VALIDATED` tool-calling mode — Ollama's `/api/chat` has no equivalent, and a bug in a
@@ -224,15 +226,70 @@ a shared secret in a URL somewhere. `await request.body()` comes first and nothi
 it, because the signature covers the raw bytes. Once the signature checks out the answer is always
 `200`: a non-200 makes Slack retry, and a retried click is a second attempt at a cluster write.
 
+## `guardrails.py` — the Day 19 refusals
+
+RBAC is the layer that cannot be argued with: the Role grants five verbs in one namespace, and no
+bug in this module can widen that. Guardrails are the layer *above* it — they stop actions the Role
+would happily allow but no on-call would want at 3am, and they name which rule refused in a sentence
+that goes back to Slack.
+
+| Guard | Key (default) | Refuses |
+|---|---|---|
+| namespace | `SHA_NAMESPACES` (`sandbox`) | anything outside the allowlist — and a *missing* namespace as firmly as a wrong one |
+| replica floor | `SHA_MIN_REPLICAS` (1) | scaling below the floor; refused, not clamped |
+| live replicas | — | an approved scale that is now a scale *down*, read from the scale subresource at click time |
+| rate limit | `SHA_MAX_ACTIONS_PER_HOUR` (3) | the fourth cluster write in an hour |
+| circuit breaker | `SHA_BREAKER_THRESHOLD` (3) | anything at all, once N consecutive executions have failed |
+| model-call budget | `SHA_MAX_LLM_CALLS` (30) | the next `provider.chat()` past the hourly ceiling |
+
+**The guards run twice, and the second run is the point.** `propose()` checks before a button
+exists; `decide()` checks again between `APPROVED` and `_execute()`. That is not belt-and-braces —
+it is that the interesting guards *change their answer* between those two moments. Another action
+ran. An execution failed. Someone scaled the Deployment by hand while the message sat unread. A
+proposal to scale `checkout-api` from 2 to 4 is an increase when it is written and a **scale-down**
+twenty minutes later if a human took it to 8 in the meantime, and only a check at click time can
+see that. It costs one verb — `get` on `deployments/scale`, a subresource carrying the replica
+count and nothing else: no image, no env var, no mounted secret.
+
+**The counts come from `audit.jsonl`, not from counters in this process.** The log is already
+append-only and fsynced; deriving from it means a restart cannot silently refill an hourly budget or
+close an open breaker, and "why is the breaker open" is answerable with `grep` instead of a
+debugger. The rate limit and the breaker read `executed`/`failed` lines — *not* `approved` — so a
+proposal that a guard blocked never spends the budget. Counting approvals would let one bad proposal
+poison the window and make the guards compound each other.
+
+**The breaker shares the rate limit's window (`SHA_GUARD_WINDOW`, 3600) because otherwise it
+deadlocks.** An open breaker blocks the only event that could close it — a successful execution — so
+without a time bound it stays open until someone restarts the process. That is the opposite of a
+safety control. Bounded, it half-opens after a quiet hour.
+
+**A blocked action is not a failed one.** `GuardrailViolation` deliberately does not inherit from
+`UpstreamError`: nothing broke, the agent refused. So the state machine gains `blocked` (terminal,
+like `executed` and `failed`), `/diagnose` answers `429` rather than `500` when the model-call
+budget is spent, and the audit log for a click-time refusal reads `proposed → approved → blocked` —
+a human *did* say yes, and the machine refused anyway. The `approved` line is written before the
+guard runs precisely so that story survives.
+
+Two things fail closed on purpose. A cluster read that errors is a refusal, not a pass — a current
+state that cannot be established cannot be checked against. And an audit line that will not parse
+raises rather than being skipped: a history this cannot read is a history it cannot check, the same
+direction as `audit.record`'s missing `try/except`.
+
+The model-call budget is the one count kept in memory, because a model call is not an audit event —
+ten lines per diagnosis would bury the decisions the log exists to record under the arithmetic. It
+is also not a per-diagnosis cap; `MAX_ITERATIONS` already is that. This is the ceiling *across*
+diagnoses, which is what matters from Day 20 on, when Alertmanager drives `/diagnose` with nobody
+watching and one flapping alert could spend the whole free tier before breakfast.
+
 ## Tests
 
-54 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
+84 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
 `tests/test_rbac.py`, 3 in `tests/test_agent.py` — a refused tool stays refused and the loop keeps
 going, `MAX_ITERATIONS` exhausted produces no fabricated diagnosis, and an allowed tool's result
-round-trips back into the transcript. Day 18 adds 12 in `tests/test_approvals.py` and 18 in
-`tests/test_slack.py`.
+round-trips back into the transcript. Day 18 adds 16 in `tests/test_approvals.py` and 15 in
+`tests/test_slack.py`; Day 19 adds 29 in `tests/test_guardrails.py`.
 
-The two that carry the most weight:
+The three that carry the most weight:
 
 - **a second Approve executes nothing.** Two people see the same alert and both click; the pod is
   deleted once. `decide()` flips state before executing, so the second call finds a proposal that
@@ -241,6 +298,10 @@ The two that carry the most weight:
   must still read `proposed → approved → failed`. Were the record written after the call instead, a
   crash mid-write and a call that never happened would be indistinguishable afterwards — and this
   is the test that would go green anyway.
+- **a guard that refuses at click time leaves `approved → blocked`.** The proposal is legal when it
+  is made and illegal by the time it is approved, because the live replica count moved in between.
+  Nothing executes, the state lands on `blocked`, and the log says a human clicked yes and the
+  machine refused. Move the guard back to propose time only and this is the test that fails.
 
 Fully offline — no test needs a cluster, a key, or a network call. `FakeAgentProvider` scripts the
 model's turns, the registry is data so a fake write tool is a `dataclasses.replace` rather than a
@@ -250,7 +311,7 @@ forged one is rejected.
 
 ```bash
 cd services/self-healing-agent
-python -m pytest tests/ -q      # 54 passed
+python -m pytest tests/ -q      # 84 passed
 black --check .                 # clean
 ```
 
@@ -276,7 +337,14 @@ comes back "expired or unknown". The copilot also runs `--workers 1`, but for an
 **The audit log needs a mount.** `SHA_AUDIT_PATH` points at `/app/audit/audit.jsonl`, and compose
 bind-mounts `services/self-healing-agent/audit` over it. An append-only record that dies with the
 container cannot answer "who approved that restart" a week later, which is the only question it
-exists to answer.
+exists to answer. The `.jsonl` is not a typo — one JSON object per line is what makes an
+append-only log appendable, and since Day 19 the rate limit and the circuit breaker read their
+counts from those lines. Rename the file and the guards start from zero without saying so.
+
+**`GET /health` reports the limits this process actually loaded** — namespaces, the three
+thresholds, the window, `max_iterations` — because appsrv's `.env` overrides the image's defaults
+and a stale value there is invisible until it silently truncates a diagnosis. That happened on Day
+18 with `SHA_MAX_ITERATIONS` still set to 6, and cost an evening.
 
 **Its own subdomain, not a `location` on the copilot's.** `sha.crypticani.dev` gets its own server
 block, sharing a certificate with `knowledge-copilot.crypticani.dev` via `certbot --expand`. The
@@ -327,8 +395,6 @@ send a verification challenge when saving it. A successful save proves nothing, 
 
 ## Not built yet
 
-- Guardrails: namespace allowlist, replica floor, rate limit, circuit breaker, LLM call cap —
-  `later` (Day 19)
 - Alertmanager webhook, `/metrics`, agent Deployment manifest — `later` (Day 20)
 - Injected-failure capstone recording, eval harness over recorded tool transcripts — `later`
   (Day 21)
