@@ -5,6 +5,11 @@ incomplete diagnosis is an error.
 Day 18 adds the write path, and it does not run from here either: /diagnose records
 and posts a proposal, and POST /slack/interactive turns a human's click into the only
 call that reaches a write tool.
+
+Day 20 adds POST /alerts, and with it the last human out of the loop's *front* end:
+until now every diagnosis began with someone running curl. The human is still in the
+loop where it counts -- nothing writes to a cluster without a click -- but the trigger is
+now Alertmanager, which is why this file grew a background path and a /metrics scrape.
 """
 
 import hmac
@@ -15,10 +20,12 @@ from typing import Any
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel
 
 import agent
+import alerts
 import approvals
 import audit
 import guardrails
@@ -79,6 +86,27 @@ class DiagnoseResponse(BaseModel):
     proposal_id: str | None = None
 
 
+def _diagnose_and_propose(alert: dict):
+    """One diagnosis, from alert to button. Shared by the two things that start one.
+
+    Extracted on Day 20 rather than duplicated into the webhook, because the two callers
+    differ only in what they do with the *outcome* -- /diagnose returns it, /alerts has
+    no one left to return it to. Duplicating meant two places to remember that a Slack
+    outage must not discard a diagnosis, and the second copy is the one that forgets.
+    """
+    result = diagnose(alert, get_agent_provider())
+
+    # The proposal is audited before it is posted, so a Slack outage costs the button
+    # and not the record. Failing here because a chat API was down would discard work
+    # that succeeded and is already on disk.
+    proposal = None
+    try:
+        proposal = approvals.propose(result, alert)
+    except slack.SlackError as e:
+        logger.error(f"proposal recorded but not posted to slack: {e}")
+    return result, proposal
+
+
 @app.post(
     "/diagnose",
     response_model=DiagnoseResponse,
@@ -87,7 +115,7 @@ class DiagnoseResponse(BaseModel):
 def diagnose_alert(request: DiagnoseRequest):
     logger.info(f"/diagnose alert={request.alert!r}")
     try:
-        result = diagnose(request.alert, get_agent_provider())
+        result, proposal = _diagnose_and_propose(request.alert)
     except GuardrailViolation as e:
         # 429, not 500: nothing is broken. The model-call budget this deploy was given is
         # spent, and the honest answer to "diagnose this now" is "not until the window
@@ -98,15 +126,6 @@ def diagnose_alert(request: DiagnoseRequest):
         logger.warning(f"{e}")
         raise HTTPException(status_code=e.status, detail=str(e))
 
-    # The proposal is audited before it is posted, so a Slack outage costs the button
-    # and not the record. This endpoint's contract is to return a diagnosis; failing it
-    # because a chat API was down would discard work that succeeded and is on disk.
-    proposal = None
-    try:
-        proposal = approvals.propose(result, request.alert)
-    except slack.SlackError as e:
-        logger.error(f"proposal recorded but not posted to slack: {e}")
-
     return DiagnoseResponse(
         summary=result.summary,
         evidence=list(result.evidence),
@@ -115,6 +134,73 @@ def diagnose_alert(request: DiagnoseRequest):
         incomplete=result.incomplete,
         proposal_id=proposal.id if proposal else None,
     )
+
+
+def _diagnose_in_background(alert: dict) -> None:
+    """The same work, with nobody to report to.
+
+    Catches everything, deliberately. There is no response left to fail, so an escaping
+    exception buys a traceback nobody reads -- and worse, starlette would surface it
+    after the 202 has already gone out, which is the worst of both: Alertmanager thinks
+    it succeeded and the log says otherwise.
+
+    A guardrail refusal in particular is a *decision*, already counted and audited by the
+    time it arrives here. Logging it at warning and stopping is the correct end of that
+    story, not an error.
+    """
+    try:
+        _diagnose_and_propose(alert)
+    except GuardrailViolation as e:
+        logger.warning(f"guardrail {e.guard!r} refused this alert: {e}")
+    except UpstreamError as e:
+        logger.error(f"diagnosis abandoned, {e.provider} failed: {e}")
+    except Exception:
+        logger.exception("diagnosis abandoned by an unexpected failure")
+
+
+@app.post("/alerts", status_code=202, dependencies=[Depends(require_token)])
+def receive_alerts(payload: dict, background: BackgroundTasks):
+    """Alertmanager's webhook. Day 20, and the end of curl as the way in.
+
+    202 and not 200, because the diagnosis has been accepted rather than performed.
+    Alertmanager's webhook client gives up after seconds and re-POSTs the group; a
+    diagnosis is six to ten model calls and runs for minutes. Answering synchronously
+    would guarantee a timeout on every alert *and* a duplicate diagnosis behind it --
+    two calls into a free tier of about twenty a day.
+
+    The body is taken as a bare dict rather than a Pydantic model on purpose. A schema
+    here turns anything Alertmanager's future changes to the payload into a 422, and a
+    422 makes it retry a body that will never work; alerts.accept is written to be
+    defensive about shape instead, which is where the knowledge belongs.
+    """
+    intake = alerts.accept(payload)
+    logger.info(
+        f"/alerts accepted={len(intake.accepted)} resolved={intake.resolved} "
+        f"duplicate={intake.duplicate}"
+    )
+    for alert in intake.accepted:
+        background.add_task(_diagnose_in_background, alert)
+
+    return {
+        "accepted": len(intake.accepted),
+        "resolved": intake.resolved,
+        "duplicate": intake.duplicate,
+    }
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """Prometheus scrape target.
+
+    Unauthenticated, exactly like the copilot's: Prometheus reaches this over loopback on
+    appsrv, and a bearer token in a scrape config is a secret in a third place buying
+    nothing.
+
+    Nothing is computed here. Every metric in this service is a counter or a histogram
+    incremented at the moment the thing happened, so there is no live state to read at
+    scrape time and no way for a scrape to fail.
+    """
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")
@@ -164,6 +250,13 @@ def health_check():
         "audit_path": audit.AUDIT_PATH,
         "pending_proposals": len(approvals._proposals),
         "proposal_ttl": approvals.PROPOSAL_TTL,
+        # Day 20. A dedup table that is empty while Alertmanager is firing means the
+        # webhook is not arriving; one that never empties means _prune stopped running
+        # and every future alert is being suppressed. Neither is visible anywhere else.
+        "alerts": {
+            "suppressed": len(alerts._seen),
+            "dedup_ttl": alerts.DEDUP_TTL,
+        },
         # The limits this process actually loaded, not the ones the image ships. appsrv's
         # .env overrides image defaults, and on Day 18 that cost an evening to a
         # SHA_MAX_ITERATIONS still set to 6 -- invisible until it truncated a diagnosis.

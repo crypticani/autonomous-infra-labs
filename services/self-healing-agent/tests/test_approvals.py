@@ -225,3 +225,49 @@ def test_the_audit_line_carries_the_arguments_that_will_run(audit_log, spy_tool)
     assert approved["args"] == RESTART["args"]
     assert approved["user"] == "aniket"
     assert approved["id"] == proposal.id
+
+
+def test_each_lifecycle_transition_is_counted_under_its_own_state(spy_tool, audit_log):
+    """proposed vs executed is the ratio this service is judged on: how much the agent
+    wanted to do, against how much a human let it. One counter per state is what makes
+    that a graph rather than an afternoon reading audit.jsonl."""
+    from conftest import metric
+
+    before = {
+        state: metric("sha_proposals_total", state=state)
+        for state in ("proposed", "approved", "executed", "rejected")
+    }
+    approved = approvals.propose(diagnosis(RESTART), {})
+    rejected = approvals.propose(diagnosis(RESTART), {})
+
+    approvals.decide(approved.id, "approve", "aniket")
+    approvals.decide(rejected.id, "reject", "aniket")
+
+    assert metric("sha_proposals_total", state="proposed") == before["proposed"] + 2
+    assert metric("sha_proposals_total", state="approved") == before["approved"] + 1
+    assert metric("sha_proposals_total", state="executed") == before["executed"] + 1
+    assert metric("sha_proposals_total", state="rejected") == before["rejected"] + 1
+
+
+def test_a_failed_execution_is_counted_as_failed_not_executed(
+    spy_tool, audit_log, monkeypatch
+):
+    # The counter has to agree with the audit log. A `failed` execution counted as
+    # `executed` would make the one graph anyone looks at during an incident say the
+    # agent's writes are all landing.
+    from conftest import metric
+
+    def broken(apis, **args):
+        raise K8sError("the API server said no", 500)
+
+    monkeypatch.setitem(
+        REGISTRY, "restart_pod", replace(REGISTRY["restart_pod"], fn=broken)
+    )
+    before_failed = metric("sha_proposals_total", state="failed")
+    before_executed = metric("sha_proposals_total", state="executed")
+    proposal = approvals.propose(diagnosis(RESTART), {})
+
+    approvals.decide(proposal.id, "approve", "aniket")
+
+    assert metric("sha_proposals_total", state="failed") == before_failed + 1
+    assert metric("sha_proposals_total", state="executed") == before_executed

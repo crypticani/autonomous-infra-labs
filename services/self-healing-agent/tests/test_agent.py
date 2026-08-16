@@ -1,5 +1,10 @@
+import pytest
+
 import agent
+import guardrails
 import tools.external as external
+from conftest import metric
+from errors import AgentProviderError, GuardrailViolation
 from provider import AgentTurn, ToolCall
 
 ALERT = {"alertname": "CrashLoopBackOff", "service": "checkout-api"}
@@ -92,3 +97,84 @@ def test_dispatches_an_allowed_tool_and_feeds_back_its_result(
     assert diagnosis.confidence == 0.8
     fed_back = provider.seen_contents[1][-1]
     assert fed_back["result"]["output"]["hits"][0]["text"] == "raise the memory limit"
+
+
+def submits(summary="checkout-api is crashlooping", confidence=0.4):
+    return turn(
+        calls=[
+            call(
+                "submit_diagnosis",
+                summary=summary,
+                evidence=["logs"],
+                confidence=confidence,
+            )
+        ]
+    )
+
+
+def test_a_finished_diagnosis_counts_as_complete(fake_provider):
+    before = metric("sha_diagnoses_total", outcome="complete")
+
+    agent.diagnose(ALERT, fake_provider(submits()))
+
+    assert metric("sha_diagnoses_total", outcome="complete") == before + 1
+
+
+def test_an_exhausted_loop_counts_as_incomplete_not_complete(fake_provider):
+    # The distinction the counter exists for. An incomplete diagnosis is still a returned
+    # Diagnosis, so a single sha_diagnoses_total would call this a success and hide the
+    # only failure mode this loop has that raises nothing.
+    before = metric("sha_diagnoses_total", outcome="incomplete")
+    provider = fake_provider(
+        *[turn(text="still investigating") for _ in range(agent.MAX_ITERATIONS)]
+    )
+
+    agent.diagnose(ALERT, provider)
+
+    assert metric("sha_diagnoses_total", outcome="incomplete") == before + 1
+
+
+def test_a_guardrail_refusal_counts_as_blocked(fake_provider, monkeypatch):
+    before = metric("sha_diagnoses_total", outcome="blocked")
+
+    def refuse(now=None):
+        raise GuardrailViolation("budget spent", guard="llm_calls")
+
+    monkeypatch.setattr(guardrails, "check_llm_call", refuse)
+
+    with pytest.raises(GuardrailViolation):
+        agent.diagnose(ALERT, fake_provider(submits()))
+
+    assert metric("sha_diagnoses_total", outcome="blocked") == before + 1
+
+
+def test_an_upstream_failure_counts_as_failed_not_blocked(fake_provider):
+    # Blocked is the agent deciding not to act; failed is something else breaking. One
+    # is a working guardrail and the other is a page, so collapsing them would make the
+    # metric unactionable.
+    before = metric("sha_diagnoses_total", outcome="failed")
+
+    class Broken(type(fake_provider(submits()))):
+        def chat(self, *a, **k):
+            raise AgentProviderError("model is down", 502, provider="fake")
+
+    with pytest.raises(AgentProviderError):
+        agent.diagnose(ALERT, Broken([]))
+
+    assert metric("sha_diagnoses_total", outcome="failed") == before + 1
+
+
+def test_a_diagnosis_is_timed_even_when_it_raises(fake_provider):
+    # A histogram that only observes the happy path makes an outage look like a quiet
+    # afternoon: the failures cost real seconds and simply never appear.
+    before = metric("sha_diagnosis_duration_seconds_count")
+    agent.diagnose(ALERT, fake_provider(submits()))
+
+    class Broken(type(fake_provider(submits()))):
+        def chat(self, *a, **k):
+            raise AgentProviderError("model is down", 502, provider="fake")
+
+    with pytest.raises(AgentProviderError):
+        agent.diagnose(ALERT, Broken([]))
+
+    assert metric("sha_diagnosis_duration_seconds_count") == before + 2

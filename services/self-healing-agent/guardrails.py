@@ -21,8 +21,10 @@ import json
 import logging
 import os
 import time
+from typing import NoReturn
 
 import audit
+import metrics
 from errors import GuardrailViolation, UpstreamError
 from tools.k8s import MIN_REPLICAS, current_replicas
 
@@ -97,12 +99,23 @@ def _outcomes(now: float) -> list[str]:
     ]
 
 
+def _refuse(message: str, guard: str, cause: Exception | None = None) -> NoReturn:
+    """Every refusal in this module leaves by this door.
+
+    Not a wrapper for its own sake: sha_guardrail_blocks_total is only trustworthy if it
+    is impossible to add a guard that refuses without counting. Instrumenting check()
+    instead would have missed check_llm_call, which no caller routes through it.
+    """
+    metrics.GUARDRAIL_BLOCKS.labels(guard=guard).inc()
+    raise GuardrailViolation(message, guard=guard) from cause
+
+
 def _check_namespace(args: dict) -> None:
     """Missing is refused as firmly as wrong. `args.get` returning None lands outside any
     allowlist, which is the answer fail-closed wants."""
     namespace = args.get("namespace")
     if namespace not in NAMESPACES:
-        raise GuardrailViolation(
+        _refuse(
             f"namespace {namespace!r} is not in the allowlist {list(NAMESPACES)}",
             guard="namespace",
         )
@@ -115,7 +128,7 @@ def _check_replica_floor(args: dict) -> None:
     something nobody approved."""
     replicas = args.get("replicas")
     if not isinstance(replicas, int) or replicas < MIN_REPLICAS:
-        raise GuardrailViolation(
+        _refuse(
             f"scaling to {replicas!r} is below the floor of {MIN_REPLICAS}: a service "
             "scaled to zero is an outage, not a fix",
             guard="replica_floor",
@@ -138,13 +151,14 @@ def _check_live_replicas(args: dict, apis) -> None:
             apis, namespace=args["namespace"], deployment=args["deployment"]
         )
     except UpstreamError as e:
-        raise GuardrailViolation(
+        _refuse(
             f"could not read the current replica count to check this against: {e}",
             guard="live_replicas",
-        ) from e
+            cause=e,
+        )
 
     if args["replicas"] < live:
-        raise GuardrailViolation(
+        _refuse(
             f"this would scale {args['deployment']} down from {live} to "
             f"{args['replicas']}: the replica count changed after this was proposed",
             guard="live_replicas",
@@ -154,7 +168,7 @@ def _check_live_replicas(args: dict, apis) -> None:
 def _check_rate(now: float) -> None:
     attempts = len(_outcomes(now))
     if attempts >= MAX_ACTIONS_PER_HOUR:
-        raise GuardrailViolation(
+        _refuse(
             f"{attempts} actions already executed in the last {WINDOW // 60}m, limit "
             f"is {MAX_ACTIONS_PER_HOUR}: a flapping alert is not sixty restarts",
             guard="rate_limit",
@@ -168,7 +182,7 @@ def _check_breaker(now: float) -> None:
         return
     tail = _outcomes(now)[-BREAKER_THRESHOLD:]
     if len(tail) == BREAKER_THRESHOLD and all(o == FAILED for o in tail):
-        raise GuardrailViolation(
+        _refuse(
             f"the last {BREAKER_THRESHOLD} executions all failed: something is wrong "
             "that one more action will not fix",
             guard="breaker",
@@ -214,7 +228,7 @@ def check_llm_call(now: float | None = None) -> None:
     now = time.time() if now is None else now
     _llm_calls[:] = [t for t in _llm_calls if t >= now - WINDOW]
     if len(_llm_calls) >= MAX_LLM_CALLS:
-        raise GuardrailViolation(
+        _refuse(
             f"{len(_llm_calls)} model calls in the last {WINDOW // 60}m, limit is "
             f"{MAX_LLM_CALLS}",
             guard="llm_calls",

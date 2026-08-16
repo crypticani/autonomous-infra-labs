@@ -2,6 +2,7 @@ import pytest
 from google.genai import errors as genai_errors
 from google.genai import types
 
+import provider as provider_module
 from errors import AgentProviderError
 from provider import GeminiProvider
 
@@ -19,18 +20,27 @@ TOOLS = [
 
 
 class RecordingModels:
-    """Stands in for client.models, and keeps the config it was handed."""
+    """Stands in for client.models, and keeps the config it was handed.
 
-    def __init__(self, response=None, error=None):
+    `calls` and `fail_first` exist for the retry: a stub that always raises can prove
+    exhaustion but never recovery, and recovery is the behaviour day 20 added. With
+    fail_first=2 the third call succeeds, which is the shape of a real 503.
+    """
+
+    def __init__(self, response=None, error=None, fail_first=None):
         self.response = response
         self.error = error
+        self.fail_first = fail_first
+        self.calls = 0
+        self.slept: list[float] = []
         self.last_config = None
         self.last_contents = None
 
     def generate_content(self, *, model, contents, config):
+        self.calls += 1
         self.last_config = config
         self.last_contents = contents
-        if self.error:
+        if self.error and (self.fail_first is None or self.calls <= self.fail_first):
             raise self.error
         return self.response
 
@@ -49,10 +59,13 @@ def a_call(name="get_pod_logs", **args):
 
 @pytest.fixture
 def gemini(monkeypatch):
-    def _make(response=None, error=None):
+    def _make(response=None, error=None, fail_first=None):
         provider = GeminiProvider()
-        models = RecordingModels(response=response, error=error)
+        models = RecordingModels(response=response, error=error, fail_first=fail_first)
         monkeypatch.setattr(provider, "client", type("Shim", (), {"models": models})())
+        # Recorded, not endured. Every retry test would otherwise pay the real backoff,
+        # and the delays themselves are worth an assertion.
+        monkeypatch.setattr(provider_module.time, "sleep", models.slept.append)
         return provider, models
 
     return _make
@@ -159,6 +172,77 @@ def test_api_error_becomes_an_agent_provider_error(gemini):
         provider.chat("sys", [], TOOLS)
 
     assert caught.value.provider == "gemini"
+
+
+def test_a_transient_error_is_retried_until_it_succeeds(gemini):
+    # The whole point of day 20's retry. Before it, this 503 discarded a diagnosis that
+    # was six model calls deep -- survivable while a human drives, silent data loss once
+    # Alertmanager does.
+    provider, models = gemini(
+        a_response(types.Part(text="the pod is OOMKilled")),
+        error=genai_errors.APIError(503, {"message": "model overloaded"}),
+        fail_first=2,
+    )
+
+    result = provider.chat("sys", [], TOOLS)
+
+    assert result.text == "the pod is OOMKilled"
+    assert models.calls == 3
+
+
+def test_a_permanent_error_is_not_retried(gemini):
+    # A 400 is a request this code got wrong. Retrying it sends the same broken request
+    # three times and turns one fast failure into three slow ones.
+    provider, models = gemini(error=genai_errors.APIError(400, {"message": "bad tool"}))
+
+    with pytest.raises(AgentProviderError):
+        provider.chat("sys", [], TOOLS)
+
+    assert models.calls == 1
+    assert models.slept == []
+
+
+def test_retries_are_bounded_and_still_raise(gemini):
+    # An outage that outlasts the budget must still surface. A retry that never gives up
+    # is an alert nobody gets.
+    provider, models = gemini(error=genai_errors.APIError(503, {"message": "down"}))
+
+    with pytest.raises(AgentProviderError) as caught:
+        provider.chat("sys", [], TOOLS)
+
+    assert models.calls == provider_module.MAX_RETRIES
+    assert caught.value.status == 502
+    assert caught.value.provider == "gemini"
+
+
+def test_each_retry_is_counted_under_the_status_that_caused_it(gemini):
+    # A retry counter that never moves is a retry nobody has evidence works, and one
+    # that moves constantly is a provider to reconsider. Neither is visible from logs.
+    from conftest import metric
+
+    before = metric("sha_model_retries_total", status="503")
+    provider, _ = gemini(
+        a_response(types.Part(text="ok")),
+        error=genai_errors.APIError(503, {"message": "overloaded"}),
+        fail_first=2,
+    )
+
+    provider.chat("sys", [], TOOLS)
+
+    assert metric("sha_model_retries_total", status="503") == before + 2
+
+
+def test_backoff_grows_between_attempts(gemini):
+    # Constant backoff against a rate limit is three requests into the same closed door.
+    provider, models = gemini(error=genai_errors.APIError(429, {"message": "quota"}))
+
+    with pytest.raises(AgentProviderError):
+        provider.chat("sys", [], TOOLS)
+
+    # One sleep fewer than attempts: nothing sleeps after the last failure.
+    assert len(models.slept) == provider_module.MAX_RETRIES - 1
+    assert models.slept == sorted(models.slept)
+    assert models.slept[0] < models.slept[-1]
 
 
 def test_tool_result_is_a_function_response(gemini):

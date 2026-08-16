@@ -393,3 +393,32 @@ def test_the_namespace_allowlist_matches_the_role_it_sits_above():
     role = next(doc for doc in docs if doc and doc.get("kind") == "Role")
 
     assert role["metadata"]["namespace"] in guardrails.NAMESPACES
+
+
+def test_a_refusal_is_counted_under_the_guard_that_refused(audit_log):
+    # The label carries the whole signal. `sha_guardrail_blocks_total` on its own says
+    # only that the agent said no; `guard="breaker"` says something is broken and
+    # `guard="namespace"` says the model aimed at the wrong cluster. Different pages.
+    from conftest import metric
+
+    before = metric("sha_guardrail_blocks_total", guard="namespace")
+
+    with pytest.raises(GuardrailViolation):
+        guardrails.check("restart_pod", {"namespace": "kube-system", "pod": "etcd-0"})
+
+    assert metric("sha_guardrail_blocks_total", guard="namespace") == before + 1
+
+
+def test_the_llm_budget_refusal_is_counted_too(audit_log, monkeypatch):
+    # It is the only guard that never goes through check(), so it is the one a single
+    # instrumentation point in the wrong place would silently miss.
+    from conftest import metric
+
+    monkeypatch.setattr(guardrails, "MAX_LLM_CALLS", 1)
+    before = metric("sha_guardrail_blocks_total", guard="llm_calls")
+    guardrails.check_llm_call()
+
+    with pytest.raises(GuardrailViolation):
+        guardrails.check_llm_call()
+
+    assert metric("sha_guardrail_blocks_total", guard="llm_calls") == before + 1

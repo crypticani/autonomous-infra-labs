@@ -11,9 +11,12 @@ This is **Project 3 (Week 3)** of the
 > and how the loop knows when to stop. This README is the *what and how much*; that one is the
 > *why*.
 
-**Status (Day 18):** the loop dispatches tools, terminates on `submit_diagnosis`, and is reachable
-over `POST /diagnose`. A diagnosis carrying a write action now becomes a Slack proposal with
+**Status (Day 20):** the loop dispatches tools, terminates on `submit_diagnosis`, and is reachable
+over `POST /diagnose`. A diagnosis carrying a write action becomes a Slack proposal with
 Approve/Reject buttons, and `POST /slack/interactive` is the only path by which a write tool runs.
+Day 20 closes the front of the loop: Alertmanager POSTs to `/alerts`, which deduplicates and
+answers `202` while the diagnosis runs in the background. The human is no longer the *trigger* —
+they are still the only thing that can authorise a write.
 Live-verified against a real alert and a real Gemini call — see below.
 
 ## Why this is an agent and not another RAG service
@@ -281,13 +284,94 @@ is also not a per-diagnosis cap; `MAX_ITERATIONS` already is that. This is the c
 diagnoses, which is what matters from Day 20 on, when Alertmanager drives `/diagnose` with nobody
 watching and one flapping alert could spend the whole free tier before breakfast.
 
+## `alerts.py` and `POST /alerts` — the Day 20 loop closure
+
+Until today every diagnosis started with a human running `curl`. Day 16 built the *outbound*
+direction — `get_recent_alerts` polls Alertmanager for what else is firing — and this is the inbound
+one. The human stays in the loop where it counts: nothing writes to a cluster without a click. What
+leaves is the human as the *trigger*.
+
+**202, not 200.** A diagnosis is six to ten model calls and runs for minutes; Alertmanager's webhook
+client gives up after seconds and re-POSTs the group. Answering synchronously would guarantee a
+timeout on every alert *and* a duplicate diagnosis behind it — two calls into a free tier of about
+twenty a day. So `/alerts` validates, deduplicates, hands each accepted alert to a `BackgroundTasks`
+job and answers `{"accepted": n, "resolved": n, "duplicate": n}` in milliseconds. The proposal still
+reaches Slack the same way it always did; the human is the async channel, not the HTTP response.
+
+**Deduplication is the guard that matters most today.** Alertmanager re-sends a firing group every
+`group_interval` — five minutes by default — until it resolves. Without suppression, one flapping
+alert is a fresh diagnosis every five minutes, and the day's model budget is gone before anyone has
+read the first proposal. `alerts.py` keys on Alertmanager's own `fingerprint`, falling back to the
+alert's labels when an older Alertmanager omits it. That fallback is not a nicety: falling back to
+anything unique-per-delivery would mean *no* deduplication at all, silently, which is worse than not
+deduplicating on purpose. `SHA_ALERT_DEDUP_TTL` (3600) matches `SHA_GUARD_WINDOW` and
+`SHA_PROPOSAL_TTL` — all three answer "how long is this still the same incident" — and suppression
+expires, so an alert still firing an hour later gets looked at again.
+
+**The alert is passed through unchanged.** `get_recent_alerts` flattens, because there an alert is
+*context* and the summary is the point. Here the alert **is** the problem, and every field dropped
+is a field the model cannot reason about — `namespace` and `pod` above all, since those are exactly
+the arguments `get_pod_logs` needs.
+
+**A failure in the background must never become a non-2xx.** A non-2xx makes Alertmanager retry, and
+retrying a guardrail refusal is a loop that ends only when the alert resolves — hammering an endpoint
+that is deliberately saying no. So `_diagnose_in_background` catches everything: a refusal is logged
+at warning and stopped, because by the time it arrives there it is a *decision*, already counted and
+audited.
+
+**The body is a bare `dict`, not a Pydantic model.** A schema here turns any future change to
+Alertmanager's payload into a `422`, and a `422` makes it retry a body that will never work.
+`alerts.accept` is defensive about shape instead — a non-list `alerts`, a `None`, an entry that is
+not a dict — which is where that knowledge belongs.
+
+## `metrics.py` and `GET /metrics` — what the agent didn't do
+
+Same module shape as knowledge-copilot's, same single-worker registry constraint, different purpose.
+There, metrics measure quality: is retrieval finding the right chunk. Here they measure **restraint** —
+every counter answers a version of "how often did this thing decide not to act", because from today
+nobody is watching it decide.
+
+| Metric | Labels | Reads as |
+|---|---|---|
+| `sha_alerts_received_total` | `accepted \| resolved \| duplicate` | `duplicate` climbing while `accepted` is flat is a healthy flap; both climbing is dedup broken |
+| `sha_diagnoses_total` | `complete \| incomplete \| blocked \| failed` | `incomplete` is the loop's only failure that raises nothing |
+| `sha_diagnosis_duration_seconds` | — | timed in `finally`, so failures appear too |
+| `sha_guardrail_blocks_total` | `guard` | named in `errors.py` on Day 15, five days before it existed |
+| `sha_proposals_total` | `proposed \| approved \| rejected \| executed \| failed \| expired \| blocked` | proposed-vs-executed is how much the agent wanted to do against how much a human allowed |
+| `sha_model_retries_total` | `status` | the evidence that the retry works at all |
+
+`blocked` and `failed` are deliberately not one counter. One is a working guardrail, the other is a
+page. Collapsing them makes the metric unactionable at exactly the moment it is being read.
+
+Every refusal in `guardrails.py` leaves through one function, `_refuse()`. Not a wrapper for its own
+sake: `sha_guardrail_blocks_total` is only trustworthy if it is *impossible* to add a guard that
+refuses without counting — and instrumenting `check()` instead would already have missed
+`check_llm_call`, which no caller routes through it.
+
+## The retry — `provider.py`
+
+A diagnosis is not one model call; it is six to ten, and the transcript exists only in memory.
+Losing the ninth to a `503` discards the eight that worked and every tool result they cost. That was
+survivable while a human drove it. It stops being survivable today, because a discarded diagnosis is
+now an alert that silently gets none.
+
+Three attempts, 1s then 2s, on `429/500/502/503/504` only — failures where the identical request
+could plausibly succeed. A `400` means this code built a bad request and a `404` is a wrong model
+name; neither improves by waiting, and retrying them turns one fast failure into three slow ones.
+
+The retry is deliberately **invisible to `check_llm_call()`**, which counts turns the model actually
+took. A `503` was never served, so charging it to the budget would let an outage spend the day's
+calls without producing a single diagnosis.
+
 ## Tests
 
-84 tests: 10 in `tests/test_provider.py` (unchanged from Day 15), 10 in `tests/test_tools.py`, 1 in
-`tests/test_rbac.py`, 3 in `tests/test_agent.py` — a refused tool stays refused and the loop keeps
-going, `MAX_ITERATIONS` exhausted produces no fabricated diagnosis, and an allowed tool's result
-round-trips back into the transcript. Day 18 adds 16 in `tests/test_approvals.py` and 15 in
-`tests/test_slack.py`; Day 19 adds 29 in `tests/test_guardrails.py`.
+119 tests: 15 in `tests/test_provider.py`, 10 in `tests/test_tools.py`, 1 in `tests/test_rbac.py`,
+8 in `tests/test_agent.py` — a refused tool stays refused and the loop keeps going, `MAX_ITERATIONS`
+exhausted produces no fabricated diagnosis, and an allowed tool's result round-trips back into the
+transcript. Day 18 adds 18 in `tests/test_approvals.py` and 15 in `tests/test_slack.py`; Day 19 adds
+32 in `tests/test_guardrails.py`; Day 20 adds 11 in `tests/test_alerts.py` and 9 in
+`tests/test_app.py` — the first tests here that go through FastAPI rather than call a module, and
+narrowly so: what they cover is the part that exists only as routing.
 
 The three that carry the most weight:
 
@@ -311,7 +395,7 @@ forged one is rejected.
 
 ```bash
 cd services/self-healing-agent
-python -m pytest tests/ -q      # 84 passed
+python -m pytest tests/ -q      # 119 passed
 black --check .                 # clean
 ```
 
@@ -344,7 +428,37 @@ counts from those lines. Rename the file and the guards start from zero without 
 **`GET /health` reports the limits this process actually loaded** — namespaces, the three
 thresholds, the window, `max_iterations` — because appsrv's `.env` overrides the image's defaults
 and a stale value there is invisible until it silently truncates a diagnosis. That happened on Day
-18 with `SHA_MAX_ITERATIONS` still set to 6, and cost an evening.
+18 with `SHA_MAX_ITERATIONS` still set to 6, and cost an evening. Day 20 adds `alerts.suppressed`
+to it: a dedup table that stays empty while Alertmanager is firing means the webhook is not
+arriving, and one that never empties means suppression has stopped expiring and every future alert
+is being dropped. Neither failure is visible anywhere else.
+
+**Wiring Alertmanager and Prometheus.** Both run on the appsrv host, not in this project's compose
+stack — which is why `/alerts` and `/metrics` are reached over loopback and nginx exposes neither.
+The receiver, in Alertmanager's config:
+
+```yaml
+receivers:
+  - name: self-healing-agent
+    webhook_configs:
+      - url: http://127.0.0.1:7200/alerts
+        send_resolved: true
+        http_config:
+          authorization: { type: Bearer, credentials: <SHA_API_TOKEN> }
+```
+
+`send_resolved: true` is deliberate even though a resolved alert is never diagnosed. It is counted
+and dropped for the price of a dict lookup, and having both edges arrive is what makes
+`sha_alerts_received_total{outcome="resolved"}` a usable signal that the loop is seeing the whole
+lifecycle rather than half of it.
+
+And the scrape, alongside the copilot's:
+
+```yaml
+  - job_name: self-healing-agent
+    static_configs:
+      - targets: ["127.0.0.1:7200"]
+```
 
 **Its own subdomain, not a `location` on the copilot's.** `sha.crypticani.dev` gets its own server
 block, sharing a certificate with `knowledge-copilot.crypticani.dev` via `certbot --expand`. The
@@ -395,6 +509,8 @@ send a verification challenge when saving it. A successful save proves nothing, 
 
 ## Not built yet
 
-- Alertmanager webhook, `/metrics`, agent Deployment manifest — `later` (Day 20)
+- Agent Deployment manifest — deferred from Day 20 on purpose. There is no sandbox cluster to apply
+  it to yet, so writing it today would ship untested YAML; Day 21 writes it against a real `kind`
+  cluster instead.
 - Injected-failure capstone recording, eval harness over recorded tool transcripts — `later`
   (Day 21)

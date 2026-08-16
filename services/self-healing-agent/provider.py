@@ -21,6 +21,7 @@ callable is ever handed over for it to invoke.
 
 import logging
 import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import lru_cache
@@ -31,11 +32,27 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
+import metrics
 from errors import AgentProviderError
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# Retried in place, because a diagnosis is not one model call -- it is six to ten, and the
+# transcript is only in memory. Losing the ninth to a 503 discards the eight that worked and
+# the tool results they cost. Day 20 is when that stops being survivable: Alertmanager calls
+# this with nobody watching, so a discarded diagnosis is an alert that silently gets none.
+#
+# Only failures where the same request could plausibly succeed unchanged. A 400 means this
+# code built a bad request; sending it twice more is three identical failures instead of one.
+# 404 is a wrong model name. Neither improves by waiting.
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+MAX_RETRIES = int(os.getenv("SHA_MODEL_RETRIES", "3"))
+# Doubles per attempt: 1s, 2s. Constant backoff against a rate limit is just three requests
+# into the same closed door. Total added latency is bounded at 3s, which is nothing next to
+# a diagnosis that already runs for minutes.
+RETRY_BACKOFF = float(os.getenv("SHA_MODEL_RETRY_BACKOFF", "1.0"))
 
 
 @dataclass(frozen=True)
@@ -167,14 +184,27 @@ class GeminiProvider(BaseAgentProvider):
                 )
             )
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name, contents=contents, config=config
-            )
-        except genai_errors.APIError as e:
-            raise AgentProviderError(
-                f"the model API returned an error: {e}", 502, provider=self.name
-            ) from e
+        # Retries are deliberately invisible to guardrails.check_llm_call(), which counts
+        # turns the model actually took. A 503 was never served, so charging it to the
+        # budget would let an outage spend the day's calls without producing a diagnosis.
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                response = self.client.models.generate_content(
+                    model=self.model_name, contents=contents, config=config
+                )
+                break
+            except genai_errors.APIError as e:
+                if e.code not in RETRY_STATUSES or attempt == MAX_RETRIES:
+                    raise AgentProviderError(
+                        f"the model API returned an error: {e}", 502, provider=self.name
+                    ) from e
+                metrics.MODEL_RETRIES.labels(status=str(e.code)).inc()
+                delay = RETRY_BACKOFF * 2 ** (attempt - 1)
+                logger.warning(
+                    f"model returned {e.code}, retrying in {delay}s "
+                    f"(attempt {attempt}/{MAX_RETRIES})"
+                )
+                time.sleep(delay)
 
         calls = tuple(
             ToolCall(name=call.name, args=call.args or {}, id=call.id)

@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import audit
 import guardrails
 import k8s_client
+import metrics
 import slack
 from errors import GuardrailViolation
 from tools import REGISTRY
@@ -114,6 +115,7 @@ def propose(diagnosis, alert: dict, now: float | None = None) -> Proposal | None
         guardrails.check(tool, args)
     except GuardrailViolation as e:
         audit.record(BLOCKED, tool=tool, args=args, guard=e.guard, reason=str(e))
+        metrics.PROPOSALS.labels(state=BLOCKED).inc()
         logger.warning(f"guardrail {e.guard!r} refused {tool}: {e}")
         return None
 
@@ -134,6 +136,7 @@ def propose(diagnosis, alert: dict, now: float | None = None) -> Proposal | None
         alert=alert.get("labels", alert),
     )
     _proposals[proposal.id] = proposal
+    metrics.PROPOSALS.labels(state=PROPOSED).inc()
 
     if slack_enabled():
         slack.post_blocks(APPROVAL_CHANNEL, slack.blocks_for(proposal))
@@ -149,6 +152,7 @@ def _sweep(now: float) -> None:
         if now - proposal.created > PROPOSAL_TTL:
             if proposal.state == PROPOSED:
                 audit.record(EXPIRED, id=proposal.id, tool=proposal.tool)
+                metrics.PROPOSALS.labels(state=EXPIRED).inc()
             del _proposals[proposal.id]
 
 
@@ -191,12 +195,14 @@ def decide(
     if decision != "approve":
         proposal.state = REJECTED
         audit.record(REJECTED, id=proposal.id, tool=proposal.tool, user=user)
+        metrics.PROPOSALS.labels(state=REJECTED).inc()
         return Decision(True, f"Rejected by {user}. Nothing was changed.")
 
     proposal.state = APPROVED
     audit.record(
         APPROVED, id=proposal.id, tool=proposal.tool, args=proposal.args, user=user
     )
+    metrics.PROPOSALS.labels(state=APPROVED).inc()
 
     # Day 19: the second checkpoint, and the one that matters. It sits after the state
     # flip so the double-click defence is untouched, and after the `approved` line so the
@@ -214,6 +220,7 @@ def decide(
         audit.record(
             BLOCKED, id=proposal.id, tool=proposal.tool, guard=e.guard, reason=str(e)
         )
+        metrics.PROPOSALS.labels(state=BLOCKED).inc()
         logger.warning(
             f"guardrail {e.guard!r} refused {proposal.tool} after approval: {e}"
         )
@@ -223,9 +230,11 @@ def decide(
     except Exception as e:
         proposal.state = FAILED
         audit.record(FAILED, id=proposal.id, tool=proposal.tool, error=str(e))
+        metrics.PROPOSALS.labels(state=FAILED).inc()
         logger.error(f"{proposal.tool} failed after approval by {user}: {e}")
         return Decision(False, f"Approved by {user}, but `{proposal.tool}` failed: {e}")
 
     proposal.state = EXECUTED
     audit.record(EXECUTED, id=proposal.id, tool=proposal.tool, result=result)
+    metrics.PROPOSALS.labels(state=EXECUTED).inc()
     return Decision(True, f"Approved by {user}. Ran `{proposal.tool}`.")

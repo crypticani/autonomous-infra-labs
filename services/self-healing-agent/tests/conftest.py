@@ -12,9 +12,24 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # instantiated to test its translation logic, and that runs the constructor.
 os.environ.setdefault("GEMINI_API_KEY", "test-key-never-sent")
 
+import alerts  # noqa: E402
 import audit  # noqa: E402
 import guardrails  # noqa: E402
+from prometheus_client import REGISTRY  # noqa: E402
 from provider import AgentTurn, ToolCall  # noqa: E402
+
+
+def metric(name: str, **labels) -> float:
+    """One counter's current value, read the way Prometheus reads it.
+
+    Through the registry rather than `counter._value`, because the private attribute
+    would still answer for a metric whose labels are wrong -- and a mislabelled counter
+    is exactly the failure that survives review and then shows up as an empty graph.
+
+    Counters accumulate for the life of the process, so every caller measures a delta
+    across the thing under test rather than an absolute.
+    """
+    return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
 @pytest.fixture
@@ -45,6 +60,16 @@ def fresh_llm_budget():
     guardrails._llm_calls.clear()
     yield
     guardrails._llm_calls.clear()
+
+
+@pytest.fixture(autouse=True)
+def fresh_alert_dedup():
+    """Same hazard as fresh_llm_budget, one module over: alerts._seen is process state,
+    so the second test to send the same fingerprint would be deduplicated by the first.
+    """
+    alerts._seen.clear()
+    yield
+    alerts._seen.clear()
 
 
 class FakeAgentProvider:

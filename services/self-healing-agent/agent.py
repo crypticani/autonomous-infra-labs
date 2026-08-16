@@ -11,10 +11,13 @@ the gap. See docs/superpowers/specs/2026-08-11-week3-agent-design.md, decisions 
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 
 import guardrails
 import k8s_client
+import metrics
+from errors import GuardrailViolation, UpstreamError
 from provider import BaseAgentProvider
 from tools import READ_ONLY, REGISTRY, as_model_tools
 
@@ -81,6 +84,40 @@ def _dispatch(name: str, args: dict) -> dict:
 
 
 def diagnose(
+    alert: dict,
+    provider: BaseAgentProvider,
+    allowed: tuple[str, ...] = READ_ONLY,
+) -> Diagnosis:
+    """The loop, counted and timed. Day 20 split this from _loop so that every way a
+    diagnosis can end is recorded in one place.
+
+    The four outcomes are not interchangeable. `incomplete` is a returned Diagnosis, so a
+    single counter would call it a success and hide the only failure this loop has that
+    raises nothing. `blocked` is the agent deciding not to act and `failed` is something
+    else breaking -- one is a working guardrail, the other is a page.
+
+    Timing is in `finally` because the failures cost real seconds too, and a histogram
+    that observes only the happy path makes an outage look like a quiet afternoon.
+    """
+    started = time.monotonic()
+    try:
+        result = _loop(alert, provider, allowed)
+    except GuardrailViolation:
+        metrics.DIAGNOSES.labels(outcome="blocked").inc()
+        raise
+    except UpstreamError:
+        metrics.DIAGNOSES.labels(outcome="failed").inc()
+        raise
+    else:
+        metrics.DIAGNOSES.labels(
+            outcome="incomplete" if result.incomplete else "complete"
+        ).inc()
+        return result
+    finally:
+        metrics.DIAGNOSIS_DURATION.observe(time.monotonic() - started)
+
+
+def _loop(
     alert: dict,
     provider: BaseAgentProvider,
     allowed: tuple[str, ...] = READ_ONLY,
