@@ -1,0 +1,358 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Select your existing Prometheus datasource on import.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "9.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)"
+      }
+    ]
+  },
+  "editable": true,
+  "id": null,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Alerts received by outcome (per hour)",
+      "description": "duplicate climbing while accepted stays flat is the healthy shape for a flapping alert -- Alertmanager re-sends a firing group every group_interval until it resolves, and dedup is what stops that from being a fresh diagnosis every five minutes. The two rising together means dedup is broken and the model budget is draining.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (outcome) (increase(sha_alerts_received_total[1h]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Diagnoses by outcome (per hour)",
+      "description": "incomplete is the loop's only failure that raises nothing -- MAX_ITERATIONS exhausted without reaching submit_diagnosis, still returned as a Diagnosis. blocked is a guardrail refusing before any model call; failed is an upstream breaking. Collapsing any of these into one counter hides which one a rising line actually means.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (outcome) (increase(sha_diagnoses_total[1h]))",
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Diagnosis duration p50/p95 (s)",
+      "description": "A diagnosis is six to ten model calls, not one -- buckets reach 600s for that reason. The tail is the interesting number: a p95 running close to the ceiling is indistinguishable from one that is merely slow until you check whether MAX_ITERATIONS was the reason it stopped.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(sha_diagnosis_duration_seconds_bucket[6h])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(sha_diagnosis_duration_seconds_bucket[6h])))",
+          "legendFormat": "p50"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Guardrail blocks by guard (per hour)",
+      "description": "The label is the whole signal. 'the agent refused something' is not actionable; guard=\"breaker\" means something is broken and one more action will not fix it, guard=\"namespace\" means the model aimed at the wrong cluster, guard=\"llm_calls\" means the hourly model budget is spent. Every refusal in guardrails.py leaves through one function, so nothing refuses without landing here.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (guard) (increase(sha_guardrail_blocks_total[1h]))",
+          "legendFormat": "{{guard}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Proposal lifecycle by state (per hour)",
+      "description": "proposed vs executed is the ratio this service is judged on: how much the agent wanted to do against how much a human let it. blocked and failed are deliberately separate lines -- one is a working guardrail refusing a second time at click time, the other is the cluster write itself breaking.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (state) (increase(sha_proposals_total[1h]))",
+          "legendFormat": "{{state}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Model retries by status (per hour)",
+      "description": "Evidence the Day 20 retry works at all, not just that it exists. A line that never moves is a retry nobody has proven fires; one that climbs constantly against a single status is a provider outage to escalate, not a transient blip to absorb quietly.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (status) (increase(sha_model_retries_total[1h]))",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Diagnosis completion rate (%)",
+      "description": "Share of diagnoses that reached submit_diagnosis rather than exhausting MAX_ITERATIONS. Raised from 6 to 10 on Day 17 evidence that six turns was not enough headroom for gather-plus-one-retry; a falling number here is the same symptom returning.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 50
+              },
+              {
+                "color": "green",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * sum(increase(sha_diagnoses_total{outcome=\"complete\"}[24h])) / clamp_min(sum(increase(sha_diagnoses_total[24h])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Approval rate (%)",
+      "description": "executed over proposed, 24h. Deliberately uncolored: a low number is not failure and a high one is not automatically trust earned, since a rejection is the guardrails working as designed. This is the number worth watching over weeks, not reacting to in the moment.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * sum(increase(sha_proposals_total{state=\"executed\"}[24h])) / clamp_min(sum(increase(sha_proposals_total{state=\"proposed\"}[24h])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Alert suppression rate (%)",
+      "description": "Share of arriving alerts that were the same fingerprint seen within SHA_ALERT_DEDUP_TTL. Also uncolored -- a rising number during an incident is dedup doing its job on a flapping alert, not a fault.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * sum(increase(sha_alerts_received_total{outcome=\"duplicate\"}[24h])) / clamp_min(sum(increase(sha_alerts_received_total{outcome=~\"accepted|duplicate\"}[24h])), 0.0001)"
+        }
+      ]
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": [
+    "self-healing-agent",
+    "kubernetes",
+    "agents"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "title": "Self-Healing Agent — Diagnoses, Guardrails & Proposals",
+  "uid": "self-healing-agent-overview",
+  "version": 1
+}

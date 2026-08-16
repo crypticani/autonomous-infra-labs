@@ -348,6 +348,20 @@ sake: `sha_guardrail_blocks_total` is only trustworthy if it is *impossible* to 
 refuses without counting — and instrumenting `check()` instead would already have missed
 `check_llm_call`, which no caller routes through it.
 
+### The Grafana dashboard
+
+[`observability/grafana/dashboards/self-healing-agent.json`](./observability/grafana/dashboards/self-healing-agent.json),
+imported the same way as the copilot's — **Dashboards → New → Import**, then pick your Prometheus
+datasource when it prompts for `DS_PROMETHEUS`.
+
+Nine panels: the six metrics above, each split by their label, plus three ratios worth reading over
+weeks rather than reacting to in the moment — diagnosis completion rate, approval rate, and alert
+suppression rate. The approval and suppression stats are deliberately left uncolored: a low approval
+rate is not failure (a rejection is the guardrails working as designed), and a rising suppression
+rate during an incident is dedup doing its job on a flapping alert, not a fault. Diagnosis completion
+rate is the one stat with real thresholds, because there is a known-bad direction — a falling number
+is the same symptom `SHA_MAX_ITERATIONS` was raised from 6 to 10 for on Day 17, returning.
+
 ## The retry — `provider.py`
 
 A diagnosis is not one model call; it is six to ten, and the transcript exists only in memory.
