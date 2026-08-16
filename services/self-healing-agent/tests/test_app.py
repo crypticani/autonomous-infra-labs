@@ -22,7 +22,14 @@ def client(monkeypatch):
     _diagnose_and_propose is replaced rather than the provider, because a test that
     stubbed the model would still run the real loop, the real guardrails and the real
     Slack post. What is under test here is which alerts get that far.
+
+    SHA_API_TOKEN is forced empty for the same reason conftest.py pins GEMINI_API_KEY:
+    without it, these tests pass locally where the shell has no token set and then fail
+    the moment they run inside the deployed container, where SHA_API_TOKEN is a real
+    secret and require_token means it. test_the_webhook_requires_the_bearer_token
+    overrides this back on, deliberately, to test the other side of that gate.
     """
+    monkeypatch.setattr(app_module, "SHA_API_TOKEN", "")
     diagnosed: list[dict] = []
     monkeypatch.setattr(app_module, "_diagnose_and_propose", diagnosed.append)
     return TestClient(app_module.app), diagnosed
