@@ -57,6 +57,27 @@ def a_call(name="get_pod_logs", **args):
     return types.Part(function_call=types.FunctionCall(name=name, args=args))
 
 
+class FakeClock:
+    """A monotonic clock only time.sleep advances, so a rate limiter's arithmetic is
+    checkable without a test enduring the real wait. `advance` moves time forward with
+    nothing sleeping for it -- e.g. calls far enough apart that pacing shouldn't fire.
+    """
+
+    def __init__(self, sleep_log):
+        self.now = 1_000_000.0
+        self.sleep_log = sleep_log
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleep_log.append(seconds)
+        self.now += seconds
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 @pytest.fixture
 def gemini(monkeypatch):
     def _make(response=None, error=None, fail_first=None):
@@ -65,7 +86,10 @@ def gemini(monkeypatch):
         monkeypatch.setattr(provider, "client", type("Shim", (), {"models": models})())
         # Recorded, not endured. Every retry test would otherwise pay the real backoff,
         # and the delays themselves are worth an assertion.
-        monkeypatch.setattr(provider_module.time, "sleep", models.slept.append)
+        clock = FakeClock(models.slept)
+        models.clock = clock
+        monkeypatch.setattr(provider_module.time, "sleep", clock.sleep)
+        monkeypatch.setattr(provider_module.time, "monotonic", clock.monotonic)
         return provider, models
 
     return _make
@@ -243,6 +267,66 @@ def test_backoff_grows_between_attempts(gemini):
     assert len(models.slept) == provider_module.MAX_RETRIES - 1
     assert models.slept == sorted(models.slept)
     assert models.slept[0] < models.slept[-1]
+
+
+def test_no_pacing_within_the_free_burst(gemini):
+    # The free tier's own per-minute cap, not the daily one -- discovered from a live 429
+    # naming "GenerateRequestsPerMinutePerProjectPerModel-FreeTier". Under the limit,
+    # pacing must stay invisible: a diagnosis that only ever needs a few turns should
+    # never pay a wait it doesn't need.
+    provider, models = gemini(a_response(types.Part(text="ok")))
+
+    for _ in range(provider_module.RATE_LIMIT):
+        provider.chat("sys", [], TOOLS)
+
+    assert models.slept == []
+
+
+def test_the_call_past_the_burst_is_paced(gemini):
+    # The whole point: the 6th call in under a minute is what actually tripped the real
+    # 429 on 2026-08-16. This waits instead of sending it and being refused.
+    provider, models = gemini(a_response(types.Part(text="ok")))
+
+    for _ in range(provider_module.RATE_LIMIT):
+        provider.chat("sys", [], TOOLS)
+    provider.chat("sys", [], TOOLS)
+
+    assert models.slept == [provider_module.RATE_LIMIT_WINDOW]
+
+
+def test_calls_spaced_past_the_window_need_no_pacing(gemini):
+    # Suppression with an expiry, same shape as alerts.py's dedup: a burst from a much
+    # earlier diagnosis must not still be counted against a new one.
+    provider, models = gemini(a_response(types.Part(text="ok")))
+
+    for _ in range(provider_module.RATE_LIMIT):
+        provider.chat("sys", [], TOOLS)
+    models.clock.advance(provider_module.RATE_LIMIT_WINDOW + 1)
+
+    provider.chat("sys", [], TOOLS)
+
+    assert models.slept == []
+
+
+def test_pacing_counts_every_attempt_not_just_completed_calls(gemini, monkeypatch):
+    # A retried attempt is still a real request against the same quota. Counting only
+    # calls that made it back to agent.py would undercount exactly the case that matters
+    # -- a diagnosis already retrying through transient errors -- and let it exceed the
+    # limit pacing exists to respect.
+    monkeypatch.setattr(provider_module, "RATE_LIMIT", 2)
+    provider, models = gemini(
+        a_response(types.Part(text="ok")),
+        error=genai_errors.APIError(503, {"message": "overloaded"}),
+        fail_first=1,
+    )
+    start = models.clock.now
+
+    provider.chat(
+        "sys", [], TOOLS
+    )  # attempt 1 fails (a slot spent), attempt 2 succeeds
+    provider.chat("sys", [], TOOLS)  # a third real attempt -- must not land in-window
+
+    assert models.clock.now - start >= provider_module.RATE_LIMIT_WINDOW
 
 
 def test_tool_result_is_a_function_response(gemini):

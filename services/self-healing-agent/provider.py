@@ -54,6 +54,16 @@ MAX_RETRIES = int(os.getenv("SHA_MODEL_RETRIES", "3"))
 # a diagnosis that already runs for minutes.
 RETRY_BACKOFF = float(os.getenv("SHA_MODEL_RETRY_BACKOFF", "1.0"))
 
+# The retry above cannot ride this one out. Discovered live on 2026-08-16: a 429 whose body
+# named the exact quota -- "GenerateRequestsPerMinutePerProjectPerModel-FreeTier", value 5
+# -- and asked for a 51s retry. Gemini's free tier caps requests per *minute*, independent
+# of MAX_LLM_CALLS' hourly one, and none of this loop's tool calls are slow enough to space
+# turns out on their own: seven iterations fired in eight seconds against a cap of five.
+# Pacing stays under the limit instead of recovering from a violation of it -- proactive,
+# not reactive, because 1s/2s of backoff is nothing against a stated 51s wait.
+RATE_LIMIT = int(os.getenv("SHA_MODEL_RATE_LIMIT", "5"))
+RATE_LIMIT_WINDOW = 60.0
+
 
 @dataclass(frozen=True)
 class ToolCall:
@@ -127,7 +137,31 @@ class GeminiProvider(BaseAgentProvider):
         # four chunks of markdown, and one shared key makes that a coupled decision.
         self.model_name = os.getenv("SHA_GEMINI_MODEL", "gemini-3.6-flash")
         self.client = genai.Client()
+        # Real request timestamps, kept for the life of this provider -- which is the life
+        # of the process, since get_agent_provider() is a singleton. Pacing has to see calls
+        # from earlier diagnoses too: Gemini's per-minute cap doesn't reset between them.
+        self._call_times: list[float] = []
         logger.info(f"GeminiProvider using {self.model_name}")
+
+    def _pace(self) -> None:
+        """Waits, if needed, to keep this provider under RATE_LIMIT requests per
+        RATE_LIMIT_WINDOW. Every attempt counts, not only ones that made it back to
+        agent.py -- a retried attempt is still a real request against the same quota,
+        and undercounting here is exactly how a diagnosis retrying through transient
+        errors would end up back at the 429 the retry above cannot outlast.
+        """
+        now = time.monotonic()
+        self._call_times = [t for t in self._call_times if now - t < RATE_LIMIT_WINDOW]
+        if len(self._call_times) >= RATE_LIMIT:
+            wait = RATE_LIMIT_WINDOW - (now - self._call_times[0])
+            if wait > 0:
+                logger.info(
+                    f"pacing to stay under {RATE_LIMIT}/{RATE_LIMIT_WINDOW:.0f}s: "
+                    f"sleeping {wait:.1f}s"
+                )
+                time.sleep(wait)
+                now = time.monotonic()
+        self._call_times.append(now)
 
     def user(self, text: str) -> types.Content:
         return types.Content(role="user", parts=[types.Part(text=text)])
@@ -188,6 +222,7 @@ class GeminiProvider(BaseAgentProvider):
         # turns the model actually took. A 503 was never served, so charging it to the
         # budget would let an outage spend the day's calls without producing a diagnosis.
         for attempt in range(1, MAX_RETRIES + 1):
+            self._pace()
             try:
                 response = self.client.models.generate_content(
                     model=self.model_name, contents=contents, config=config

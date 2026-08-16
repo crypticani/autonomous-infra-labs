@@ -377,9 +377,27 @@ The retry is deliberately **invisible to `check_llm_call()`**, which counts turn
 took. A `503` was never served, so charging it to the budget would let an outage spend the day's
 calls without producing a single diagnosis.
 
+### The pacing, found the same day
+
+The retry cannot ride out every `429`. Live on 2026-08-16, a `CrashLoopBackOff` diagnosis fired seven
+model calls in eight seconds and got refused with a body naming the real constraint:
+`GenerateRequestsPerMinutePerProjectPerModel-FreeTier`, value `5`, `retryDelay: 51s`. That is a
+**per-minute** cap on the free tier, entirely separate from `SHA_MAX_LLM_CALLS`' hourly one — and
+1s/2s of backoff is nothing against a stated 51-second wait. None of this loop's tool calls are slow
+enough to space turns out on their own, so any diagnosis needing more than five turns hits this wall
+within seconds, regardless of the hour or the day's remaining daily quota.
+
+`GeminiProvider._pace()` stays under the limit instead of recovering from breaking it. It keeps the
+timestamps of its last `SHA_MODEL_RATE_LIMIT` (5) real requests — every attempt, including retried
+ones, since a retry is still a request against the same quota — and sleeps before the next one if
+the oldest of those is still inside the 60-second window. Proactive rather than reactive: a 10-turn
+diagnosis now takes on the order of two minutes instead of finishing in eight seconds and dying, but
+it finishes. That cost is free to pay here specifically because `_diagnose_in_background` means
+nobody is waiting on the HTTP response while it does.
+
 ## Tests
 
-119 tests: 15 in `tests/test_provider.py`, 10 in `tests/test_tools.py`, 1 in `tests/test_rbac.py`,
+123 tests: 19 in `tests/test_provider.py`, 10 in `tests/test_tools.py`, 1 in `tests/test_rbac.py`,
 8 in `tests/test_agent.py` — a refused tool stays refused and the loop keeps going, `MAX_ITERATIONS`
 exhausted produces no fabricated diagnosis, and an allowed tool's result round-trips back into the
 transcript. Day 18 adds 18 in `tests/test_approvals.py` and 15 in `tests/test_slack.py`; Day 19 adds
