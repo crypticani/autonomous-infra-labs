@@ -195,11 +195,11 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#   and can be added to the global gitignore or merged into this file. However, if you prefer,
 #   you could uncomment the following to ignore the entire vscode folder
-# .vscode/
+.vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
@@ -231,3 +231,7 @@ docs/superpowers/
 # is never committed. The directory itself IS tracked (via .gitkeep), because compose
 # bind-mounts it and Docker would otherwise create it root-owned on a fresh host.
 **/audit/*.jsonl
+
+# A live ServiceAccount token for the sandbox kind cluster, staged here only to scp to
+# appsrv -- same reasoning as .env, never committed.
+services/self-healing-agent/.secrets/

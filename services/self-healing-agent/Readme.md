@@ -539,10 +539,189 @@ copilot uses events and never interactivity) — and unlike Event Subscriptions,
 send a verification challenge when saving it. A successful save proves nothing, which is why the
 `curl` above comes first.
 
+## The sandbox cluster and the Tailscale bridge — Day 21
+
+Every write tool has had a real target since Day 16 only in theory: nothing has been reachable, so
+every live diagnosis so far has correctly concluded "no cluster reachable" and stopped. Day 21 gives
+`k8s_client.py` something real — a local `kind` cluster on the laptop — and closes the last gap: the
+agent that needs to call it runs on appsrv, not on the laptop.
+
+**Where things live.** `k8s/sandbox-demo.yaml` is `flaky-app`, a two-replica `nginx` Deployment in
+the `sandbox` namespace with nothing else depending on it — scaling it to zero and back is a real,
+observable, and completely harmless failure. Applied alongside `k8s/rbac.yaml`, which existed since
+Day 19 but had never been applied to an actual cluster before now.
+
+**Reachability.** `kind` binds its API server to `127.0.0.1` only — Tailscale's ACL being permissive
+doesn't matter, because nothing is listening on the tailnet-facing interface at all. The fix is
+`tailscale serve --bg --tcp=6443 tcp://127.0.0.1:<kind-api-port>`: tailscaled itself listens on the
+tailnet interface and forwards to the loopback address. Scoped to the tailnet, not a public funnel.
+One prerequisite the first time: `sudo tailscale set --operator=$USER`, because `serve` otherwise
+needs root.
+
+**Auth is a ServiceAccount token, not the admin kind-config.** `kubectl create token
+self-healing-agent -n sandbox --duration=720h` mints a token scoped to exactly the RBAC Day 19
+wrote — `scale_deployment`, `restart_pod`, `get_pod_logs`, `get_recent_deploys`, nothing else. Handing
+appsrv the laptop's cluster-admin kubeconfig would have been the lazier path and the wrong one: the
+whole point of Day 19's guardrails is that a bug or a leaked credential here cannot reach past
+`sandbox`.
+
+**The kubeconfig skips TLS verification, on purpose.** The kind API server's cert has no SAN for the
+Tailscale IP — it was issued for `kind-control-plane`, `localhost`, and the docker-network address,
+not for a tailnet identity that didn't exist when the cluster came up. `insecure-skip-tls-verify:
+true` is the honest way to say that hostname verification doesn't apply here, not a blanket "don't
+check anything": the channel itself is still a mutually-authenticated, encrypted WireGuard tunnel
+between exactly these two nodes, which is a stronger guarantee than the certificate would have added.
+
+This kubeconfig lives at `services/self-healing-agent/.secrets/kubeconfig` — gitignored, since it
+carries a live (if narrowly-scoped) bearer token, the same reasoning as `.env`.
+
+**The compose wiring**, mirrored in both `docker-compose.prod.yml` and appsrv's live copy:
+
+```yaml
+    environment:
+      - KUBECONFIG=/home/appuser/.kube/config
+    volumes:
+      - ./services/self-healing-agent/audit:/app/audit
+      - ./services/self-healing-agent/.secrets/kubeconfig:/home/appuser/.kube/config:ro
+```
+
+`KUBECONFIG` is set in `environment:`, not in the shared root `.env` — it is an in-container path
+specific to this service's user, and the other two containers have no reason to see it.
+`k8s_client.py` needed no change at all: `config.load_kube_config()` already honors `KUBECONFIG` when
+set, which is exactly why that env var exists instead of a bespoke setting.
+
+Confirmed working via `GET /health`, which probes the client rather than trusting that it constructed:
+
+```json
+"cluster": "reachable"
+```
+
+**Skipped:** an agent Deployment manifest for running self-healing-agent as a workload *inside*
+`kind`. That would only matter if the agent itself lived in the cluster it manages — it doesn't, it
+stays on appsrv and reaches `sandbox` over the bridge above, so that manifest would be untested YAML
+for a deploy path nothing exercises.
+
+### Real detection, not just a real fix — wiring the existing Prometheus/Alertmanager
+
+The `curl` in the run sheet above exercises the real `/alerts` code path, but a human is still the
+one deciding *when* something is broken. `k8s/kube-state-metrics.yaml` closes that gap: a minimal
+`kube-state-metrics` (RBAC + Deployment + Service, trimmed to `--resources=deployments` — the
+upstream bundle collects far more than this alert needs) inside `kind`, bridged to the tailnet the
+same way the API server was — `kubectl port-forward` into `tailscale serve --bg --tcp=8081
+tcp://127.0.0.1:8080` — since kind doesn't auto-publish arbitrary service ports the way it publishes
+the API server's.
+
+**The alert condition is not the usual "replica mismatch."** The standard `kube-state-metrics`
+pattern — `kube_deployment_status_replicas_available < kube_deployment_spec_replicas` — fires when a
+deployment *wants* N replicas and can't get them (crashing pods, a bad image). It does not fire when
+someone deliberately scales `spec.replicas` to 0: both sides read 0, no mismatch. The capstone's
+injected failure (`kubectl scale --replicas=0`) needs the simpler condition instead — a floor, not a
+mismatch — which happens to line up with the same `SHA_MIN_REPLICAS` floor `guardrails.py` already
+enforces on the fix side:
+
+```yaml
+# Prometheus scrape config, alongside the existing appsrv targets:
+  - job_name: kube-state-metrics-sandbox
+    static_configs:
+      - targets: ["100.98.66.65:8081"]
+
+# Alerting rule:
+groups:
+  - name: sandbox-capstone
+    rules:
+      - alert: SandboxDeploymentBelowFloor
+        expr: kube_deployment_spec_replicas{namespace="sandbox"} < 1
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.deployment }} in sandbox has fewer than 1 desired replica"
+```
+
+Route it to the same `self-healing-agent` receiver Day 20 already configured — by `alertname` if the
+existing route is not a catch-all.
+
+**Quota risk, unmuted:** Alertmanager re-fires a firing group every `group_interval` until it
+resolves, and `flaky-app` stays broken until someone clicks Approve. Left alone against a 20/day
+Gemini budget, one missed approval window turns into several wasted diagnoses. Either approve
+promptly once the recording starts, or silence the alert in Alertmanager right after the first fire.
+
+The port-forward is the fragile half of this — it is a foreground-ish process with no supervisor,
+and it dies if the laptop sleeps or the terminal closes. Fine for a single recording session; would
+want a systemd user unit (or kind's `extraPortMappings`, which needs recreating the cluster) for
+anything longer-lived.
+
+### Running the capstone
+
+1. Break it — scale `flaky-app` to zero, from the laptop against the local `kind` cluster:
+
+   ```bash
+   kubectl -n sandbox scale deployment/flaky-app --replicas=0
+   kubectl -n sandbox get deploy flaky-app   # 0/0, confirm the break landed
+   ```
+
+2. Report it — `/alerts` is loopback-only (nginx exposes only `/slack/interactive`
+   publicly), so this runs *on* appsrv:
+
+   ```bash
+   ssh appsrv 'curl -s -X POST http://127.0.0.1:7200/alerts \
+     -H "Authorization: Bearer $(grep ^SHA_API_TOKEN= /app/autonomous-infra-labs/.env | cut -d= -f2)" \
+     -H "Content-Type: application/json" \
+     -d "{
+       \"version\": \"4\",
+       \"groupKey\": \"{}:{alertname=\\\"KubeDeploymentReplicasMismatch\\\"}\",
+       \"status\": \"firing\",
+       \"alerts\": [{
+         \"status\": \"firing\",
+         \"labels\": {
+           \"alertname\": \"KubeDeploymentReplicasMismatch\",
+           \"namespace\": \"sandbox\",
+           \"deployment\": \"flaky-app\"
+         },
+         \"annotations\": {
+           \"summary\": \"flaky-app has 0 of 2 desired replicas available in sandbox\"
+         },
+         \"startsAt\": \"2026-08-17T00:00:00.000Z\",
+         \"fingerprint\": \"capstone-day21\"
+       }]
+     }"'
+   ```
+
+   Expect `{"accepted": 1, "resolved": 0, "duplicate": 0}` back immediately (202) — the
+   diagnosis runs in the background from here, six to ten model calls over roughly a
+   minute or two.
+
+3. Watch it — a Slack message with an Approve/Deny button should land in
+   `SHA_APPROVAL_CHANNEL` once the diagnosis proposes `scale_deployment`. Click Approve.
+
+4. Verify the fix:
+
+   ```bash
+   kubectl -n sandbox get deploy flaky-app   # replicas back up
+   ssh appsrv 'tail -3 /app/autonomous-infra-labs/services/self-healing-agent/audit/audit.jsonl'
+   ```
+
+   The audit line should read `proposed → approved → executed` — `executed`, not `failed`,
+   for the first time since this project started, because for the first time there is a
+   real cluster on the other end.
+
+Retaking the recording needs a different `fingerprint` in step 2 (or a wait past
+`SHA_ALERT_DEDUP_TTL`, an hour by default) — `alerts.py`'s dedup table is exactly what would
+otherwise swallow every retake as a duplicate.
+
 ## Not built yet
 
-- Agent Deployment manifest — deferred from Day 20 on purpose. There is no sandbox cluster to apply
-  it to yet, so writing it today would ship untested YAML; Day 21 writes it against a real `kind`
-  cluster instead.
-- Injected-failure capstone recording, eval harness over recorded tool transcripts — `later`
-  (Day 21)
+- The Prometheus/Alertmanager auto-detection leg above (`kube-state-metrics` is deployed and
+  bridged; the appsrv-side scrape job and alerting rule are not applied). Deliberately deferred
+  past this project's calendar — worth finishing later as a genuinely hands-off demo, but the
+  manual `curl` already exercises the identical `/alerts` code path Alertmanager would use, and the
+  capstone's point (a real diagnose → approve → fix loop against a real cluster) doesn't depend on
+  who originates the webhook.
+- Eval harness over recorded tool transcripts — `later`.
+
+## Capstone: recorded 2026-08-17
+
+detect (`/alerts`) → diagnose (survived several Gemini `503`s on Day 20's retry logic) → approve
+(Slack) → fix (`scale_deployment`, `flaky-app` back to `2/2` on the real `kind` cluster). Audit trail:
+`proposed → approved → executed`, the first `executed` this project has ever produced against a
+cluster that exists.

@@ -1,0 +1,29 @@
+# The capstone's failure target: a deployment with nothing else depending on it, so
+# scaling it to 0 and back is a real, observable, and completely harmless failure.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flaky-app
+  namespace: sandbox
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: flaky-app
+  template:
+    metadata:
+      labels:
+        app: flaky-app
+    spec:
+      containers:
+        - name: flaky-app
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              cpu: 50m
+              memory: 32Mi

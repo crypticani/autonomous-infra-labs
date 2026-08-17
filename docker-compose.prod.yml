@@ -85,12 +85,19 @@ services:
       # and proxies to it. Slack reaches /slack/interactive through nginx, never here.
       - "127.0.0.1:${SHA_PORT:-7200}:${SHA_PORT:-7200}"
     user: "${SHA_UID:-1000}:${SHA_GID:-1000}"
+    environment:
+      # k8s_client.py's config.load_kube_config() reads this when set, in-container path
+      # for the file the volume below mounts. Scoped to this service only -- the other
+      # two containers don't touch kubernetes and don't need it in their environment.
+      - KUBECONFIG=/home/appuser/.kube/config
     volumes:
       # The audit log is a safety control and has to outlive the container.
       - ./services/self-healing-agent/audit:/app/audit
-      # See docker-compose.yml: no cluster yet, and Day 20 chooses between a mounted
-      # kubeconfig and running in-cluster.
-      # - ${KUBECONFIG:-~/.kube/config}:/home/appuser/.kube/config:ro
+      # Day 21's sandbox kind cluster, reached over Tailscale (see k8s/ in the service
+      # dir). A ServiceAccount token scoped to the sandbox namespace, not an admin
+      # kubeconfig -- least privilege even though this container already runs the RBAC
+      # that scopes the API calls themselves.
+      - ./services/self-healing-agent/.secrets/kubeconfig:/home/appuser/.kube/config:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
