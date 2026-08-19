@@ -235,3 +235,7 @@ docs/superpowers/
 # A live ServiceAccount token for the sandbox kind cluster, staged here only to scp to
 # appsrv -- same reasoning as .env, never committed.
 services/self-healing-agent/.secrets/
+
+# Claude Code's per-machine settings: a permission allowlist scoped to this laptop's
+# paths and tools, not project configuration anyone else would want.
+.claude/
