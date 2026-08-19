@@ -151,15 +151,35 @@ Ollama's raw speed; the real one, found live, was a runaway generation loop (see
 `ST_MAX_TOKENS`/`repeat_penalty` and `TriageResult.explanation`'s `max_length` above) that made a
 47s answer take 20+ minutes on an unrelated run of the identical prompt.
 
-**Measured on 2026-08-19, one 5-finding batch, after the fix:** 40.0s on a laptop (CPU-only —
-the same laptop's Nvidia MX110 GPU path hit an unrelated empty-response error earlier and hasn't
-been re-tested since; left open, not resolved by this fix), 68.2s on appsrv's 2-core host. Both
-clean: 5/5 triaged, 0 invented fingerprints. A single run each, and temp-0 is
-not reproducible here (see below), so treat these as "the timeout is gone and the order of
-magnitude is tens of seconds," not a precise number — Day 27 benchmarks properly across batch
-sizes. Extrapolating appsrv's 68.2s/batch across all 559 deduped findings at batch size 5 (~112
-batches) is roughly two hours run serially; whether that's acceptable, and whether a larger batch
-size changes the per-finding cost, is exactly what Day 27 exists to settle.
+### Measured 2026-08-19: model size decides whether this works at all
+
+One 5-finding batch, laptop CPU, single run each (temp-0 is not reproducible here — see above — so
+these are orders of magnitude, not precise figures):
+
+| `ST_OLLAMA_MODEL` | per batch | full corpus, serial | output quality |
+|---|---|---|---|
+| `qwen2.5-coder:1.5b` | 78.7s | ~2.4h | **unusable** |
+| `qwen2.5-coder:7b` | 258.9s | ~8h | good |
+
+The quality gap is the finding, not the latency. **1.5b did not triage at all** — it returned five
+byte-identical explanations, generic boilerplate ("requires a specific payload to trigger") that
+matched none of the findings, and `needs_human` for all five at `conf 0.80`. Valid JSON, correct
+fingerprints, all guards satisfied, and completely worthless. That is the same repetition attractor
+one level up: `repeat_penalty` suppresses repeated tokens *within* a sequence, so the model
+templated across *array elements* instead, which no sampling knob addresses.
+
+7b, same prompt, produced five distinct and factually correct judgments — `DS-0026` identified as a
+missing HEALTHCHECK and rated low, `KSV-0013` as an unpinned `:latest` tag, `KSV-01010` as
+ConfigMap data leakage, the CVE as pre-auth RCE rated high. Spread: 1 high, 2 medium, 2 low.
+
+**Still not calibrated: `confidence` was `1.00` on all five.** A model asserting perfect certainty
+on every judgment puts no information in that field — the flat `0.80` from 1.5b with different
+wording. Day 25's risk score should lean on `priority`, and treat `confidence` as unproven until
+Day 28's eval set can actually check it against known-correct answers.
+
+Day 27 still owns the real benchmark (batch-size sweep, Gemini comparison, cost per run). What
+Day 23 settles is narrower and load-bearing for it: **the floor is ~7B for this task**, so any
+latency tuning starts from 258.9s/batch, not 78.7s.
 
 ## Tests
 

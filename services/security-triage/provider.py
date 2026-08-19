@@ -64,10 +64,14 @@ class OllamaProvider(BaseTriageProvider):
     name = "ollama"
 
     def __init__(self) -> None:
-        # qwen2.5-coder:1.5b, not knowledge-copilot's 7b-instruct: the plan's own risk
-        # section calls for starting small on CPU and letting Day 27 measure whether a
-        # bigger model is worth the latency.
-        self.model_name = os.getenv("ST_OLLAMA_MODEL", "qwen2.5-coder:1.5b")
+        # 7b, and the size is load-bearing rather than a default nobody measured. The
+        # plan called for starting at 1.5b and letting Day 27 judge whether bigger was
+        # worth the latency; Day 23 measured it early because 1.5b turned out not to
+        # triage at all -- five byte-identical boilerplate explanations, needs_human for
+        # everything, all guards satisfied and all of it worthless. 7b answers the same
+        # prompt correctly at ~3.3x the wall-clock. Slow and right beats fast and useless;
+        # see the measurement table in Readme.md.
+        self.model_name = os.getenv("ST_OLLAMA_MODEL", "qwen2.5-coder:7b")
         self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         logger.info(f"OllamaProvider using {self.model_name} at {self.base_url}")
 
