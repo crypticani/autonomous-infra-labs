@@ -148,15 +148,17 @@ def triage_findings(
 
 if __name__ == "__main__":
     # The Day 23 verify step: triage a slice of the real fixture corpus against
-    # whichever provider ST_LLM_PROVIDER names, and print wall-clock per batch. Defaults
-    # to 15 findings (3 batches at the default size) rather than the full 559-deduped
-    # fixture -- on CPU Ollama that full run could be hours, and the point here is a
-    # timing reading to inform Day 27, not a full corpus triage.
+    # whichever provider ST_LLM_PROVIDER names, printing wall-clock per batch and then
+    # every judgment it produced. Defaults to 15 findings (3 batches at the default size)
+    # rather than the full 559-deduped fixture -- on CPU Ollama that full run could be
+    # hours, and the point here is a timing reading plus eyes on the actual output, not a
+    # full corpus triage.
     #
     #   python triage.py [fixture_path] [limit]
     import json
     import sys
     import time
+    from collections import Counter
 
     from scanners import dedupe, parse_envelope
 
@@ -187,4 +189,21 @@ if __name__ == "__main__":
 
     returned = {r.fingerprint for r in results}
     assert returned <= sent_all, "a fingerprint was returned that was never sent"
+
+    # The judgments themselves, not just that some arrived. Counting results proves the
+    # pipeline ran; only reading them catches a model returning five valid-shaped,
+    # useless ones -- which the counts above would call a clean run.
+    by_fingerprint = {f.fingerprint: f for f in findings}
+    print()
+    for result in results:
+        finding = by_fingerprint[result.fingerprint]
+        print(
+            f"  {result.priority:<11} conf {result.confidence:.2f}  "
+            f"{finding.rule_id} ({finding.scanner})  {finding.target}"
+        )
+        print(f"      {result.explanation}")
+
+    tally = Counter(r.priority for r in results)
+    print()
+    print("  ".join(f"{priority}: {n}" for priority, n in tally.most_common()))
     print(f"{len(results)}/{len(findings)} findings triaged, 0 invented fingerprints")
