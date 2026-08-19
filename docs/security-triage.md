@@ -178,5 +178,97 @@ duplicate this time."
 
 ---
 
-*Next: Day 23 adds the model — batched, structured triage over the deduped findings above, with
-a legal way to say "I don't know" instead of guessing a confidence score.*
+## 1.3 Why the model never sees free text back
+
+Ask a model to "explain this vulnerability" and it answers in prose. Prose is fine for a human
+reading a PR comment, but it is a bad shape for anything downstream that needs to *act* on the
+answer — Day 25's risk gate needs a `priority` it can compare against a threshold, not a
+paragraph it has to re-parse with a regex and hope the wording didn't drift.
+
+The fix is the same one `log-analyzer` used from Day 2: hand the model a JSON Schema and ask the
+*backend*, not the model's good behavior, to enforce it. Ollama's `/api/generate` takes a
+`format` field; Gemini's `generate_content` takes a `response_schema`. Both constrain decoding
+itself — the model literally cannot emit a token that would produce invalid JSON — which is a
+different and stronger guarantee than a prompt that says "please respond in JSON" and hopes.
+`triage.py` never parses prose looking for a severity; it calls `TriageBatch.model_validate_json()`
+on the response and lets Pydantic reject anything that doesn't fit.
+
+Schema-constrained decoding guarantees *shape*. It says nothing about whether the *content* is
+honest — a model can still emit perfectly valid JSON that names a `fingerprint` nobody sent, or a
+`confidence` that's really just its severity field wearing a decimal point. That is what the next
+two sections are actually for.
+
+It also guarantees nothing about *when the model stops* — found live on 2026-08-19, not
+predicted. An unbounded `explanation: str` let `qwen2.5-coder:1.5b` fall into a repeating
+conditional ("if it can be exploited... if it cannot...") dozens of times over, valid JSON the
+entire way, right up until it ran out of context. A schema says what a value must look like *if*
+generation ever produces one; it says nothing about how much text comes before it does. The fix
+that actually held was making the schema itself say less: `max_length=280` on `explanation` is
+still part of the JSON schema Ollama constrains against, so the grammar itself refuses a longer
+string — a repetition penalty is a sampling-time nudge that can still lose, but a length bound in
+the schema is a guarantee the grammar can't violate.
+
+## 1.4 Batching, and why it's not "one call, more findings"
+
+The obvious way to save calls is to stuff all 559 deduped findings into one prompt. That trades
+559 slow calls for one enormous one — and on a CPU-only backend, prompt evaluation time scales
+with input size, so one call carrying 559 findings' worth of context does not finish faster than
+559 calls carrying one finding each; it just fails as a single unit instead of many small ones,
+and a truncated or malformed response loses everything instead of one finding's worth.
+`ST_BATCH_SIZE` (default 5) is the actual lever: small enough that one bad batch is a small loss,
+large enough that the fixed overhead per call (loading the model's context window, restating the
+system prompt) is amortized over more than one finding.
+
+## 1.5 Two ways a valid-shaped answer can still be wrong
+
+**A fingerprint the batch never sent.** Nothing about JSON Schema stops a model from naming a
+`fingerprint` string that happens to look plausible but was never in the prompt — the schema only
+constrains *shape*, not *membership*. This is exactly Day 10's invented-citation problem
+(`knowledge-copilot`'s model occasionally cited a chunk marker like `[9]` that was never
+retrieved) wearing a different field name, and the fix is the same shape: compute the set of
+fingerprints actually sent, and drop anything the model returns that isn't in it. Trusting an
+unverified fingerprint here is worse than the citation case, too — a wrong citation is a
+readability bug, a wrong triage fingerprint is wrong *risk data* attached to a real finding.
+
+**A confidence score that isn't actually calibrated.** The rubric asks the model to report its own
+certainty, 0.0–1.0 — but a model under instructions to always produce a number will produce one,
+whether or not it has grounds to be confident. That's the same failure as a scanner's `severity`
+field misread as absolute rather than contextual (§1's "Priority" problem), just moved one layer
+up: a number that looks calibrated is not automatically calibrated. The escape hatch is
+`needs_human` as a *legal* `priority` value, sitting alongside `critical`/`high`/`medium`/`low` in
+the same enum rather than being a separate error path the model has to reach for deliberately. A
+model choosing among five options including "I don't know" is answering a different, more honest
+question than one being forced to pick among four real severities on a finding it can't actually
+judge.
+
+---
+
+# Part 3 — Reading the code (Day 23)
+
+## 3.1 `provider.py` — one seam, two backends, no schema knowledge
+
+`generate(system, user, schema)` takes a Pydantic **class**, not a dict, because the two backends
+want it in different shapes: Ollama's `format` wants `schema.model_json_schema()`, Gemini's
+`response_schema` wants the class itself. Passing the class once and letting each provider ask it
+for whichever shape it needs is what keeps this module able to serve *any* schema — it never
+imports `TriageBatch`, `triage.py` imports `provider.py`, and the dependency only ever points one
+way.
+
+## 3.2 `triage.py` — the guard is a filter, not a retry
+
+```python
+def _drop_unsent_fingerprints(results, sent, provider_name):
+    kept = [r for r in results if r.fingerprint in sent]
+    ...
+    return kept
+```
+
+No re-prompting, no "ask the model to fix it" loop. A dropped fingerprint just means that finding
+comes back untriaged rather than mistriaged — the same choice `ground_answer()` made for an
+invented citation marker: strip what can't be trusted, keep what can, and let the gap be visible
+(a log line here, an unresolved citation there) rather than silently patched over.
+
+---
+
+*Next: Day 24 adds proposed fixes — a diff generated from a finding's own context lines, never
+applied, for the classes of finding mechanical enough to fix with confidence.*
