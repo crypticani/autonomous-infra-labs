@@ -2,8 +2,9 @@
 
 A ground-up explanation of [`services/security-triage`](../services/security-triage): why an LLM
 sits *on top of* real scanners instead of replacing them, why three scanners produce three
-schemas that agree on almost nothing, and how a dedup key can be deterministic without a rule-id
-crosswalk between tools that were never designed to agree.
+schemas that agree on almost nothing, how a dedup key can be deterministic without a rule-id
+crosswalk between tools that were never designed to agree, and why a proposed fix is a
+deterministic diff plus a human rather than an auto-commit.
 
 The service README covers *what was built and what it can do*. This document covers *why any of
 it works*.

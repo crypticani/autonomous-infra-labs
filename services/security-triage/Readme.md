@@ -11,9 +11,9 @@ This is **Project 4 (Week 4)** of the
 > make three disagreeing JSON schemas look like one. This README is the *what and how much*; that
 > one is the *why*.
 
-**Status (Day 23):** the boring layer (`scan.sh`, `scanners.py`) and the triage layer
-(`provider.py`, `triage.py`) are both built. No server exists yet; `POST /triage` starts Day 25 —
-today's triage runs from a script, against the fixture corpus, not over HTTP.
+**Status (Day 24):** the boring layer (`scan.sh`, `scanners.py`), the triage layer (`provider.py`,
+`triage.py`) and the fix layer (`fixes.py`) are built. No server exists yet; `POST /triage` starts
+Day 25 — triage and fixes both run from a script, against the fixture corpus, not over HTTP.
 
 ## Why the service never sees a checkout
 
@@ -62,7 +62,8 @@ None of the three scanners agree on shape:
 
 `parse_envelope()` turns any subset of those three into one list of `Finding` — a Pydantic model
 with `scanner`, `rule_id`, `severity_raw`, `title`, `target`, `line`, `package`,
-`installed_version`, `fixed_version`, `cwe`, and a computed `fingerprint`. A `scans` key that's
+`installed_version`, `fixed_version`, `cwe`, a computed `fingerprint`, and (added Day 24, for
+`fixes.py`) `context`, `resolution` and `message`. A `scans` key that's
 absent (or present but empty) contributes nothing; it is never an error, since that's exactly what
 a partial envelope from a non-Python repo looks like.
 
