@@ -244,7 +244,7 @@ Two constraints found in the data, both of which shape the diff builder:
 
 ### The bug this design exists to avoid
 
-Nine of Trivy's `KSV-*` rules fire on the *same* container block. Nine independent diffs would each
+Ten of Trivy's `KSV-*` rules fire on the *same* container block. Ten independent diffs would each
 insert their own `securityContext:` key, and the second one applied would produce duplicate YAML
 keys — a patch that applies cleanly and then fails to parse. So candidates are grouped by insertion
 point and emitted as **one** hunk carrying the union of the keys: the same collapse Day 22 does for
@@ -265,7 +265,7 @@ in `note` — is what comes back when:
 
 | refusal | cause |
 |---|---|
-| the message doesn't name a container | `KSV-0030` says "Either Pod or Container should set…", `KSV-0106` says "container should drop all". 17 of the family's 21 findings in this corpus name one, in either quote style; 4 don't |
+| the message doesn't name a container | `KSV-0030` says "Either Pod or Container should set…", `KSV-0106` says "container should drop all". 19 of the family's 23 findings in this corpus name one, in either quote style; 4 don't |
 | a `securityContext` is already in the visible lines | only the first ten lines are visible, and merging into a mapping we can only partly see risks a second `securityContext:` key |
 | the container isn't in the returned lines | it's declared past Trivy's truncation |
 | the target isn't a repo file | a container image reference (`alpine:3.19 (alpine 3.19.1)`), or a path that climbs out of the repo — `target` arrives in a public request body and ends up in a patch header |
@@ -285,9 +285,13 @@ cd ../.. && git apply --check -v /tmp/proposed.patch
 
 A proposed diff that doesn't apply is worse than no diff, because a reviewer trusts the shape.
 
-**Measured 2026-08-20:** 629 raw findings → 3 diffs (24 inserted lines across
-`log-analyzer/k8s/deployment.yaml`, `kube-state-metrics.yaml`, `sandbox-demo.yaml`) and 614 advice,
-with 4 findings refused for naming no container. `git apply --check` clean on all three, no offsets.
+**Measured 2026-08-20:** 629 raw findings → 3 diffs (26 inserted lines across
+`log-analyzer/k8s/deployment.yaml`, `kube-state-metrics.yaml`, `sandbox-demo.yaml`) and 610 advice,
+with 4 findings refused for naming no container. The three hunks absorb 19 findings between them —
+eight rules on each of the two `self-healing-agent` manifests, three on `log-analyzer`'s — which is
+the merge doing its job: 19 separate diffs, each inserting its own `securityContext:`, is 16
+patches that apply cleanly and then fail to parse. `git apply --check` clean on all three, no
+offsets.
 Applied in a scratch clone and re-scanned, the only `KSV-00xx` rule still firing on
 `sandbox-demo.yaml` was `KSV-0001` — and that survivor is what the round trip was for:
 `allowPrivilegeEscalation: false` is as mechanical as the eight rules that were already in the
@@ -336,7 +340,7 @@ fixture end to end; that needs a real model and minutes per batch, which is what
 
 `test_fixes.py` (21, Day 24): the exact hunk text for a synthetic container block — derived from the
 block rather than typed out, so a miscounted space in a test literal can't be the reason it fails —
-the nine-rules-one-hunk merge and its key ordering, the `ports:`/`env:` anchor trap, a second
+the sibling-rules-into-one-hunk merge and its key ordering, the `ports:`/`env:` anchor trap, a second
 container getting its own anchor, every refusal branch above, path normalisation from all three
 scanners' spellings, and a check that every diff the real fixture produces is arithmetically
 well-formed (start lines equal, quoted-line count matching the header, no `-` lines in an

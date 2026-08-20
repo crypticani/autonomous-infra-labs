@@ -36,8 +36,8 @@ called mechanical, one is constructible from context lines alone:
   `FixedVersion`, so there is nothing to bump to. The advice path names the upgrade when
   a fixed version does exist.
 
-The interesting bug this design avoids: nine of Trivy's KSV rules fire on the *same*
-container block, so nine independent diffs would each insert their own
+The interesting bug this design avoids: ten of Trivy's KSV rules fire on the *same*
+container block, so ten independent diffs would each insert their own
 `securityContext:` key and the second one applied would produce duplicate YAML keys. So
 candidates are grouped by insertion point and emitted as one hunk carrying the union of
 the keys -- the same collapse Day 22 does for cost, done here for correctness.
@@ -76,6 +76,7 @@ _SECURITY_CONTEXT: dict[str, tuple[str, tuple[str, ...]]] = {
     "KSV-0030": ("seccompProfile", ("seccompProfile:", "  type: RuntimeDefault")),
     "KSV-0104": ("seccompProfile", ("seccompProfile:", "  type: RuntimeDefault")),
     "KSV-0003": ("capabilities", ("capabilities:", "  drop:", "    - ALL")),
+    "KSV-0004": ("capabilities", ("capabilities:", "  drop:", "    - ALL")),
     "KSV-0106": ("capabilities", ("capabilities:", "  drop:", "    - ALL")),
 }
 

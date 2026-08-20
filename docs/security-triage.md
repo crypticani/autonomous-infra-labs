@@ -381,12 +381,12 @@ that isn't a check on secrets — it's that `fixes.py` builds diffs only for an 
 so a secret finding never reaches a fixer at all. An allowlist fails closed; a blocklist of things
 not to patch would need updating every time a scanner adds a rule.
 
-## 4.2 Nine rules, one hunk
+## 4.2 Ten rules, one hunk
 
-Trivy raises nine separate `KSV-*` rules against a container with no `securityContext` — one each
-for `runAsNonRoot`, `allowPrivilegeEscalation`, `runAsUser`, `runAsGroup`,
-`readOnlyRootFilesystem`, seccomp (twice, under two rule ids) and capabilities (twice). Fix them
-independently and you get nine diffs that each insert
+Trivy raises ten separate `KSV-*` rules against a container with no `securityContext` — one each
+for `runAsNonRoot`, `allowPrivilegeEscalation`, `runAsUser`, `runAsGroup` and
+`readOnlyRootFilesystem`, seccomp under two rule ids, and capabilities under three. Fix them
+independently and you get ten diffs that each insert
 their own `securityContext:` key. The first applies; the second applies *cleanly too*, and produces
 a YAML document with a duplicate key that Kubernetes rejects. A patch that applies and is invalid is
 the worst outcome available.
@@ -396,10 +396,10 @@ That's the same collapse Day 22 does with `dedupe()`, arrived at from the opposi
 it was a cost optimisation, here it's a correctness requirement.
 
 Which exposes what Day 22's dedup key costs. A misconfiguration is identified by `(target, line)`,
-and all nine of those rules report the same block's `StartLine` — so they share one fingerprint and
+and all ten of those rules report the same block's `StartLine` — so they share one fingerprint and
 `dedupe()` keeps exactly one. That is the *right* identity for triage: one judgment about one
-misconfigured block, and nine model calls collapsed into one. It's the wrong identity for fixes,
-because one surviving rule means one key in the hunk instead of nine. The resolution isn't to change
+misconfigured block, and ten model calls collapsed into one. It's the wrong identity for fixes,
+because one surviving rule means one key in the hunk instead of ten. The resolution isn't to change
 the fingerprint — it's that the two layers want different identities, so `propose_fixes()` reads the
 pre-dedup list and dedups on the insertion point instead. The `# ponytail:` comment in
 `scanners.py` predicted this collapse on Day 22 as a hypothetical; Day 24 is it happening.
@@ -431,7 +431,7 @@ _CONTAINER_IN_MESSAGE = re.compile(r"[Cc]ontainer [\"']([^\"']+)[\"']")
 Both quote styles are load bearing — `KSV-0012` writes `Container 'x'` and `KSV-0104` writes
 `container "x"`, in the same scan. And the rules that name no container at all (`KSV-0030`: "Either
 Pod or Container should set…", `KSV-0106`: "container should drop all") get prose advice instead of
-a guess. In this repo's corpus that's 17 of the family's 21 findings anchored and 4 refused, which
+a guess. In this repo's corpus that's 19 of the family's 23 findings anchored and 4 refused, which
 is the trade taken deliberately: a refusal costs a reviewer nothing, and a wrong anchor costs them
 their trust in every other diff in the file.
 

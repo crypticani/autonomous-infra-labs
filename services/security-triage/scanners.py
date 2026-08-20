@@ -26,11 +26,11 @@ alone, dropping the rule id and the scanner name entirely.
 # Upgrade path: a hand-built rule-id crosswalk table, if that turns out to happen in
 # practice against real fixtures.
 #
-# It does happen in practice, found on Day 24: the nine securityContext rules Trivy can
+# It does happen in practice, found on Day 24: the ten securityContext rules Trivy can
 # raise against one container block all report the block's StartLine, so they share one
 # fingerprint and `dedupe` keeps exactly one. That is the right identity for triage
 # (one judgment about one misconfigured block) and the wrong one for fixes (one surviving
-# rule means one key in the proposed diff instead of nine), so `fixes.py` reads the
+# rule means one key in the proposed diff instead of ten), so `fixes.py` reads the
 # pre-dedup list and groups on the insertion point instead. Left as-is rather than
 # upgraded: the collapse is correct for what dedup exists to do, which is keep Day 23's
 # batches from re-triaging the same block.
