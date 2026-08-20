@@ -181,16 +181,147 @@ Day 27 still owns the real benchmark (batch-size sweep, Gemini comparison, cost 
 Day 23 settles is narrower and load-bearing for it: **the floor is ~7B for this task**, so any
 latency tuning starts from 258.9s/batch, not 78.7s.
 
+## `fixes.py` — proposed diffs, never applied
+
+A finding gets a diff and a human, not an auto-commit. Two reasons, and the second is the one that
+shaped the module:
+
+- **The service has no checkout.** It never sees the repo, only the JSON that was POSTed to it — so
+  it cannot read the file it wants to change, cannot run the tests afterwards, and has no branch to
+  push. A diff as text is the only honest artifact.
+- **A security fix is a behaviour change.** `runAsUser: 10001` breaks an image whose files are owned
+  by another uid; `readOnlyRootFilesystem: true` breaks a container that writes to its own
+  filesystem. Whether that is acceptable is a judgment about the workload, which is the one thing
+  neither a scanner nor a model has.
+
+**No model call in this module.** The diff is built by deterministic Python from the finding's own
+context lines; anything that can't be built that way returns the scanner's own remediation sentence
+as prose instead. That split is the point: `git apply --check` is a real oracle, so this is the one
+place in the pipeline where a wrong answer is cheaply detectable and therefore worth writing by
+hand. A 7b model that miscounts one column of YAML indentation emits a patch that fails to apply —
+and Day 23 already measured this model producing five valid-shaped, worthless judgments. A plausible
+diff is that same failure with a `+` in front of it. Prose needs no model either: every Trivy
+misconfiguration ships a `Resolution` written by whoever wrote the check.
+
+### Three "mechanical" fix classes, one survivor
+
+The week's plan named three. Against the real corpus:
+
+| class | verdict | why |
+|---|---|---|
+| add a `securityContext` key | **diff** | the value is a constant, and both the insertion point and its indentation are derivable from the `- name: <container>` line Trivy returns |
+| pin a base image to a digest | advice | the digest isn't in the finding and the service can't reach a registry. A diff with an invented digest is exactly the patch that looks authoritative and doesn't apply |
+| bump a pinned dependency | advice | this corpus' one real CVE has no `FixedVersion` — nothing to bump to. The advice names the upgrade when a fixed version does exist |
+
+Membership in `_SECURITY_CONTEXT` is the whole definition of *mechanical*: a rule is in the table
+only if the correct value is a constant that holds for any workload (`readOnlyRootFilesystem: true`,
+`capabilities.drop: [ALL]`, `seccompProfile.type: RuntimeDefault`). Rules whose right answer is a
+number somebody has to choose — a memory limit, a uid that matches the image — are not, however
+tempting the template looks.
+
+### What the scanners were already sending, and Day 22 was dropping
+
+`Finding` gained three fields, none of which feeds the fingerprint, so every dedup key Days 22–23
+measured is unchanged:
+
+| field | Trivy | Bandit | Checkov |
+|---|---|---|---|
+| `context` — `(line, content)` pairs | `CauseMetadata.Code.Lines` (38 of 43 misconfigs) | `code`, always (534 of 534) | `code_block` — **0 of 50**, see below |
+| `resolution` | `Resolution`, a real sentence | none | `guideline`, a URL |
+| `message` | `Message` — the only place the container is named | n/a | n/a |
+
+Two constraints found in the data, both of which shape the diff builder:
+
+- **Trivy caps a code block at ten lines** and marks the cut with an entry whose `Truncated` is true
+  and whose content is empty. So a 43-line container block arrives as lines 22–30 and then a hole.
+  A hunk header claims a start line and a count, so a gap inside the quoted lines makes the whole
+  hunk a lie about the file — `_contiguous()` takes the run before the sentinel and the hunk is
+  built from that alone.
+- **`scan.sh` runs `checkov --compact`, which is exactly the flag that strips `code_block`.** All 50
+  Checkov findings are therefore advice-only today. The parser handles the field anyway, so dropping
+  one flag and re-scanning is the only change needed to get Checkov diffs.
+
+### The bug this design exists to avoid
+
+Nine of Trivy's `KSV-*` rules fire on the *same* container block. Nine independent diffs would each
+insert their own `securityContext:` key, and the second one applied would produce duplicate YAML
+keys — a patch that applies cleanly and then fails to parse. So candidates are grouped by insertion
+point and emitted as **one** hunk carrying the union of the keys: the same collapse Day 22 does for
+cost, done here for correctness.
+
+Which surfaces the cost of Day 22's dedup key. A misconfiguration is identified by `(target, line)`,
+and all five securityContext rules on one block report that block's `StartLine` — so they share one
+fingerprint and `dedupe()` keeps exactly one of them. That is the right identity for triage (one
+judgment about one misconfigured block) and the wrong one for fixes (one surviving rule means one
+key in the hunk instead of five). `propose_fixes()` therefore reads the **pre-dedup** list and
+dedups on the insertion point instead. Because those fingerprints are identical, the single
+fingerprint it reports is still the one a triage result is keyed by.
+
+### Refusals, and why they're the interesting output
+
+A `Fix` is `{target, rule_ids, fingerprints, kind, diff, note}`. `kind="advice"` — with the reason
+in `note` — is what comes back when:
+
+| refusal | cause |
+|---|---|
+| the message doesn't name a container | `KSV-0030` says "Either Pod or Container should set…", `KSV-0106` says "container should drop all". 17 of the family's 21 findings in this corpus name one, in either quote style; 4 don't |
+| a `securityContext` is already in the visible lines | only the first ten lines are visible, and merging into a mapping we can only partly see risks a second `securityContext:` key |
+| the container isn't in the returned lines | it's declared past Trivy's truncation |
+| the target isn't a repo file | a container image reference (`alpine:3.19 (alpine 3.19.1)`), or a path that climbs out of the repo — `target` arrives in a public request body and ends up in a patch header |
+| the hunk overlaps another in the same file | overlapping hunks make `git apply` reject the *whole* patch, so one bad pair would cost every other fix in the file |
+
+The `--name:`-matching is not cosmetic: a container block's `ports:` list contains `- name: http`
+and its `env:` list contains `- name: LOG_LEVEL`, both indented deeper. A first-match anchor inserts
+the `securityContext` inside `ports:`.
+
+### Verify: the round trip is the only test that counts
+
+```bash
+cd services/security-triage
+python fixes.py fixtures/this-repo.json > /tmp/proposed.patch   # patch to stdout, tally to stderr
+cd ../.. && git apply --check -v /tmp/proposed.patch
+```
+
+A proposed diff that doesn't apply is worse than no diff, because a reviewer trusts the shape.
+
+**Measured 2026-08-20:** 629 raw findings → 3 diffs (24 inserted lines across
+`log-analyzer/k8s/deployment.yaml`, `kube-state-metrics.yaml`, `sandbox-demo.yaml`) and 614 advice,
+with 4 findings refused for naming no container. `git apply --check` clean on all three, no offsets.
+Applied in a scratch clone and re-scanned, the only `KSV-00xx` rule still firing on
+`sandbox-demo.yaml` was `KSV-0001` — and that survivor is what the round trip was for:
+`allowPrivilegeEscalation: false` is as mechanical as the eight rules that were already in the
+table, and had simply been missed when the table was written by eye. `pytest` could never have
+found that; only re-scanning a patched file could. The same re-scan showed `KSV-0030` gone despite
+coming back as advice, because the hunk's `seccompProfile` key (contributed by `KSV-0104`)
+satisfies it too — the fingerprint accounting under-claims on purpose, crediting only what it can
+prove.
+
+With `KSV-0001` added the patched `sandbox-demo.yaml` reports only `KSV-0117` and `KSV-0118`, and
+both are correctly advice: `KSV-0118`'s pod-level half wants `spec.template.spec.securityContext`,
+a different insertion point from the container line the finding anchored to, and `KSV-0117` wants an
+existing `containerPort` *changed* to a value someone picks, which also cascades into the Service's
+`targetPort` in another file. Known value, wrong scope — the second half of the "mechanical" test,
+and the reason a scanner asked to check the patch agreed with what the module claimed.
+
+Two things to expect from `git apply`: "applied with offset N" where one file got two hunks (each `Fix`
+carries its own header, since a caller posts one fix per PR comment, so the second hunk's line
+numbers were computed against the unpatched file), and a genuine failure if the fixture is older
+than the manifests it describes — re-run `scan.sh` if the repo has moved on.
+
 ## Tests
 
 ```bash
 cd services/security-triage
-python -m pytest -v   # 10 (scanners) + 10 (provider) + 11 (triage) = 31, if green
+python -m pytest -v   # 15 (scanners) + 10 (provider) + 11 (triage) + 21 (fixes) = 57, if green
 ```
 
-`test_scanners.py` (10, Day 22): each scanner's real shape, a missing-scanner-key envelope, CVE
+`test_scanners.py` (15, Days 22 and 24): each scanner's real shape, a missing-scanner-key envelope, CVE
 dedup across two scans, distinct packages sharing a CVE ID staying distinct, cross-scanner
-location dedup, fingerprint stability, and a sanity check against the real fixture.
+location dedup, fingerprint stability, and a sanity check against the real fixture. Day 24 added
+five: Trivy's context stopping at the truncation sentinel (and a genuine blank line surviving it),
+a secret's context arriving already redacted and from a different place in the JSON, Bandit's
+numbered `code` string recovering the original indentation, Checkov's `guideline`/`code_block`, and
+a finding with none of the three defaulting to empty rather than null.
 
 `test_provider.py` (10, Day 23): transport-failure status mapping and the schema/JSON-body shape
 sent to each provider, using the same fake-response/monkeypatch style as
@@ -202,9 +333,17 @@ dependency-injection shape `triage_findings(provider=...)` exists for. No test t
 fixture end to end; that needs a real model and minutes per batch, which is what `triage.py`'s
 `__main__` script above is for, run by hand, not by `pytest`.
 
+`test_fixes.py` (21, Day 24): the exact hunk text for a synthetic container block — derived from the
+block rather than typed out, so a miscounted space in a test literal can't be the reason it fails —
+the nine-rules-one-hunk merge and its key ordering, the `ports:`/`env:` anchor trap, a second
+container getting its own anchor, every refusal branch above, path normalisation from all three
+scanners' spellings, and a check that every diff the real fixture produces is arithmetically
+well-formed (start lines equal, quoted-line count matching the header, no `-` lines in an
+insert-only patch). What `pytest` can't prove is that a patch applies; that's the `git apply --check`
+round trip above.
+
 ## Not built yet
 
-- Proposed fixes as diffs, never applied (Day 24).
 - `POST /triage` / `GET /triage/{id}`, bearer auth, the reusable GitHub Actions workflow (Day 25).
 - Runtime signals (K8s audit log events) through the same pipeline (Day 26).
 - Cost/latency benchmark, Ollama vs. Gemini (Day 27).

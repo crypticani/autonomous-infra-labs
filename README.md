@@ -25,7 +25,7 @@ exposure to the AI side — they build up the concepts from scratch, then walk t
 | [`docs/log-analyzer.md`](./docs/log-analyzer.md) | Tokens, context windows, temperature, system vs. user prompts, constrained decoding, why `def` beats `async def` here, and how to test a non-deterministic system |
 | [`docs/knowledge-copilot.md`](./docs/knowledge-copilot.md) | Embeddings, cosine similarity, chunk size and overlap, what a vector database actually buys you, and why queries and documents are embedded differently |
 | [`docs/self-healing-agent.md`](./docs/self-healing-agent.md) | What a tool call actually is, why RAG's one-shot retrieval can't diagnose a live problem, and how an observe-think-act loop knows when to stop |
-| [`docs/security-triage.md`](./docs/security-triage.md) | Why AI triages scanner output instead of replacing scanners, why three scanners produce three disagreeing schemas, and how a dedup key stays deterministic without a rule-id crosswalk between tools |
+| [`docs/security-triage.md`](./docs/security-triage.md) | Why AI triages scanner output instead of replacing scanners, why three scanners produce three disagreeing schemas, how a dedup key stays deterministic without a rule-id crosswalk between tools, and why a proposed fix is a deterministic diff plus a human rather than an auto-commit |
 
 ## Architecture
 

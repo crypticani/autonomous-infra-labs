@@ -25,6 +25,15 @@ alone, dropping the rule id and the scanner name entirely.
 # genuinely different findings that happen to land on the same line get merged into one.
 # Upgrade path: a hand-built rule-id crosswalk table, if that turns out to happen in
 # practice against real fixtures.
+#
+# It does happen in practice, found on Day 24: the five securityContext rules Trivy
+# raises against one container block all report the block's StartLine, so all five share
+# one fingerprint and `dedupe` keeps exactly one. That is the right identity for triage
+# (one judgment about one misconfigured block) and the wrong one for fixes (one surviving
+# rule means one key in the proposed diff instead of five), so `fixes.py` reads the
+# pre-dedup list and groups on the insertion point instead. Left as-is rather than
+# upgraded: the collapse is correct for what dedup exists to do, which is keep Day 23's
+# batches from re-triaging the same block.
 """
 
 import hashlib
@@ -43,6 +52,15 @@ class Finding(BaseModel):
     installed_version: str | None = None
     fixed_version: str | None = None
     cwe: str | None = None
+    # Day 24's three additions, all of them things the scanners were already sending and
+    # this module was dropping on the floor. None of them feeds `_fingerprint`, so every
+    # fingerprint Day 22 and Day 23 measured is unchanged.
+    resolution: str | None = (
+        None  # the scanner's own remediation line, where it has one
+    )
+    message: str | None = None  # Trivy's per-finding message; the only thing that names
+    # which container of a Deployment a misconfiguration is about
+    context: list[tuple[int, str]] = []  # (line number, content), in file order
     fingerprint: str
 
 
@@ -73,6 +91,48 @@ def _finding(**fields) -> Finding:
     return Finding(fingerprint=fingerprint, **fields)
 
 
+def _trivy_context(holder: dict) -> list[tuple[int, str]]:
+    """Trivy's `Code.Lines`, stopping at the truncation sentinel.
+
+    Trivy caps a code block at ten lines and marks the cut with an entry whose
+    `Truncated` is true and whose `Content` is empty -- so a 43-line container block
+    arrives as lines 22-30 and then a hole. Everything after that sentinel is a lie about
+    the file, and a unified diff hunk needs contiguous lines with an accurate count, so
+    the run before it is all any diff can be built from. (`holder` is `CauseMetadata` for
+    a misconfiguration and the secret object itself for a secret -- Trivy puts `Code` in
+    a different place for each.)
+    """
+    lines = []
+    for line in (holder.get("Code") or {}).get("Lines") or []:
+        if line.get("Truncated"):
+            break
+        lines.append((line["Number"], line["Content"]))
+    return lines
+
+
+def _bandit_context(code: str | None) -> list[tuple[int, str]]:
+    """Bandit ships the offending line plus a neighbour either side as one string, each
+    line prefixed with its unpadded number and a single space -- so one partition per
+    line recovers the original content exactly, indentation included.
+    """
+    lines = []
+    for raw_line in (code or "").split("\n"):
+        number, _, content = raw_line.partition(" ")
+        if number.isdigit():
+            lines.append((int(number), content))
+    return lines
+
+
+def _checkov_context(code_block: list | None) -> list[tuple[int, str]]:
+    """Checkov's `code_block`, a list of [number, content] pairs.
+
+    Empty for every finding in the committed fixture, because `scan.sh` runs checkov
+    with `--compact` and that is precisely the flag that strips it. Parsed anyway so
+    dropping the flag is the only change needed to get Checkov diffs out of `fixes.py`.
+    """
+    return [(number, content.rstrip("\n")) for number, content in code_block or []]
+
+
 def _parse_trivy(raw: dict) -> list[Finding]:
     findings = []
     for result in raw.get("Results") or []:
@@ -94,6 +154,7 @@ def _parse_trivy(raw: dict) -> list[Finding]:
             )
 
         for misconfig in result.get("Misconfigurations") or []:
+            cause = misconfig.get("CauseMetadata") or {}
             findings.append(
                 _finding(
                     scanner="trivy",
@@ -101,7 +162,10 @@ def _parse_trivy(raw: dict) -> list[Finding]:
                     severity_raw=misconfig.get("Severity"),
                     title=misconfig.get("Title", misconfig["ID"]),
                     target=target,
-                    line=(misconfig.get("CauseMetadata") or {}).get("StartLine"),
+                    line=cause.get("StartLine"),
+                    resolution=misconfig.get("Resolution"),
+                    message=misconfig.get("Message"),
+                    context=_trivy_context(cause),
                 )
             )
 
@@ -114,6 +178,11 @@ def _parse_trivy(raw: dict) -> list[Finding]:
                     title=secret.get("Title", "secret detected"),
                     target=target,
                     line=secret.get("StartLine"),
+                    # Redacted by Trivy -- the secret itself comes back as asterisks, so
+                    # this shows a human *where* and can never be diffed back into the
+                    # file. `fixes.py` only builds diffs for an allowlist of rule ids,
+                    # which is what keeps a redacted line out of a patch.
+                    context=_trivy_context(secret),
                 )
             )
 
@@ -133,6 +202,7 @@ def _parse_bandit(raw: dict) -> list[Finding]:
                 target=result.get("filename", ""),
                 line=result.get("line_number"),
                 cwe=str(cwe["id"]) if cwe else None,
+                context=_bandit_context(result.get("code")),
             )
         )
     return findings
@@ -151,6 +221,10 @@ def _parse_checkov(raw: list) -> list[Finding]:
                     title=check.get("check_name", check["check_id"]),
                     target=check.get("file_path", ""),
                     line=line_range[0],
+                    # A URL, not a sentence -- Checkov has no prose remediation field.
+                    # Still the best advice available for a check with no fixer.
+                    resolution=check.get("guideline"),
+                    context=_checkov_context(check.get("code_block")),
                 )
             )
     return findings

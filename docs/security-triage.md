@@ -270,5 +270,194 @@ invented citation marker: strip what can't be trusted, keep what can, and let th
 
 ---
 
-*Next: Day 24 adds proposed fixes — a diff generated from a finding's own context lines, never
-applied, for the classes of finding mechanical enough to fix with confidence.*
+## 1.6 Why a security fix is proposed, never applied
+
+An auto-fix bot for security findings sounds obviously good and is mostly a trap. Three separate
+reasons, and they stack:
+
+**The service has no checkout.** By design (§"The problem"): the caller's CI scans its own code and
+POSTs the JSON. So the service cannot read the file it wants to change, cannot run the tests
+afterwards to see whether the change broke anything, and has no branch to push to. Every one of
+those is a precondition for committing a change. What it *can* do is emit a diff as text, which the
+caller attaches to a PR for a human who has all three.
+
+**A security fix is a behaviour change, not a correction.** This is the part that surprises people.
+`readOnlyRootFilesystem: true` is unambiguously the more secure setting, and it breaks any container
+that writes to its own filesystem — a temp file, a cache, a unix socket. `runAsUser: 10001` breaks
+an image whose files are owned by another uid. Neither is a typo being corrected; both are trades
+against how the workload actually behaves, which is information that exists nowhere in the finding.
+"More secure" and "still works" are different questions, and a scanner only asked the first.
+
+**The confident-looking wrong patch is worse than no patch.** A reviewer reading a diff trusts its
+shape — the line numbers, the surrounding context, the fact that it *looks* like it came from the
+file. That trust is the thing being spent. A patch that doesn't apply wastes a few minutes; a patch
+that applies and is subtly wrong (an inserted key one indent level off, silently landing in the
+wrong block) is a security fix that got merged and doesn't do anything. This is the reason the diff
+builder is deterministic Python rather than the model that is already sitting in the pipeline: a
+diff has a real oracle (`git apply --check`), so the cost of being wrong is cheap to detect — and
+that is exactly the case worth spending code on instead of tokens. Day 23 measured this same model
+returning five valid-shaped, factually worthless triage judgments. A plausible diff is that same
+failure with a `+` in front of it.
+
+## 1.7 What "mechanical" actually means
+
+The week's plan called three fix classes mechanical: pin a base image to a digest, add a
+`securityContext`, bump a pinned dependency. Against a real corpus one survives, and the reason each
+of the other two fails is more instructive than the one that works:
+
+- **Pin a base image to a digest.** The digest is not in the finding. Getting it means reaching a
+  registry, which the service deliberately cannot do. A diff containing an invented digest is the
+  confident-looking wrong patch from §1.6, in its purest form.
+- **Bump a pinned dependency.** Needs a known-good target version. This corpus' one real CVE has no
+  `FixedVersion` — the upstream fix doesn't exist yet. Where a fixed version *is* present the advice
+  names it, but naming a version is not the same as editing a lockfile, which has its own resolver.
+- **Add a `securityContext` key.** Works, because the value is a *constant*: `readOnlyRootFilesystem:
+  true` is the right answer for every workload that can take it. Nothing has to be looked up.
+
+So the honest test for "mechanical" is not *is the edit small* — all three are one-line edits. It is
+**does the correct value have to be discovered from somewhere the service can't see.** A memory
+limit, an image digest, a uid that matches the image: all small edits, none mechanical. That
+distinction is the entire content of `_SECURITY_CONTEXT`, the table in `fixes.py`, and it's why the
+table is short.
+
+Verifying the round trip on 2026-08-20 surfaced a *second* axis, which the first re-scan of a
+patched file made obvious in a way reading rule descriptions hadn't. Two rules kept firing on the
+patched manifest, and neither has an unknown value:
+
+- **`KSV-0118`** ("default security context configured") fires twice on one workload — once for the
+  container, once for the *Deployment*. The container-level one is satisfied by the hunk; the
+  pod-level one wants `spec.template.spec.securityContext`, which is a different insertion point
+  from the `- name: <container>` line the finding anchored to. Known value, wrong scope.
+- **`KSV-0117`** ("prevent binding to privileged ports") wants a `containerPort` below 1024 changed.
+  That's a *modification* of an existing line rather than an insertion, the replacement port is a
+  choice, and changing it cascades into the Service's `targetPort` — a second file the finding says
+  nothing about.
+
+So the second question is **does the edit land where the finding's own context lines reach**. A fix
+whose insertion point is a different block, or whose correctness depends on a second file, is not
+mechanical either, however constant its value. Both of these come back as advice, which is why the
+one thing the module claims — "this hunk resolves these fingerprints" — stayed true when a scanner
+was asked to check it.
+
+---
+
+# Part 4 — Reading the code (Day 24)
+
+## 4.1 The context lines were always there
+
+Every diff needs the lines around the change, and the service has no file to read them from. It
+turns out all three scanners already ship them and `scanners.py` was dropping them on the floor:
+Trivy in `CauseMetadata.Code.Lines`, Bandit in `code` (a single string, each line prefixed with its
+unpadded number and one space), Checkov in `code_block` (a list of `[number, content]` pairs).
+
+`Finding` gained `context`, `resolution` and `message` to carry them. None feeds `_fingerprint`,
+which is deliberate — every dedup key Days 22 and 23 measured is unchanged, so adding three fields
+invalidated no earlier result.
+
+Two things the data does that a diff builder has to respect:
+
+**Trivy truncates in the middle and tells you.** A block is capped at ten lines, with the cut marked
+by an entry whose `Truncated` is true and whose `Content` is empty. So a 43-line container block
+arrives as lines 22–30 and then a hole:
+
+```python
+for line in (holder.get("Code") or {}).get("Lines") or []:
+    if line.get("Truncated"):
+        break
+    lines.append((line["Number"], line["Content"]))
+```
+
+That `break` is load bearing. A unified diff hunk header — `@@ -22,9 +22,15 @@` — is a *claim* about
+the file: nine consecutive lines start at line 22. A gap anywhere inside the quoted lines makes the
+claim false even though every individual line is correct, and `git apply` rejects it. `_contiguous()`
+then takes the run from the start and stops at the first non-consecutive number, so a hunk is only
+ever built from lines that really are adjacent in the file.
+
+**A secret's context is pre-redacted, and lives somewhere else.** Trivy puts `Code` directly on the
+secret object rather than under `CauseMetadata`, and the secret itself comes back as asterisks. It's
+useful for showing a human *where*, and it must never be diffed back into a file. What guarantees
+that isn't a check on secrets — it's that `fixes.py` builds diffs only for an allowlist of rule ids,
+so a secret finding never reaches a fixer at all. An allowlist fails closed; a blocklist of things
+not to patch would need updating every time a scanner adds a rule.
+
+## 4.2 Nine rules, one hunk
+
+Trivy raises nine separate `KSV-*` rules against a container with no `securityContext` — one each
+for `runAsNonRoot`, `allowPrivilegeEscalation`, `runAsUser`, `runAsGroup`,
+`readOnlyRootFilesystem`, seccomp (twice, under two rule ids) and capabilities (twice). Fix them
+independently and you get nine diffs that each insert
+their own `securityContext:` key. The first applies; the second applies *cleanly too*, and produces
+a YAML document with a duplicate key that Kubernetes rejects. A patch that applies and is invalid is
+the worst outcome available.
+
+So the fixers are grouped by insertion point and emitted as one hunk carrying the union of the keys.
+That's the same collapse Day 22 does with `dedupe()`, arrived at from the opposite direction: there
+it was a cost optimisation, here it's a correctness requirement.
+
+Which exposes what Day 22's dedup key costs. A misconfiguration is identified by `(target, line)`,
+and all nine of those rules report the same block's `StartLine` — so they share one fingerprint and
+`dedupe()` keeps exactly one. That is the *right* identity for triage: one judgment about one
+misconfigured block, and nine model calls collapsed into one. It's the wrong identity for fixes,
+because one surviving rule means one key in the hunk instead of nine. The resolution isn't to change
+the fingerprint — it's that the two layers want different identities, so `propose_fixes()` reads the
+pre-dedup list and dedups on the insertion point instead. The `# ponytail:` comment in
+`scanners.py` predicted this collapse on Day 22 as a hypothetical; Day 24 is it happening.
+
+## 4.3 Anchoring, and the `- name:` trap
+
+The insertion point comes from the container's own `- name:` line, which also gives the indentation:
+
+```python
+match = _NAME_KEY.match(content)          # ^(\s*)-(\s+)name:\s*(\S+)\s*$
+if match and match.group(3).strip("\"'") == wanted:
+    indent = " " * (len(match.group(1)) + 1 + len(match.group(2)))
+```
+
+`- name:` puts its sibling keys at the dash's column, plus the dash, plus the space after it —
+`        - name: x` means keys at column 10. YAML's whole meaning is in that arithmetic, which is
+precisely why it isn't left to a model.
+
+The trap: a container block contains `- name: http` inside its `ports:` list and `- name: LOG_LEVEL`
+inside its `env:`. They match the same pattern, indented deeper. A first-match anchor cheerfully
+inserts a `securityContext` inside `ports:` — a patch that applies, parses, and does nothing. What
+disambiguates is `wanted`, the container name, and the only place it appears is Trivy's per-finding
+`Message`:
+
+```python
+_CONTAINER_IN_MESSAGE = re.compile(r"[Cc]ontainer [\"']([^\"']+)[\"']")
+```
+
+Both quote styles are load bearing — `KSV-0012` writes `Container 'x'` and `KSV-0104` writes
+`container "x"`, in the same scan. And the rules that name no container at all (`KSV-0030`: "Either
+Pod or Container should set…", `KSV-0106`: "container should drop all") get prose advice instead of
+a guess. In this repo's corpus that's 17 of the family's 21 findings anchored and 4 refused, which
+is the trade taken deliberately: a refusal costs a reviewer nothing, and a wrong anchor costs them
+their trust in every other diff in the file.
+
+## 4.4 The refusals are the feature
+
+`propose_fixes()` returns a `Fix` for every finding, and `kind="advice"` — with the reason in
+`note` — for every one it won't build a diff for. Five refusal branches: no container named in the
+message, a `securityContext` already visible in the lines, the container declared past the
+truncation, a target that isn't a repo file (a container image reference like
+`alpine:3.19 (alpine 3.19.1)`, or a path climbing out of the repo — that string arrives in a public
+request body and ends up in a patch header), and a hunk whose lines overlap another hunk in the same
+file.
+
+That last one exists because `git apply` rejects an entire patch when two hunks share lines, not
+just the offending hunk — so one bad pair would cost every other fix in that file. Dropping the
+second to advice keeps the rest applicable.
+
+The prose itself needs no model either. Every Trivy misconfiguration ships a `Resolution` written by
+whoever wrote the check ("Set `containers[].securityContext.runAsUser` to an integer > 10000"),
+Checkov ships a `guideline` URL, and a vulnerability with a `FixedVersion` gets "upgrade chromadb
+1.5.9 -> 1.5.10" assembled from fields it already has. Asking a 7b model to paraphrase a sentence
+that is already correct and already free is the kind of LLM call that makes a pipeline slower without
+making it better — and at ~4 minutes per batch on CPU (§Day 23's measurement), 559 findings' worth of
+paraphrase is hours spent to restate what the scanner said.
+
+---
+
+*Next: Day 25 turns triaged priorities into a single risk score with a threshold verdict, and puts
+the whole pipeline behind `POST /triage` with bearer auth, a body-size cap and a per-token rate
+limit — a public endpoint that spends CPU-minutes per call needs all three.*

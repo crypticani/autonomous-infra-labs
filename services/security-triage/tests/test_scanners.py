@@ -224,6 +224,165 @@ def test_dedupe_collapses_the_same_location_across_scanners():
     assert len(deduped) == 1
 
 
+def test_trivy_context_stops_at_the_truncation_sentinel():
+    # Trivy caps a code block at ten lines and marks the cut with an entry whose Content
+    # is empty. Carrying that sentinel through would put a phantom blank line into any
+    # diff built from these lines.
+    envelope = {
+        "scans": {
+            "trivy": {
+                "Results": [
+                    {
+                        "Target": "services/log-analyzer/k8s/deployment.yaml",
+                        "Misconfigurations": [
+                            {
+                                "ID": "KSV-0014",
+                                "Title": "Root file system is not read-only",
+                                "Message": "Container 'log-analyzer' of Deployment x",
+                                "Resolution": "Change it to 'true'.",
+                                "CauseMetadata": {
+                                    "StartLine": 22,
+                                    "Code": {
+                                        "Lines": [
+                                            {
+                                                "Number": 22,
+                                                "Content": "        - name: log-analyzer",
+                                                "Truncated": False,
+                                            },
+                                            {
+                                                "Number": 23,
+                                                "Content": "",
+                                                "Truncated": False,
+                                            },
+                                            {
+                                                "Number": 24,
+                                                "Content": "",
+                                                "Truncated": True,
+                                            },
+                                        ]
+                                    },
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    f = parse_envelope(envelope)[0]
+
+    # The blank line at 23 is a real blank line in the file; the one at 24 is a hole.
+    assert f.context == [(22, "        - name: log-analyzer"), (23, "")]
+    assert f.resolution == "Change it to 'true'."
+    assert f.message == "Container 'log-analyzer' of Deployment x"
+
+
+def test_trivy_secret_context_is_the_redacted_lines():
+    envelope = {
+        "scans": {
+            "trivy": {
+                "Results": [
+                    {
+                        "Target": "services/self-healing-agent/.secrets/kubeconfig",
+                        "Secrets": [
+                            {
+                                "RuleID": "jwt-token",
+                                "Title": "JWT token",
+                                "StartLine": 18,
+                                "Code": {
+                                    "Lines": [
+                                        {
+                                            "Number": 18,
+                                            "Content": "      token: ****",
+                                            "Truncated": False,
+                                        }
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    }
+
+    f = parse_envelope(envelope)[0]
+
+    # Trivy puts Code on the secret itself, not under CauseMetadata as it does for a
+    # misconfiguration -- and the content it returns is already asterisked out.
+    assert f.context == [(18, "      token: ****")]
+
+
+def test_bandit_code_block_recovers_the_original_lines():
+    envelope = {
+        "scans": {
+            "bandit": {
+                "results": [
+                    {
+                        "test_id": "B104",
+                        "issue_text": "Possible binding to all interfaces.",
+                        "filename": "./services/knowledge-copilot/app.py",
+                        "line_number": 619,
+                        # Bandit's own format: unpadded number, one space, then the line
+                        # exactly as it appears, indentation included.
+                        "code": '618 if __name__ == "__main__":\n619     uvicorn.run(app)\n',
+                    }
+                ]
+            }
+        }
+    }
+
+    f = parse_envelope(envelope)[0]
+
+    assert f.context == [
+        (618, 'if __name__ == "__main__":'),
+        (619, "    uvicorn.run(app)"),
+    ]
+
+
+def test_checkov_carries_its_guideline_and_code_block():
+    envelope = {
+        "scans": {
+            "checkov": [
+                {
+                    "check_type": "kubernetes",
+                    "results": {
+                        "failed_checks": [
+                            {
+                                "check_id": "CKV_K8S_21",
+                                "check_name": "The default namespace should not be used",
+                                "file_path": "/services/log-analyzer/k8s/configmap.yaml",
+                                "file_line_range": [1, 12],
+                                "guideline": "https://docs.example/bc-k8s-20",
+                                "code_block": [
+                                    [1, "apiVersion: v1\n"],
+                                    [2, "kind: ConfigMap\n"],
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    }
+
+    f = parse_envelope(envelope)[0]
+
+    assert f.resolution == "https://docs.example/bc-k8s-20"
+    assert f.context == [(1, "apiVersion: v1"), (2, "kind: ConfigMap")]
+
+
+def test_a_finding_with_no_context_defaults_to_empty():
+    # The committed fixture's Checkov half is exactly this: scan.sh runs with --compact,
+    # which strips code_block, and DS-0026 ships no CauseMetadata at all.
+    f = parse_envelope(_trivy_envelope())[0]
+
+    assert f.context == []
+    assert f.resolution is None
+    assert f.message is None
+
+
 def test_fingerprint_is_stable_across_calls():
     a = parse_envelope(_trivy_envelope())[0]
     b = parse_envelope(_trivy_envelope())[0]
