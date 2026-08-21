@@ -1,3 +1,5 @@
+import pytest
+
 from comment import render
 
 
@@ -99,6 +101,14 @@ def test_a_failed_run_does_not_read_like_a_pass():
     assert "ollama: the model took too long" in body
     assert "absence of one" in body
     assert "✅" not in body
+
+
+def test_a_pending_run_is_refused_not_rendered():
+    """Found by hand on 2026-08-21, rendering a run that had not finished: the old code
+    reached for risk["counts"] on a null and died with a TypeError naming neither the run
+    nor the reason. A comment for a pending run would have to invent a verdict."""
+    with pytest.raises(ValueError, match="still pending"):
+        render(_run(status="pending", risk=None, top=[], triaged=0))
 
 
 def test_every_comment_names_its_run_and_commit():
