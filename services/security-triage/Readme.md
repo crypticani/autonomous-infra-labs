@@ -11,9 +11,10 @@ This is **Project 4 (Week 4)** of the
 > make three disagreeing JSON schemas look like one. This README is the *what and how much*; that
 > one is the *why*.
 
-**Status (Day 24):** the boring layer (`scan.sh`, `scanners.py`), the triage layer (`provider.py`,
-`triage.py`) and the fix layer (`fixes.py`) are built. No server exists yet; `POST /triage` starts
-Day 25 — triage and fixes both run from a script, against the fixture corpus, not over HTTP.
+**Status (Day 25):** the boring layer (`scan.sh`, `scanners.py`), the triage layer (`provider.py`,
+`triage.py`), the fix layer (`fixes.py`), the policy layer (`risk.py`) and the HTTP surface
+(`app.py`) are built, with a reusable GitHub Actions workflow any repo can call. Not deployed —
+the endpoint runs locally with `uvicorn`; appsrv, the image and the metrics are Day 28.
 
 ## Why the service never sees a checkout
 
@@ -313,11 +314,157 @@ carries its own header, since a caller posts one fix per PR comment, so the seco
 numbers were computed against the unpatched file), and a genuine failure if the fixture is older
 than the manifests it describes — re-run `scan.sh` if the repo has moved on.
 
+## `risk.py` — one score, and a threshold somebody chose
+
+A risk threshold is a policy decision, and this module exists to make it explicit and per-repo
+instead of leaving it implicit in *"did any scanner say CRITICAL"*. "No criticals" and "safe" are
+different claims.
+
+The score is a **weighted sum capped at 100**, not worst-finding-wins:
+
+| Corpus | Score | At threshold 40 |
+|---|---|---|
+| 1 critical | 40 | fail |
+| 3 highs, no critical | 45 | fail |
+| 40 mediums, nothing worse | 100 | fail |
+| 2 lows | 2 | pass |
+
+Worst-finding-wins would score the last two rows 40 and 10 — one medium and two hundred mediums
+indistinguishable — which is exactly the failure the day is about. The cap exists because past 100
+the number stops carrying information: a repo at 340 and one at 980 both need "stop and look".
+
+Two things are deliberately **not** in the formula:
+
+- **`confidence`.** Day 23 measured it flat at every model size tried — 0.8 on a judgment the model
+  had no business making, 0.8 again on an obvious one. Weighting a score by a number that doesn't
+  vary buys nothing and disguises where the score came from. `priority` is the only judgment the
+  model demonstrably makes.
+- **`needs_human`.** It scores zero and is counted separately, because a declined judgment is not a
+  low-risk one. It surfaces as `review_required` on the assessment and as a callout in the PR
+  comment. Marked as a `ponytail:` ceiling in the module: a run that declined *everything* still
+  returns `verdict: pass` with `review_required: true` beside it, and its own threshold isn't worth
+  inventing until Day 27 measures what a normal `needs_human` rate even looks like.
+
+`assess()` and `top_findings()` are separate functions on purpose. The score is a policy calculation
+over judgments alone; the ranked list is presentation, and it has to join judgments back to the
+findings they were about — a PR comment full of sixteen-character fingerprints tells a reviewer
+nothing. Ties in the ranking break on the fingerprint so two runs over an unchanged corpus produce
+a byte-identical comment; an unstable top-10 reads as a change in the codebase when nothing changed.
+
+## `app.py` — 202 now, verdict later
+
+```
+POST /triage       -> 202 {run_id, status: "pending", findings_raw, findings}
+GET  /triage/{id}  -> the run: pending | done | failed
+GET  /health       -> unauthenticated, reports the policy this process actually loaded
+```
+
+The ack-now/answer-later split is Day 13's Slack bot and Day 20's `/alerts` again, at a worse ratio:
+one model call per `ST_BATCH_SIZE` findings, and this repo's own fixture is 559 deduped findings —
+over a hundred calls, minutes each on CPU Ollama. A synchronous endpoint would time out on every
+real request, and the caller (a GitHub Actions job) would retry, doubling the work it just abandoned.
+
+**Parsing and dedup happen synchronously**, in the request, even though they'd fit just as well in
+the background task. Both are string arithmetic and take milliseconds on a 2.7 MB envelope, and
+doing them up front means a malformed `scans` block is a `422` the caller can read instead of a
+`failed` run it has to poll for. It also puts the finding count in the ack, which is the only number
+the caller has to guess how long to poll for.
+
+`propose_fixes()` gets the **pre-dedup** list and `triage_findings()` the deduped one — Day 24's
+asymmetry, preserved: nine `securityContext` rules on one container block share a `(target, line)`
+fingerprint, which is the right identity for one triage judgment and the wrong one for a hunk that
+needs all nine keys.
+
+### Three controls, from the first commit
+
+This is a public multi-tenant endpoint whose work costs CPU-minutes of somebody else's inference,
+so none of these are capstone work:
+
+| | |
+|---|---|
+| **Bearer auth** | `ST_API_TOKENS`, comma-separated. Plural unlike `SHA_API_TOKEN` and the copilot's single token — one per onboarded repo, so revoking a leaked one is a list edit, and the rate limit has something per-caller to count against. The bucket key is a SHA-256 prefix of the token, never the token |
+| **Body cap** | `ST_MAX_BODY_BYTES`, default 16 MiB. This repo's own envelope is 2.7 MB and it is a small repo |
+| **Rate limit** | `ST_MAX_RUNS_PER_HOUR` per token. Not only anti-abuse: a repo whose CI retries a failed workflow four times would otherwise queue four full runs against a backend that serves about one. `429` is the honest answer — asking again doesn't make the work faster |
+
+**The body cap is middleware, not a `Depends`, and that's the whole point of it.** FastAPI reads and
+parses the request body *before* it solves a route's dependencies, so a `Depends(require_small_body)`
+guard fires only after the megabytes it was meant to refuse have already been read and turned into
+dicts. It was written as a dependency first; moving it is the only reason it caps anything. Middleware
+returns a `JSONResponse` rather than raising `HTTPException`, because a raise there is outside the
+handlers FastAPI installs and would surface as a `500`.
+
+Run records live in a process-local dict, which makes `--workers 1` load-bearing for the third time
+in this repo (the copilot's cache, the agent's proposals, now this), and a restart mid-run strands a
+polling job on an id that will never exist again — it gets a `404` and fails the job, which is at
+least the loud version. The dict is capped at `ST_MAX_RUNS` and evicts oldest-first, or a long-lived
+container accumulates every envelope it has ever seen.
+
+## The CI gate
+
+Two workflows, and one of them is the product:
+
+- **`.github/workflows/security-triage.yml`** — reusable (`workflow_call`). Job `scan` checks out the
+  *caller's* repo, curls `scan.sh` from this one, installs the three scanners, and POSTs. Job
+  `report` polls, renders a comment, posts it with the caller's own `GITHUB_TOKEN`, and exits
+  non-zero above the threshold.
+- **`.github/workflows/security_triage_ci.yml`** — this service's own lint and tests. No
+  `build-and-push` yet: there is no `Dockerfile` until Day 28, and a publish job pointing at a
+  context that doesn't exist is a red X on every merge to `main`.
+
+**Why two jobs and not one**, given that the polling job occupies a runner for the whole wait
+anyway: permissions. `scan` builds a request body out of untrusted repo contents and is granted no
+token scopes at all (`permissions: {}`); `report` is the only half that can write to a pull request,
+and it never touches the checkout.
+
+`scan.sh` and `comment.py` are fetched with `curl` into `$RUNNER_TEMP` rather than by a second
+`actions/checkout`, for a reason that only shows up once: `actions/checkout` can't place a repo
+outside the workspace, and anything inside the workspace is a directory `scan.sh` then scans — the
+triage tooling would appear in the caller's own findings. Both are stdlib-only and need no `pip
+install` on the runner.
+
+`comment.py` exists as a module rather than a heredoc because it is **the only output of the whole
+pipeline a human reads**, and it has real branches. Inside the YAML it could only ever be exercised
+by a live pull request; as a module it has nine tests and runs locally against any saved run:
+`python comment.py run.json`.
+
+The workflow also **overrides `repo`/`commit`/`branch` from the GitHub context**. `scan.sh` derives
+them from git, and a `pull_request` checkout is detached, so `git rev-parse --abbrev-ref HEAD`
+returns the literal string `HEAD`.
+
+### Onboarding another repo
+
+The whole integration, in the calling repo:
+
+```yaml
+# .github/workflows/security-triage.yml
+name: Security Triage
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  triage:
+    uses: crypticani/autonomous-infra-labs/.github/workflows/security-triage.yml@main
+    permissions:
+      pull-requests: write
+    with:
+      endpoint: https://triage.example.net
+      risk-threshold: '40'      # omit to take the service's default
+    secrets:
+      api_token: ${{ secrets.SECURITY_TRIAGE_TOKEN }}
+```
+
+A URL and a token. Nothing on the service side is per-repo: `repo` is a label, not configuration.
+This repo dogfoods it through `.github/workflows/security_triage_self.yml`, which is that same
+snippet plus an `if: vars.SECURITY_TRIAGE_ENDPOINT != ''` guard — the endpoint isn't live until Day
+28, and a skipped job is better than a red X on every pull request for a week.
+
 ## Tests
 
 ```bash
 cd services/security-triage
-python -m pytest -v   # 15 (scanners) + 10 (provider) + 11 (triage) + 21 (fixes) = 57, if green
+python -m pytest -v   # 15 scanners + 10 provider + 11 triage + 21 fixes
+                      #   + 14 risk + 14 app + 9 comment = 94, if green
 ```
 
 `test_scanners.py` (15, Days 22 and 24): each scanner's real shape, a missing-scanner-key envelope, CVE
@@ -347,9 +494,34 @@ well-formed (start lines equal, quoted-line count matching the header, no `-` li
 insert-only patch). What `pytest` can't prove is that a patch applies; that's the `git apply --check`
 round trip above.
 
+`test_risk.py` (14, Day 25): the scoring rows in the table above, including the one that justifies
+the whole design — forty mediums with no critical and no high scoring 100 and failing, which
+worst-finding-wins would pass. Plus the per-request threshold override, a threshold of `0` failing a
+clean run (a legal bar for a repo to ask for), `needs_human` scoring nothing while still setting
+`review_required`, and the ranking being stable when the same corpus arrives in a different order.
+
+`test_app.py` (14, Day 25): the endpoint, through `TestClient`, with `triage_findings` monkeypatched
+— `TestClient` runs background tasks before returning from the POST, so without that every test
+would make real Ollama calls. The envelope in it is a real Bandit document rather than a
+pre-built `Finding`, so the test exercises `scanners.py` on the way through. Covers the 202 → verdict
+round trip and the fingerprint join reaching `top`, a provider failure being a *recorded* failure
+rather than a run stuck `pending` forever, `401` on both routes, the per-token rate limit (one token
+being refused while another isn't), the body cap, and oldest-first eviction.
+
+`test_comment.py` (9, Day 25): the markdown itself — the pass/fail mark, the table carrying rule ids
+and paths rather than fingerprints, zero counts omitted, the `needs_human` callout, advice fixes
+staying out of the diff block, and the one that matters most: a `failed` run producing a comment
+that cannot be mistaken for a clean bill of health.
+
+## Running it
+
+```bash
+cd services/security-triage
+uvicorn app:app --port 7300 --workers 1     # --workers 1 is load-bearing, see above
+```
+
 ## Not built yet
 
-- `POST /triage` / `GET /triage/{id}`, bearer auth, the reusable GitHub Actions workflow (Day 25).
 - Runtime signals (K8s audit log events) through the same pipeline (Day 26).
 - Cost/latency benchmark, Ollama vs. Gemini (Day 27).
 - Metrics, Grafana dashboard, eval harness, deployment to appsrv (Day 28).

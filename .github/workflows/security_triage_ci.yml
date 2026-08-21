@@ -1,0 +1,47 @@
+name: Security Triage CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - 'services/security-triage/**'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - 'services/security-triage/**'
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.14'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r services/security-triage/requirements.txt
+
+      - name: Run Linting
+        run: |
+          black --check services/security-triage
+
+      - name: Run Tests
+        working-directory: services/security-triage
+        run: python -m pytest tests/ -q
+
+      - name: Check scan.sh
+        # The one piece of this service that runs on somebody else's runner, so a syntax
+        # error in it breaks every onboarded repo's CI rather than this one's.
+        run: bash -n services/security-triage/scan.sh
+
+  # No validate-manifests and no build-and-push yet, unlike the other three workflows:
+  # this service has neither a Dockerfile nor k8s/ until Day 28, and a publish job
+  # pointing at a context that does not exist is a red X on every merge to main. Both
+  # jobs land with the image, copying self_healing_agent_ci.yml including its
+  # push-to-main-only guard.

@@ -459,6 +459,214 @@ paraphrase is hours spent to restate what the scanner said.
 
 ---
 
-*Next: Day 25 turns triaged priorities into a single risk score with a threshold verdict, and puts
-the whole pipeline behind `POST /triage` with bearer auth, a body-size cap and a per-token rate
-limit — a public endpoint that spends CPU-minutes per call needs all three.*
+## 1.8 "No criticals" is not the same as "safe"
+
+Most CI security gates are a severity filter: fail the build if anything is tagged CRITICAL, pass
+otherwise. It reads as strict and it is the wrong shape, in both directions at once.
+
+It is too strict on one axis. A CRITICAL in a dev-only dependency that never ships, in a code path
+behind an admin flag nobody enables, fails the build — so the gate gets disabled, or a blanket
+ignore-list grows, and after a month nobody can say what the gate actually checks.
+
+And it is far too lax on the other. A service with **no** criticals and forty medium findings passes
+cleanly. Forty ways in is not safer than one way in; it is just harder to write in a headline. The
+severity filter cannot express that, because it only ever looks at the single worst row.
+
+So the gate here is a **score**, and the score is a sum:
+
+```
+critical 40   high 15   medium 4   low 1        score = min(100, sum)
+```
+
+| Corpus | Score | Threshold 40 |
+|---|---|---|
+| 1 critical | 40 | fail |
+| 3 highs, no critical | 45 | fail |
+| 40 mediums, nothing worse | 100 | **fail** |
+| 2 lows | 2 | pass |
+
+The third row is the whole argument. Under worst-finding-wins it scores 40 and is indistinguishable
+from a single medium.
+
+Two consequences worth being explicit about. The **cap** is there because past 100 the number stops
+carrying information — a repo at 340 and a repo at 980 both need the same response, which is "stop
+and look", and an uncapped number invites treating one as five times worse than the other. And the
+**threshold is per-repo**, overridable in the request body, because 40 is a value somebody picked
+rather than a fact somebody discovered. A public API and a cron script have genuinely different
+bars, and neither should have to argue with a default set in another repository.
+
+## 1.9 The two numbers that are not in the score
+
+**`confidence` is excluded.** Every triage result carries one, and the obvious move is to weight the
+score by it — a low-confidence critical counting for less than a certain one. Day 23 measured it:
+it is flat. 0.8 on a judgment the model had no business making, 0.8 again on an obvious one, at
+every model size tried. A weight that doesn't vary changes no ordering and no total; all it does is
+put a number in the formula that *looks* like calibration and isn't. `priority` is the only judgment
+the model demonstrably makes, so `priority` is what the score is made of.
+
+This is the same lesson as Day 23's `needs_human`, arriving from the other side. There, giving the
+model a legal way to decline is what made the other four priorities trustworthy. Here, refusing to
+use a self-reported certainty is what keeps the score from laundering a guess into a decimal.
+
+**`needs_human` scores zero, and is counted separately.** It is tempting to give it a weight —
+"unjudged isn't safe" is true. But any weight is a fabrication: score it like a medium and forty
+declined judgments fail a build that may be clean; score it low and a run where the model gave up
+entirely looks like a good one.
+
+The honest version is that it is not a risk level at all, it is an *absence of a judgment*, so it
+gets its own field (`review_required`) and its own line in the PR comment: **"5 findings the model
+declined to judge. They score nothing, so a passing verdict does not cover them."** That is a real
+gap and it is written down as one. The ceiling is marked in the module with a `ponytail:` comment —
+a run that declines everything still returns `pass` with `review_required: true` — and the upgrade
+(its own threshold) is deliberately deferred to Day 27, because nobody yet knows what a normal
+`needs_human` rate looks like, and a bar set before the measurement is just a number chosen to make
+the demo pass.
+
+---
+
+# Part 5 — Reading the code (Day 25)
+
+## 5.1 202 is not a shortcut, it is the only correct answer
+
+`POST /triage` returns `202 Accepted` and a run id. The caller polls `GET /triage/{id}` until it
+says something other than `pending`.
+
+This is the third time this repo has done it — Day 13's Slack bot, Day 20's `/alerts`, now this —
+and the ratio is worse here than in either. One model call per `ST_BATCH_SIZE` findings, minutes
+each on CPU Ollama, and this repo's own fixture is 559 deduped findings: over a hundred calls. A
+synchronous endpoint doesn't just time out. It times out *and* the caller retries, so the work that
+was abandoned is now being done twice on a backend that can serve about one run at a time.
+
+What is worth noticing is what stayed **in** the request:
+
+```python
+raw = parse_envelope(request.model_dump())
+deduped = dedupe(raw)
+```
+
+Both could have moved to the background task with the rest. Keeping them in the request costs
+milliseconds on a 2.7 MB envelope — it is string arithmetic, no model anywhere near it — and buys
+two things. A malformed `scans` block becomes a `422` the caller can read, instead of a `failed` run
+it has to poll for and then interpret. And the finding count goes out in the ack, which is the only
+number the caller has to guess how long to keep polling.
+
+The rule generalises: **the ack should carry everything that is cheap and certain**. Anything that
+is fast and can fail deterministically belongs on the near side of the 202, because after the 202
+there is nobody left to return an error to.
+
+## 5.2 The control that was in the wrong place
+
+The body cap started as a FastAPI dependency, which is where a size check obviously belongs:
+
+```python
+@app.post("/triage", dependencies=[Depends(require_small_body)])   # capped nothing
+```
+
+It capped nothing. FastAPI reads and parses the request body *before* it solves a route's
+dependencies — the body is already bytes in memory, already `json.loads`-ed into dicts, by the time
+`require_small_body` is asked whether it is too big. Every test you would naturally write for it
+passes: send an oversized body, get a `413`. The 413 arrives *after* the allocation it exists to
+prevent.
+
+The fix is where the check runs, not what it checks:
+
+```python
+@app.middleware("http")
+async def cap_body_size(request, call_next):
+    if request.method == "POST":
+        error = body_size_error(request.headers.get("content-length"))
+        ...
+```
+
+Middleware runs before the route is matched, which is the only point in the request where refusing
+is still cheap. Two details fall out of that position. It returns a `JSONResponse` rather than
+raising `HTTPException`, because a raise in middleware is outside the exception handlers FastAPI
+installs and would surface as a `500`. And it checks `Content-Length` rather than the body's real
+length, which sounds like trusting the client and isn't: uvicorn's HTTP parser stops reading at the
+declared length, so under-declaring buys an attacker a truncated request, not a large one. A request
+with no declared length at all — chunked encoding — has nothing to check and is refused with `411`.
+
+**The generalisable bit:** a guard is only a guard if it runs before the thing it guards. "Is it in
+the code" and "is it in the path" are different questions, and a passing test answers only the first.
+
+## 5.3 One token per repo, because of the rate limit
+
+`ST_API_TOKENS` is plural, unlike `SHA_API_TOKEN` and the copilot's single token. Partly that is
+revocation hygiene — a leaked token is a list edit rather than a coordinated rotation across every
+onboarded repo. The load-bearing reason is the line below it:
+
+```python
+def require_token(request) -> str:          # returns a caller id, not None
+    ...
+    return hashlib.sha256(token.encode()).hexdigest()[:8]
+```
+
+Authentication returns an **identity**, and the rate limit counts against it. With one shared token
+there is no per-caller anything: the busiest repo spends everyone's budget. The identity is a hash
+prefix rather than the token itself because it ends up in logs and on run records, and a rate-limit
+bucket key is not a place to put a credential.
+
+The limit is not primarily an anti-abuse control, either. The realistic caller is a repo whose CI
+retried a failed workflow four times, queueing four full runs against a backend that serves about
+one. `429` is the honest answer to that: the work will not happen faster by asking again.
+
+## 5.4 The gate is two jobs, and the reason is not time
+
+The reusable workflow splits into `scan` and `report`. The polling job occupies a runner for the
+whole wait either way, so this buys no wall-clock. It buys blast radius:
+
+```yaml
+  scan:
+    permissions: {}              # handles untrusted repo contents, can write nothing
+  report:
+    permissions:
+      pull-requests: write       # can write, never touches the checkout
+```
+
+The half that runs scanners over arbitrary repository contents and builds a request body out of the
+result is given no token scopes at all. The half that holds a writable token never sees the
+checkout. This is the same instinct as Day 18's approval gate — the component that *decides* and the
+component that *acts* are deliberately not the same component — applied to a CI job's credentials
+instead of to a cluster write.
+
+Two smaller things in that workflow that only look obvious in hindsight. `scan.sh` is fetched with
+`curl` into `$RUNNER_TEMP` instead of a second `actions/checkout`, because checkout cannot place a
+repo outside the workspace, and anything inside the workspace is a directory `scan.sh` then
+scans — the triage tooling would show up in the caller's own findings. And the workflow overwrites
+`repo`/`commit`/`branch` from the GitHub context after `scan.sh` writes them, because a
+`pull_request` checkout is detached and `git rev-parse --abbrev-ref HEAD` returns the literal string
+`HEAD`.
+
+## 5.5 The comment is where the design becomes visible
+
+Everything above converges on about twenty lines of markdown posted to a pull request: a score
+against a threshold, the counts, the top findings joined back to their rule ids and file paths, the
+`needs_human` callout, and any proposed diffs in a collapsed block.
+
+That renderer started inside the workflow, as a sixty-line `python3 - <<'PY'` heredoc. It is now
+`comment.py`, curled onto the runner the same way `scan.sh` already is, and the move is worth a
+sentence because it is a general rule and not a style preference: **code that can only run inside
+CI can only be debugged inside CI.** Every branch in it — a failed run, a `needs_human` count, a
+fix that is advice rather than a diff — was reachable only by opening a pull request and waiting
+for a full triage run. As a module taking a plain dict, each of those is a test, and the whole
+comment renders locally from any saved run with `python comment.py run.json`.
+
+Two decisions show up there and nowhere else. **The ranked list is a separate function from the
+score** (`top_findings()` vs `assess()`) because a fingerprint in a comment tells a reviewer nothing —
+the score is a policy calculation over judgments alone, the list has to join judgments back to the
+findings they were about, and mixing the two would have meant carrying `Finding` objects into a
+scoring formula that has no use for them. And **ties in the ranking break on the fingerprint**, so
+two runs over an unchanged corpus produce a byte-identical comment; an unstable top-10 reads as a
+change in the codebase when nothing changed, which is the fastest way to teach people to skip the
+comment.
+
+A `failed` run gets its own comment body, and it does not say "pass". It says the run did not
+complete and that nothing was judged — because the absence of a verdict and a clean verdict look
+identical to anyone reading only the check mark, and that is the failure this whole day is a
+correction of.
+
+---
+
+*Next: Day 26 sends Kubernetes audit events through the same `Finding` shape and the same
+`/triage` endpoint — no second pipeline — on the theory that static findings and runtime events are
+the same triage problem if the normalisation seam is right.*

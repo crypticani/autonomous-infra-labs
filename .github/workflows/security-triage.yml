@@ -1,0 +1,215 @@
+# Security triage as a reusable workflow -- Day 25.
+#
+# Any repo calls this with `uses:` plus a URL and a token. It runs the three scanners on
+# its own runner over its own checkout, POSTs the envelope, and comments the verdict back
+# on the pull request. Nothing about the service is per-repo, and the service never sees
+# a git credential or fetches a URL of the caller's choosing -- findings come to it, code
+# never does.
+#
+# Every `${{ }}` below is bound to an `env:` var rather than pasted into a `run:` body.
+# The values here are the caller's own workflow inputs and so not obviously hostile, but
+# `github.event.pull_request.*` in the same file would be, and having one rule for the
+# whole file is how it stays true after the next edit.
+#
+# See services/security-triage/Readme.md for the caller workflow to copy.
+name: Security Triage
+
+on:
+  workflow_call:
+    inputs:
+      endpoint:
+        description: 'Base URL of the security-triage service, no trailing slash.'
+        required: true
+        type: string
+      risk-threshold:
+        description: >-
+          Score at or above which this repo fails its build, 0-100. Empty means "use the
+          service default". A string and not a number so that "unset" and "0" stay
+          different things -- 0 is a legal bar meaning "fail on anything at all".
+        required: false
+        type: string
+        default: ''
+      scan-path:
+        description: 'Directory to scan, relative to the checkout.'
+        required: false
+        type: string
+        default: '.'
+      triage-repo:
+        description: >-
+          Where scan.sh is fetched from. The caller has no copy of it, and vendoring one
+          would mean every onboarded repo drifting from the parser that reads its output.
+        required: false
+        type: string
+        default: 'crypticani/autonomous-infra-labs'
+      triage-ref:
+        description: 'Ref of triage-repo to take scan.sh from. Pin to a tag for reproducible scans.'
+        required: false
+        type: string
+        default: 'main'
+      poll-timeout-minutes:
+        description: >-
+          How long to wait for the verdict. A triage run is one model call per batch of
+          findings and the default backend is CPU-only, so minutes is normal and this is
+          generous on purpose.
+        required: false
+        type: number
+        default: 45
+    secrets:
+      api_token:
+        description: 'Bearer token issued for this repo.'
+        required: true
+
+jobs:
+  # Two jobs, and the split is about permissions rather than time -- the polling job
+  # still occupies a runner. `scan` builds a body out of untrusted repo contents and is
+  # given no token scopes at all; `report` is the only half that can write to a pull
+  # request, and it never touches the checkout.
+  scan:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      run-id: ${{ steps.post.outputs.run-id }}
+    steps:
+      - name: Checkout the calling repository
+        uses: actions/checkout@v4
+
+      - name: Fetch scan.sh
+        # curl into RUNNER_TEMP rather than a second actions/checkout, which cannot place
+        # a repo outside the workspace -- and anything inside the workspace is a directory
+        # scan.sh would then scan, so the tooling would show up in the caller's findings.
+        env:
+          SOURCE: https://raw.githubusercontent.com/${{ inputs.triage-repo }}/${{ inputs.triage-ref }}/services/security-triage/scan.sh
+        run: |
+          curl -sSfL "$SOURCE" -o "$RUNNER_TEMP/scan.sh"
+          chmod +x "$RUNNER_TEMP/scan.sh"
+
+      - name: Install the scanners
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+          python -m pip install --quiet --upgrade pip
+          pip install --quiet bandit checkov
+
+      - name: Scan
+        # Absolute output path: scan.sh cd's into the scan directory, so a relative one
+        # would drop the envelope inside the tree it just scanned.
+        env:
+          SCAN_PATH: ${{ inputs.scan-path }}
+        run: '"$RUNNER_TEMP/scan.sh" "$SCAN_PATH" "$RUNNER_TEMP/envelope.json"'
+
+      - name: POST the envelope
+        id: post
+        env:
+          ENDPOINT: ${{ inputs.endpoint }}
+          API_TOKEN: ${{ secrets.api_token }}
+          RISK_THRESHOLD: ${{ inputs.risk-threshold }}
+        run: |
+          # scan.sh derives repo/commit/branch from git, which in a pull_request checkout
+          # gives an origin URL and the literal branch name "HEAD". The GitHub context
+          # knows better, so it wins here.
+          python3 - <<'PY'
+          import json, os
+
+          path = os.path.join(os.environ["RUNNER_TEMP"], "envelope.json")
+          with open(path) as f:
+              envelope = json.load(f)
+
+          envelope["repo"] = os.environ["GITHUB_REPOSITORY"]
+          envelope["commit"] = os.environ["GITHUB_SHA"]
+          # GITHUB_HEAD_REF is the source branch on a pull_request, where REF_NAME would
+          # be "123/merge".
+          envelope["branch"] = (
+              os.environ.get("GITHUB_HEAD_REF") or os.environ["GITHUB_REF_NAME"]
+          )
+
+          threshold = os.environ.get("RISK_THRESHOLD", "").strip()
+          if threshold:
+              envelope["risk_threshold"] = int(threshold)
+
+          with open(path, "w") as f:
+              json.dump(envelope, f)
+          PY
+
+          # --fail-with-body, not --fail: a 401, a 413 and a 429 from this endpoint each
+          # carry a detail string saying which one it is, and plain --fail throws it away.
+          curl -sS --fail-with-body -X POST "$ENDPOINT/triage" \
+            -H "Authorization: Bearer $API_TOKEN" \
+            -H "Content-Type: application/json" \
+            --data-binary "@$RUNNER_TEMP/envelope.json" \
+            -o "$RUNNER_TEMP/accepted.json"
+
+          cat "$RUNNER_TEMP/accepted.json"
+          echo "run-id=$(jq -r .run_id "$RUNNER_TEMP/accepted.json")" >> "$GITHUB_OUTPUT"
+
+  report:
+    needs: scan
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Wait for the verdict
+        env:
+          ENDPOINT: ${{ inputs.endpoint }}
+          API_TOKEN: ${{ secrets.api_token }}
+          RUN_ID: ${{ needs.scan.outputs.run-id }}
+          TIMEOUT_MINUTES: ${{ inputs.poll-timeout-minutes }}
+        run: |
+          deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+          while :; do
+            curl -sS --fail-with-body -H "Authorization: Bearer $API_TOKEN" \
+              "$ENDPOINT/triage/$RUN_ID" -o "$RUNNER_TEMP/run.json"
+            status=$(jq -r .status "$RUNNER_TEMP/run.json")
+            echo "run $RUN_ID: $status"
+            [ "$status" = "pending" ] || break
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::triage run $RUN_ID was still pending after $TIMEOUT_MINUTES minutes"
+              exit 1
+            fi
+            sleep 30
+          done
+
+      - name: Render the comment
+        # Fetched, not inlined, and for the same reason as scan.sh: this is the only
+        # output of the whole pipeline a human reads, it has real branches, and a
+        # heredoc in YAML has no way to be wrong cheaply. As a module it has tests. It
+        # is stdlib-only and takes the run JSON as a plain dict, so the runner needs no
+        # checkout and no pip install.
+        env:
+          SOURCE: https://raw.githubusercontent.com/${{ inputs.triage-repo }}/${{ inputs.triage-ref }}/services/security-triage/comment.py
+        run: |
+          curl -sSfL "$SOURCE" -o "$RUNNER_TEMP/comment.py"
+          python3 "$RUNNER_TEMP/comment.py" "$RUNNER_TEMP/run.json" "$RUNNER_TEMP/comment.md"
+
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request'
+        env:
+          # The *caller's* token, granted automatically to a reusable workflow. The
+          # service never holds a credential for anybody's repository.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          # Edit the previous comment where the runner's gh supports it, so a five-push
+          # pull request carries one verdict rather than five. A new comment is the
+          # harmless fallback.
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md" --edit-last \
+            || gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+
+      - name: Apply the gate
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+
+          with open(os.environ["RUNNER_TEMP"] + "/run.json") as f:
+              run = json.load(f)
+
+          if run["status"] == "failed":
+              sys.exit(f"triage did not complete: {run['error']}")
+
+          risk = run["risk"]
+          print(f"score {risk['score']}, threshold {risk['threshold']}: {risk['verdict']}")
+          if risk["verdict"] == "fail":
+              sys.exit(
+                  f"risk score {risk['score']} is at or above the threshold "
+                  f"{risk['threshold']}"
+              )
+          PY

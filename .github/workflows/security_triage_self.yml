@@ -1,0 +1,36 @@
+# This repo eating its own dog food -- the same ~15 lines any other repo copies, calling
+# the reusable workflow next door. It is the only caller that exists today, and the whole
+# point of it is that it contains no knowledge of how triage works.
+#
+# Inert until the endpoint is live. `vars.SECURITY_TRIAGE_ENDPOINT` is unset until the
+# service is deployed on Day 28, and the `if` below skips the job rather than failing it
+# -- a red X on every pull request for a week is how a check gets ignored forever. Setting
+# the repository variable and the secret is the only thing that turns it on; no edit here.
+name: Security Triage (self)
+
+on:
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  triage:
+    if: vars.SECURITY_TRIAGE_ENDPOINT != ''
+    uses: ./.github/workflows/security-triage.yml
+    # A `pull_request` from a fork gets a read-only token whatever this says, so the
+    # comment step fails there and the gate still runs. Not worked around with
+    # `pull_request_target`, which would run this repo's workflow against a fork's code
+    # with a writable token -- the exact trade this service exists to avoid making.
+    permissions:
+      pull-requests: write
+    with:
+      endpoint: ${{ vars.SECURITY_TRIAGE_ENDPOINT }}
+      # This repo's own bar, and higher than the shipped default of 40 on purpose: the
+      # committed fixture corpus is 559 deduped findings from this very tree, most of
+      # them transitive CVEs in a lab repo that ships nothing. Set from a real run's
+      # score once Day 28 has one.
+      risk-threshold: '60'
+      # Local, not the pinned default: a change to scan.sh has to be exercised by the
+      # pull request that makes it, not by main after the fact.
+      triage-ref: ${{ github.event.pull_request.head.sha }}
+    secrets:
+      api_token: ${{ secrets.SECURITY_TRIAGE_TOKEN }}
