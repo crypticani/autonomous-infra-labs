@@ -16,26 +16,26 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
-      
+
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.14'
-      
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r services/log-analyzer/requirements.txt
           pip install pytest httpx
-      
+
       - name: Run Linting
         run: |
           black --check services/log-analyzer
-      
+
       - name: Run Tests
         working-directory: services/log-analyzer
         run: python -m pytest tests/ -q
-    
+
   validate-manifests:
     runs-on: ubuntu-latest
     steps:
@@ -46,10 +46,10 @@ jobs:
         run: |
           curl -sL https://github.com/yannh/kubeconform/releases/download/v0.4.0/kubeconform-linux-amd64.tar.gz \
             | tar xz kubeconform && sudo mv kubeconform /usr/local/bin/
-      
+
       - name: Validate Kubernetes Manifests
         run: kubeconform -strict -summary services/log-analyzer/k8s/
-      
+
   build-and-push:
     needs: [lint-and-test, validate-manifests]
     # Load-bearing since the `pull_request` indentation was fixed on day 14. It was
@@ -64,17 +64,17 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
-      
+
       - name: Log in to Github Container Registry
         uses: docker/login-action@v2
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Set up Qemu and Docker Buildx
         uses: docker/setup-buildx-action@v2
-      
+
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v5
         with:

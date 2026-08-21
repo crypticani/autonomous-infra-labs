@@ -40,7 +40,7 @@ LLM_TOKENS_TOTAL = Counter(
 )
 
 ANALYSIS_SYSTEM_PROMPT = """
-You are a Senior DevOps Engineer with expertise in analyzing error logs. 
+You are a Senior DevOps Engineer with expertise in analyzing error logs.
 Analyze the following log.
 1. Identify the root cause of the failure.
 2. Explain it in concise, plain English.
