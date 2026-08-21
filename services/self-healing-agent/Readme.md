@@ -620,10 +620,11 @@ mismatch — which happens to line up with the same `SHA_MIN_REPLICAS` floor `gu
 enforces on the fix side:
 
 ```yaml
-# Prometheus scrape config, alongside the existing appsrv targets:
+# Prometheus scrape config, alongside the existing targets:
   - job_name: kube-state-metrics-sandbox
     static_configs:
-      - targets: ["100.98.66.65:8081"]
+      # Wherever `tailscale serve --tcp 8081` is published for the cluster.
+      - targets: ["<kube-state-metrics-host>:8081"]
 
 # Alerting rule:
 groups:

@@ -1360,7 +1360,7 @@ carried a `ponytail:` comment saying so and judging it low-cost. Then a real ale
 the line that disappeared was:
 
 ```
-Summary: root filesystem is 79.3% full on 10.0.0.24:9100
+Summary: root filesystem is 79.3% full on node-01:9100
 ```
 
 That is not a nicety, it is the entire informational content of the document. What remained was an

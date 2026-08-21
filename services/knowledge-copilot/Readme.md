@@ -614,8 +614,8 @@ either form equally well, so the dense side decides the format.
 Alert: NodeDiskSpaceLow
 Status: firing
 Severity: warning
-service: node | instance: 10.0.0.24:9100 | job: node
-Summary: root filesystem is 76.4% full on 10.0.0.24:9100
+service: node | instance: node-01:9100 | job: node
+Summary: root filesystem is 76.4% full on node-01:9100
 Description: Disk pressure on the root filesystem. Left to grow this causes failed writes …
 Started: 2026-08-06T16:00:15.457Z
 ```
@@ -1337,7 +1337,7 @@ of the way where it shouldn't.
 
 End to end, `POST /ask-runbook` returned in 167s with `grounded: true`:
 
-> "the root filesystem on node 10.0.0.24:9100 is **currently** filling up [2]. The disk usage is at
+> "the root filesystem on node node-01:9100 is **currently** filling up [2]. The disk usage is at
 > **79.3%** … Reclaim space by pruning unused container images, old logs, or unused volumes. [1]"
 
 `[2]` is the live alert, `[1]` is the runbook. That percentage exists nowhere in the corpus.
@@ -1350,7 +1350,7 @@ Both survived the full unit suite and appeared within twenty minutes of running 
 from index metadata, since Alertmanager no longer returns it. Annotations weren't stored, so they
 couldn't be restored — the shipped version carried a `ponytail:` comment calling this low-cost.
 Watching it happen said otherwise: the line that vanished was `root filesystem is 79.3% full on
-10.0.0.24:9100`, which is the entire informational content. A question about last night's alerts
+node-01:9100`, which is the entire informational content. A question about last night's alerts
 would have retrieved a husk of alertname plus two timestamps. Fixed by carrying `summary` and
 `description` in metadata (`ANNOTATION_KEYS`) rather than re-reading documents from Chroma on
 every poll.
@@ -1380,7 +1380,7 @@ appsrv ran Prometheus, Alertmanager, and Grafana with `rule_files:` empty — no
 fire, so there was nothing to ingest. Writing rules became part of the day. Three scrape targets
 were also genuinely broken, which is where the first real alerts came from: `postgres` scraped at
 `127.0.0.1:9187` from a host-network Prometheus, a self-scrape pointed at the Docker DNS name
-`prometheus:9090` that cannot resolve on the host network, and `torvix` down. The first was fixed,
+`prometheus:9090` that cannot resolve on the host network, and `demo-app` down. The first was fixed,
 the third removed from monitoring; the self-scrape one is still firing and is a real
 misconfiguration rather than a demo prop.
 
