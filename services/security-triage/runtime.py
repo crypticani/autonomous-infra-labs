@@ -94,7 +94,28 @@ if __name__ == "__main__":
     # call is spent on them, and the ratio it prints (thousands of events, a handful of
     # findings) is the day's actual result.
     findings = dedupe(parse_envelope(envelope))
-    print(f"{len(events)} events -> {len(findings)} findings, wrote {out_path}")
-    for finding in findings:
-        print(f"  {finding.rule_id:<16} {finding.target}")
-        print(f"      {finding.title}")
+    preview = "\n".join(
+        [
+            f"**{len(events)} events -> {len(findings)} findings**, "
+            f"wrote `{out_path}`",
+            "",
+            "| Rule | Who, and what it was about | What happened |",
+            "| --- | --- | --- |",
+            *(f"| `{f.rule_id}` | `{f.target}` | {f.title} |" for f in findings),
+        ]
+    )
+
+    # The same two gates as comment.py's renderer, for the same two reasons: only a human
+    # at a terminal wants box-drawing characters, and `python runtime.py ... | tee` should
+    # still produce text. The envelope written above is plain JSON either way -- the
+    # formatting never reaches anything a machine reads.
+    if sys.stdout.isatty():
+        try:
+            from rich.console import Console
+            from rich.markdown import Markdown
+        except ImportError:
+            print(preview)
+        else:
+            Console().print(Markdown(preview))
+    else:
+        print(preview)

@@ -865,7 +865,9 @@ Six minutes of cluster life, before any deliberate action:
 
 Nineteen of the twenty-two were the cluster installing itself — kubeadm and kind wiring up CoreDNS,
 kube-proxy, kindnet and the local-path provisioner, every one a real RBAC write by
-`kubernetes-admin`. Three were things a person did.
+`kubernetes-admin`. Three were things a person did. Deleting the cluster and capturing again before
+touching anything at all gives 31 events and 19 findings, every one of them the install — so this is
+a property of a fresh control plane, not an artefact of one session.
 
 There is no code fix for that, and none was written. `kubeadm` and `kubectl` authenticate as the same
 identity; the only field separating them is `userAgent`, and filtering security signals on a

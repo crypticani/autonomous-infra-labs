@@ -478,7 +478,10 @@ emit.**
 `runtime.py` is the client-side half, `scan.sh`'s counterpart: it reads an audit log, keeps the
 newest 4000 events, and writes the same envelope with the events under a fourth `scans` key. `repo`
 carries the cluster name — it is a label, and `commit`/`branch` stay empty because a cluster has no
-commit and inventing one would put a lie in the PR comment header.
+commit and inventing one would put a lie in the PR comment header. It also runs the server's own
+normalisation and prints the result, which is the only way to see both halves of the seam agree
+before spending a model call on them — through `rich` when stdout is a tty and as plain markdown
+otherwise, the same two gates `comment.py` uses, so the JSON it writes never carries an escape code.
 
 ### The audit policy is two filters, not one
 
@@ -561,8 +564,9 @@ The first capture, of a cluster that had been alive for six minutes:
 
 **19 of those 22 were the cluster installing itself** — kubeadm and kind wiring up CoreDNS,
 kube-proxy, kindnet and the local-path provisioner, every one of them a genuine RBAC write by
-`kubernetes-admin`. Three findings were things a human did. There is no code fix for this and
-deliberately none was written: `kubeadm` and `kubectl` authenticate as the same identity, and the
+`kubernetes-admin`. Three findings were things a human did. Recreating the cluster and capturing
+before touching anything reproduces it without the human half: **31 events → 19 findings, all
+nineteen of them the install.** There is no code fix for this and deliberately none was written: `kubeadm` and `kubectl` authenticate as the same identity, and the
 only field that separates them is `userAgent`, so filtering on it would mean anyone who sets
 `User-Agent: kubeadm` disappears from triage. Choosing the window is the operator's job, so the run
 sheet truncates the log once the cluster is up.
