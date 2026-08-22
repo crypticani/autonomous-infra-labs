@@ -114,3 +114,13 @@ def test_a_pending_run_is_refused_not_rendered():
 def test_every_comment_names_its_run_and_commit():
     assert "run `abc123def456`" in render(_run())
     assert "commit `01234567`" in render(_run())
+
+
+def test_a_run_with_no_commit_omits_it_rather_than_rendering_it_empty():
+    # Day 26's runtime caller: a cluster has no commit, so `commit ``` in the footer of
+    # every audit-log triage would read as a bug in the tool. Seen in the first rendered
+    # comment for a real audit run.
+    rendered = render(_run(commit=""))
+
+    assert "run `abc123def456`" in rendered
+    assert "commit" not in rendered

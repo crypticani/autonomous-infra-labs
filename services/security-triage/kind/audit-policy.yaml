@@ -1,0 +1,53 @@
+apiVersion: audit.k8s.io/v1
+kind: Policy
+# Only the completed request. RequestReceived would double every line, and
+# ResponseStarted fires a second time for the connection upgrade `exec` and
+# `port-forward` use -- which would count one shell session as two requests.
+omitStages:
+  - RequestReceived
+  - ResponseStarted
+rules:
+  # The control plane's own traffic first, because it drowns out everything else: the
+  # kubelet reads a Secret for every ServiceAccount token and image pull, and the
+  # controllers list them on a loop. Rules match in order, so these have to come before
+  # the rule below or a human reading a Secret is one line in ten thousand.
+  #
+  # ponytail: excluding the whole `system:serviceaccounts:kube-system` group is a blunt
+  # instrument -- a compromised kube-system ServiceAccount is invisible here. Ceiling
+  # accepted because the alternative is an unreadable log; upgrade path is naming the
+  # individual controllers once there is a real cluster whose baseline is known.
+  - level: None
+    userGroups:
+      - system:nodes
+      - system:serviceaccounts:kube-system
+  - level: None
+    users:
+      - system:apiserver
+      - system:kube-scheduler
+      - system:kube-controller-manager
+      - system:kube-proxy
+
+  # Metadata, never RequestResponse: the request body of a Secret write and the response
+  # body of a Secret read both contain the secret, so a Request/Response-level rule here
+  # would turn the audit log into a second, plaintext copy of every credential in the
+  # cluster. Metadata still carries who, what, when, from where, and allowed-or-refused,
+  # which is everything triage judges on.
+  #
+  # This list is deliberately wider than the rule table in scanners.py judges: volume is
+  # bounded here, meaning is decided there. An audited event that maps to no rule is not
+  # a finding, and that is the normal case.
+  - level: Metadata
+    resources:
+      - group: ""
+        resources:
+          - pods/exec
+          - pods/attach
+          - pods/portforward
+          - secrets
+          - serviceaccounts/token
+      - group: rbac.authorization.k8s.io
+        resources:
+          - roles
+          - rolebindings
+          - clusterroles
+          - clusterrolebindings

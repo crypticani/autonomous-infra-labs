@@ -1,0 +1,46 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: audit
+nodes:
+  - role: control-plane
+    # AUDIT_DIR is a placeholder, substituted for this directory's absolute path before
+    # `kind create` runs (see the Readme's run sheet). A docker bind mount needs an
+    # absolute host path and this repo does not commit machine-specific ones, so the
+    # committed file fails loudly -- docker refuses a mount source called AUDIT_DIR --
+    # rather than quietly mounting the wrong thing.
+    extraMounts:
+      - hostPath: AUDIT_DIR/audit-policy.yaml
+        containerPath: /etc/kubernetes/audit/policy.yaml
+        readOnly: true
+    # kubeadm v1beta4 (Kubernetes 1.31+) takes extraArgs as a list of name/value pairs,
+    # not the map every older example on the internet shows. kind generates a v1beta4
+    # config for these node images, so the map form silently fails to patch and the
+    # cluster comes up with no audit log at all. `runtime-config` is kind's own default,
+    # repeated here because a strategic merge that replaces the list rather than merging
+    # it would otherwise drop it.
+    kubeadmConfigPatches:
+      - |
+        kind: ClusterConfiguration
+        apiServer:
+          extraArgs:
+            - name: runtime-config
+              value: ""
+            - name: audit-policy-file
+              value: /etc/kubernetes/audit/policy.yaml
+            - name: audit-log-path
+              value: /var/log/kubernetes/audit.log
+            - name: audit-log-maxsize
+              value: "20"
+            - name: audit-log-maxbackup
+              value: "1"
+          extraVolumes:
+            - name: audit-policy
+              hostPath: /etc/kubernetes/audit/policy.yaml
+              mountPath: /etc/kubernetes/audit/policy.yaml
+              readOnly: true
+              pathType: File
+            - name: audit-log
+              hostPath: /var/log/kubernetes
+              mountPath: /var/log/kubernetes
+              readOnly: false
+              pathType: DirectoryOrCreate

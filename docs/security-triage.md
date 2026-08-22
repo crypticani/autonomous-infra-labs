@@ -3,8 +3,10 @@
 A ground-up explanation of [`services/security-triage`](../services/security-triage): why an LLM
 sits *on top of* real scanners instead of replacing them, why three scanners produce three
 schemas that agree on almost nothing, how a dedup key can be deterministic without a rule-id
-crosswalk between tools that were never designed to agree, and why a proposed fix is a
-deterministic diff plus a human rather than an auto-commit.
+crosswalk between tools that were never designed to agree, why a proposed fix is a deterministic
+diff plus a human rather than an auto-commit, and why a Kubernetes audit event — a record of
+something that already happened, with no file, no line and no severity — turns out to be the same
+triage problem as a CVE.
 
 The service README covers *what was built and what it can do*. This document covers *why any of
 it works*.
@@ -667,6 +669,225 @@ correction of.
 
 ---
 
-*Next: Day 26 sends Kubernetes audit events through the same `Finding` shape and the same
-`/triage` endpoint — no second pipeline — on the theory that static findings and runtime events are
-the same triage problem if the normalisation seam is right.*
+## 1.10 A runtime event is not a different kind of problem
+
+Everything up to here triages *potential*: a CVE in a dependency, a container that could run as
+root, a credential that might be in a file. A Kubernetes **audit event** is the other kind of
+security signal — a record of something that already happened. Somebody opened a shell in a pod.
+Somebody read a Secret. Somebody was refused.
+
+The instinct is that these need their own pipeline, because they look nothing like scanner output.
+An audit event has no file path, no line number, no package, no version, and no severity — nobody
+assigned one, because it is not a rule being violated, it is a request that was served. The two data
+sets share almost no fields.
+
+But look at what the pipeline downstream of `scanners.py` actually consumes. `triage.py` sends a
+model a rule id, a title and a target and asks for a priority. `dedupe` needs a stable identity.
+`risk.py` counts priorities. `comment.py` renders a table of rule, place and reason. Not one of them
+needs a file, a line, or a package — those are optional fields that some findings happen to have.
+What every one of them needs is **a thing worth a judgment, and where it is.**
+
+That is the whole test of whether a normalisation seam is any good: not whether it can represent
+today's inputs, but whether it was shaped around the question being asked or around the shape of the
+answer that happened to arrive first. A `Finding` modelled on "what Trivy sends" would have needed a
+parallel type, a parallel batcher and a parallel score for runtime events. A `Finding` modelled on
+"what a triage decision is about" needed a parser.
+
+The cost of accepting a fourth input was one function and one dictionary entry. That is the
+measurement, and it is the only honest way to make this claim — a seam is only proven by the second
+thing you push through it, and Days 22–25 all pushed the same kind of thing.
+
+## 1.11 Two filters, because volume and meaning are different questions
+
+Kubernetes audit logging is off by default, and for good reason: the API server serves every
+`kubectl`, every controller loop, every kubelet heartbeat, and logging all of it produces gigabytes
+that nobody reads. So an **audit policy** decides what gets written, per rule, in order, at one of
+four levels (`None`, `Metadata`, `Request`, `RequestResponse`).
+
+There is a temptation to make that policy do all the filtering — log exactly the events you want to
+triage. Resist it, because volume and meaning are different questions with different failure modes.
+A policy tuned to log only findings is a policy you have to redeploy the control plane to change,
+and one where anything you did not anticipate leaves no trace at all. A policy that logs a slightly
+wider, security-relevant set gives you a record you can re-interpret later, and lets the rule table
+— ordinary code, with tests, changeable in a commit — decide what any of it means.
+
+So: `kind/audit-policy.yaml` bounds volume, `_AUDIT_RULES` in `scanners.py` bounds meaning, and an
+audited event matching no rule is not a finding. `kubectl create secret` is logged and produces
+nothing, because creating a Secret is how the cluster is supposed to work; reading one is the
+interesting verb.
+
+Two things in that policy are worth understanding rather than copying.
+
+**The order matters, and the first two rules are the control plane's own traffic.** Audit rules match
+top-down, first match wins. The kubelet reads a Secret for every ServiceAccount token and every image
+pull; the controllers list them continuously. Without `level: None` for `system:nodes` and the
+kube-system service accounts *before* the interesting rules, a human reading a Secret is one line in
+ten thousand and the signal is gone — not filtered out, just buried, which is worse because it looks
+like coverage.
+
+**The level is `Metadata`, and going higher would be a security bug.** `RequestResponse` logs bodies.
+The request body of a Secret write is the secret; the response body of a Secret read is the secret.
+A `RequestResponse` rule on Secrets turns the audit log — a file that exists to be shipped somewhere
+central and kept for a long time — into a second, plaintext copy of every credential in the cluster.
+`Metadata` still carries who, what, when, from where, and allowed-or-refused, which is all triage
+judges on anyway. The rule to remember: **an audit log that records what it is auditing is a
+liability, not a control.**
+
+---
+
+# Part 6 — Reading the code (Day 26)
+
+## 6.1 The diff that is the whole argument
+
+```python
+_PARSERS = {
+    "trivy": _parse_trivy,
+    "bandit": _parse_bandit,
+    "checkov": _parse_checkov,
+    "k8s_audit": _parse_k8s_audit,     # Day 26
+}
+```
+
+`parse_envelope` already iterated whichever scan keys were present and ignored the absent ones,
+because Day 22 had to handle a Go repo with no Bandit output. That generality was not written for
+this, and it is why this cost one line: a key that is present gets parsed, and nothing else in the
+service has an opinion about which keys exist.
+
+`app.py`, `dedupe`, `triage.py`, `risk.py` and `comment.py` were not modified for Day 26 at all.
+`comment.py` got one two-line change, and it was a cosmetic bug the runtime caller exposed rather
+than anything structural — an envelope with no commit rendered `commit ``` in the footer, which reads
+as a broken tool. A cluster has no commit and never will.
+
+## 6.2 Grouping, and why the actor lives *inside* `target`
+
+An audit log is a stream; a triage queue is a list of decisions. Fifty `get secret` requests from one
+identity against one Secret is **one** judgment with a count attached, not fifty identical ones — and
+since `triage.py` makes one model call per `ST_BATCH_SIZE` findings, the difference between those two
+readings is the difference between one call and ten.
+
+So `_parse_k8s_audit` groups by (rule, actor, object) and carries the count and the newest timestamp
+into the title:
+
+```
+K8S-SECRET-READ  kubernetes-admin@sandbox/demo-creds
+    read Secret contents through the API (2 requests, last 2026-08-22T13:27:01.221616Z)
+```
+
+The count and timestamp are in the `title` and not in a new field, because `title` is one of the
+things `triage.py` puts in the prompt. A runtime finding with neither "how often" nor "when" is not
+judgeable, and a field nothing reads is not information.
+
+The actor is spelled **into** `target` — `kubernetes-admin@sandbox/demo-creds` — and that is a
+correctness decision rather than a formatting one. Recall `_fingerprint`: for a finding with no
+package and no line, identity is `(rule_id, target)`. If the actor sat in a separate field, two
+different users reading the same Secret would produce the same fingerprint, and `dedupe` — doing
+exactly its job — would drop one of them. The identity of a runtime finding genuinely includes who
+did it. The group key and the fingerprint have to agree, and the only way to make them agree without
+touching `_fingerprint` is to put the actor where the fingerprint looks.
+
+It has a second payoff: `target` is the PR comment's `Where` column, and "who" is the first thing a
+reviewer asks about a runtime event. Impersonation renders both halves —
+`kubernetes-admin as system:serviceaccount:sandbox:default` — because `kubectl --as` is how an
+administrator borrows a lesser identity and also how an attacker does something while it looks like
+it came from somewhere else. Recording only one of the two identities loses the interesting half
+either way.
+
+One field is deliberately left empty. `severity_raw` is `None` for every audit finding: the other
+three parsers copy a severity their scanner assigned, and nothing assigned one here. A table mapping
+`K8S-EXEC` to `HIGH` would be `scanners.py` quietly doing the judging that `triage.py` exists to do,
+and it would look like a scanner said it.
+
+## 6.3 The bug the first real log found
+
+Day 24's lesson repeated verbatim: 111 green tests, and the first real audit log broke something
+none of them could see.
+
+```
+K8S-FORBIDDEN    kubernetes-admin@cluster
+```
+
+A `create` has no `name` in its `objectRef` — the name is in the request body, which `Metadata`
+level deliberately does not carry — and neither does a `list`. So `namespace`/`name` were both empty,
+`target` fell back to a literal `"cluster"`, and a refused `create clusterrolebinding` and a refused
+`list secrets` became the same target, the same fingerprint, and one finding where there were two.
+
+```python
+where = "/".join(
+    p for p in (ref.get("namespace"), ref.get("name") or ref.get("resource")) if p
+)
+```
+
+The resource stands in when there is no name. What makes this worth writing down is not the
+one-liner, it is that **the test I had written asserted the broken behaviour as correct** — it fed a
+nameless `list secrets` event and checked for `kubernetes-admin@cluster`, because that is what the
+code did and the code looked reasonable. A test written from the implementation documents the
+implementation; only real input asks whether the implementation was right.
+
+## 6.4 The cluster was the hard part, and none of it was about auditing
+
+The audit policy can only be set at cluster creation — `kind` accepts `kubeAPIServer` arguments and
+the policy file through cluster config and nowhere else. Recreating the Day 21 cluster would have
+meant re-applying its RBAC, re-minting the self-healing-agent's ServiceAccount token, rewriting the
+kubeconfig deployed to appsrv and restarting `tailscale serve`. A **second** cluster costs a
+container and touches none of it, and the audit demo needs no tailnet at all. When a prerequisite is
+expensive, check whether it is actually a prerequisite.
+
+Then two failures, both instructive, neither about Kubernetes auditing:
+
+**The documentation was wrong for this version.** kubeadm's v1beta4 API takes `extraArgs` as a list
+of `name`/`value` pairs; every audit-logging example in circulation, including the one on kind's own
+configuration page, uses the v1beta3 map. A map-shaped strategic-merge patch against a list does not
+error — it fails to merge, and the cluster comes up healthy with no audit log whatsoever. The config
+here was written against `docker exec <node> cat /kind/kubeadm.conf` from the running cluster
+instead. **Read the artefact the tool actually generates, not the example of how to generate it.**
+
+**The error named the wrong layer.** `kubeadm init` failed with `client rate limiter Wait returned an
+error: context deadline exceeded` — a message about kubeadm's own HTTP client, sixty seconds of
+connection-refused after the API server never came up. The temptation was to debug the thing that had
+just changed, which was the audit configuration. What settled it was `crictl ps -a` returning
+*nothing*: not a crash-looping API server, no containers at all, which cannot be an API server
+problem because nothing had got as far as starting one. The kubelet journal had the real cause —
+`inotify_init: too many open files`, restart attempt 89 — from `fs.inotify.max_user_instances` being
+128 by default with one kind cluster already holding most of them. A host sysctl, three layers below
+the error and completely unrelated to the feature under test.
+
+The general shape, and it is the same one as §5.2's misplaced guard: **the loudest error is often the
+furthest from the cause.** Work down the layers by asking what each one *did*, not by re-reading the
+thing you changed last.
+
+## 6.5 What the first real capture actually contained
+
+Six minutes of cluster life, before any deliberate action:
+
+```
+36 events -> 22 findings
+```
+
+Nineteen of the twenty-two were the cluster installing itself — kubeadm and kind wiring up CoreDNS,
+kube-proxy, kindnet and the local-path provisioner, every one a real RBAC write by
+`kubernetes-admin`. Three were things a person did.
+
+There is no code fix for that, and none was written. `kubeadm` and `kubectl` authenticate as the same
+identity; the only field separating them is `userAgent`, and filtering security signals on a
+client-supplied string means anyone who sets `User-Agent: kubeadm` vanishes from triage. **A filter
+an attacker can set is not a filter.** Choosing the time window is the operator's job — the run sheet
+truncates the log once the cluster is up, and `runtime.py`'s newest-4000-events tail is the same
+decision made for a long-running cluster.
+
+After truncating, four findings, score 21 against a threshold of 40, verdict `pass`: an RBAC grant
+rated `high`, a Secret read (two requests) `medium`, a refused impersonated list and a pod exec
+`low`. Judged by a model that had only ever been shown scanner output, scored by a formula written
+for CVEs, rendered by a template built for pull requests.
+
+Reading that comment also surfaced the two problems worth carrying into Day 27, and they were only
+visible in the rendered output. Every explanation asserts "The impact is high" — including both
+findings the model itself rated `low`, so the prose contradicts the priority on half the rows. And
+the explanations still run to ~270 characters against a prompt asking for one short sentence. Neither
+is a code bug; both are prompt work that needs a token measurement next to it, which is what Day 27
+is.
+
+---
+
+*Next: Day 27 measures what all of this costs — Ollama on CPU against a hosted flash model across the
+fixture corpus at several batch sizes, in tokens, latency and findings per minute, and sets the
+shipped default from the measurement instead of the guess.*

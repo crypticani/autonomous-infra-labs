@@ -1,4 +1,4 @@
-"""Trivy, Bandit and Checkov, turned into one shape -- Day 22.
+"""Four wire shapes, one Finding -- Day 22, extended on Day 26.
 
 Three scanners, three schemas that agree on almost nothing: Trivy nests
 `Results[].Vulnerabilities[]` / `Misconfigurations[]` / `Secrets[]` under a scan target,
@@ -7,9 +7,20 @@ Bandit is a flat `results[]`, and Checkov is a *list* of per-framework reports e
 that is the caller's problem -- POST /triage always takes the same envelope, and this
 module is the only place that knows any of these shapes exist.
 
-The envelope is `{repo, commit, branch, scans: {trivy?, bandit?, checkov?}}`, and any of
-the three `scans` keys can be absent -- a Go repo's scan.sh never runs Bandit, and that is
-not an error, just a caller with a different key set (see `scan.sh`'s Bandit guard).
+The envelope is `{repo, commit, branch, scans: {trivy?, bandit?, checkov?, k8s_audit?}}`,
+and any of those `scans` keys can be absent -- a Go repo's scan.sh never runs Bandit, and
+that is not an error, just a caller with a different key set (see `scan.sh`'s Bandit
+guard).
+
+Day 26 adds the fourth key, and it is the one that argues for this seam existing at all.
+`k8s_audit` is not a scanner: it is a stream of Kubernetes audit events, no file, no line,
+no package, no severity, describing something that *already happened* rather than
+something that might. It still lands in the same `Finding`, gets fingerprinted by the same
+function, deduped by the same rule, batched into the same model calls and scored by the
+same policy -- because the only thing downstream of here ever needed was "a thing worth a
+judgment, and where it is". Static findings and runtime events are the same triage problem
+once the normalisation is honest, and the cost of proving that was one parser and one line
+in `_PARSERS`. `runtime.py` is the collector on the other side, `scan.sh`'s counterpart.
 
 Dedup is the second job here, and it is arithmetic on strings, not a model call: cheaper
 now, and it is what keeps Day 23's LLM batches from re-triaging the same finding twice.
@@ -230,10 +241,154 @@ def _parse_checkov(raw: list) -> list[Finding]:
     return findings
 
 
+_READ_VERBS = {"get", "list", "watch"}
+_WRITE_VERBS = {"create", "update", "patch", "delete", "deletecollection"}
+
+# One shared row, because four RBAC resources are the same judgment: something changed
+# who can do what.
+_RBAC_WRITE = ("K8S-RBAC-WRITE", "changed who can do what in the cluster", _WRITE_VERBS)
+
+# (resource, subresource) -> rule id, what happened, the verbs it applies to (None = any).
+# Deliberately narrower than the audit policy that produced the events: the policy bounds
+# how much gets logged, this table decides what any of it means, and an event that matches
+# nothing here is not a finding. `kubectl create secret` is logged and ignored -- creating
+# a Secret is how the cluster is supposed to work; reading one is the interesting verb.
+_AUDIT_RULES = {
+    ("pods", "exec"): ("K8S-EXEC", "ran an interactive command in a pod", None),
+    ("pods", "attach"): ("K8S-ATTACH", "attached to a running pod's process", None),
+    ("pods", "portforward"): ("K8S-PORTFORWARD", "opened a tunnel into a pod", None),
+    ("secrets", ""): (
+        "K8S-SECRET-READ",
+        "read Secret contents through the API",
+        _READ_VERBS,
+    ),
+    ("serviceaccounts", "token"): (
+        "K8S-TOKEN-MINT",
+        "minted a ServiceAccount token",
+        None,
+    ),
+    ("roles", ""): _RBAC_WRITE,
+    ("rolebindings", ""): _RBAC_WRITE,
+    ("clusterroles", ""): _RBAC_WRITE,
+    ("clusterrolebindings", ""): _RBAC_WRITE,
+}
+
+
+def _audit_rule(event: dict) -> tuple[str, str] | None:
+    """Which rule this event is, or None for the ones that are just noise.
+
+    A refusal short-circuits the table: the API server saying no to a request against an
+    audited resource is worth triaging whatever the verb was, and it is the one signal
+    here that means something even when the request itself was mundane.
+
+    # ponytail: a refusal is only seen for resources the audit policy already logs, so
+    # this cannot catch someone probing, say, every Deployment in the cluster and being
+    # refused. Ceiling accepted -- a policy wide enough to catch that logs every request
+    # the cluster serves. Upgrade path: a second `level: Metadata` rule scoped to
+    # non-resource URLs and a wider resource list, once there is a volume budget for it.
+    """
+    if (event.get("annotations") or {}).get(
+        "authorization.k8s.io/decision"
+    ) == "forbid":
+        return "K8S-FORBIDDEN", f"was refused a {event.get('verb') or 'request'}"
+
+    ref = event.get("objectRef") or {}
+    rule = _AUDIT_RULES.get((ref.get("resource", ""), ref.get("subresource", "")))
+    if rule is None:
+        return None
+
+    rule_id, what, verbs = rule
+    if verbs is not None and event.get("verb") not in verbs:
+        return None
+    return rule_id, what
+
+
+def _audit_actor(event: dict) -> str:
+    """Who did it -- the impersonated identity too, when there is one.
+
+    `kubectl --as` is how a cluster-admin borrows a lesser identity, and it is also how
+    an attacker with admin does something while it looks like it came from somewhere
+    else. Both halves belong in the answer, so this reads `admin as sa:sandbox:default`
+    rather than picking one.
+    """
+    user = (event.get("user") or {}).get("username") or "unknown"
+    impersonated = (event.get("impersonatedUser") or {}).get("username")
+    return f"{user} as {impersonated}" if impersonated else user
+
+
+def _parse_k8s_audit(raw: list) -> list[Finding]:
+    """Day 26's fourth shape: Kubernetes audit events, grouped into findings.
+
+    Grouped, and not one finding per event, because an audit log is a stream and a
+    triage queue is a list of things to decide about. Fifty `get secret` requests from
+    one identity against one Secret is one judgment with a count attached, not fifty
+    identical ones -- and at one model call per ST_BATCH_SIZE findings, the difference is
+    the whole run.
+
+    The group key is (rule, actor, object), and it is spelled into `target` as
+    `actor@namespace/name` rather than kept beside it. That is not cosmetic: `target` is
+    one of the three fields `_fingerprint` reads for a finding with no package and no
+    line, so putting the actor there is what makes two different users reading the same
+    Secret two findings instead of one that `dedupe` silently drops. It also lands in the
+    PR comment's `Where` column, where "who" is the first thing a reviewer asks.
+
+    `severity_raw` stays None on purpose. The other three parsers copy a severity their
+    scanner assigned; nothing assigned one here, and inventing a table of them would be
+    this module quietly doing the judging that triage.py exists to do.
+    """
+    groups: dict[tuple[str, str], dict] = {}
+    for event in raw or []:
+        rule = _audit_rule(event)
+        if rule is None:
+            continue
+        rule_id, what = rule
+
+        ref = event.get("objectRef") or {}
+        # The resource stands in when there is no name, because a `create` has none in
+        # its objectRef -- the name is in the request body, which Metadata level
+        # deliberately does not carry -- and neither does a `list`. Found on the very
+        # first real audit log: a refused `create clusterrolebinding` and a refused
+        # `list secrets` both came out as `kubernetes-admin@cluster`, which is one
+        # fingerprint for two unrelated refusals, and dedupe would keep one of them.
+        where = "/".join(
+            p
+            for p in (ref.get("namespace"), ref.get("name") or ref.get("resource"))
+            if p
+        )
+        target = f"{_audit_actor(event)}@{where or 'cluster'}"
+        seen = event.get("stageTimestamp") or ""
+
+        group = groups.setdefault(
+            (rule_id, target), {"what": what, "count": 0, "last": seen}
+        )
+        group["count"] += 1
+        group["last"] = max(group["last"], seen)
+
+    findings = []
+    for (rule_id, target), group in groups.items():
+        count = group["count"]
+        findings.append(
+            _finding(
+                scanner="k8s-audit",
+                rule_id=rule_id,
+                # The count and the timestamp are in the title because that is what
+                # reaches the model -- triage.py's prompt sends title and target, and a
+                # runtime finding with neither "how often" nor "when" is unjudgeable.
+                title=(
+                    f"{group['what']} ({count} request{'s' if count > 1 else ''}, "
+                    f"last {group['last'] or 'unknown'})"
+                ),
+                target=target,
+            )
+        )
+    return findings
+
+
 _PARSERS = {
     "trivy": _parse_trivy,
     "bandit": _parse_bandit,
     "checkov": _parse_checkov,
+    "k8s_audit": _parse_k8s_audit,
 }
 
 

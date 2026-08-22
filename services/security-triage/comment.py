@@ -92,7 +92,13 @@ def render(run: dict) -> str:
                 body += ["```diff", fix["diff"].rstrip(), "```", ""]
             body += ["</details>"]
 
-    body += ["", f"<sub>run `{run['id']}` · commit `{run['commit'][:8]}`</sub>"]
+    # The commit is omitted rather than rendered empty: Day 26's runtime caller has no
+    # commit to send and never will, and `commit ``` in the footer of a real PR comment
+    # reads like a bug in the tool rather than a property of the thing being triaged.
+    footer = f"run `{run['id']}`"
+    if run["commit"]:
+        footer += f" · commit `{run['commit'][:8]}`"
+    body += ["", f"<sub>{footer}</sub>"]
     return "\n".join(body) + "\n"
 
 

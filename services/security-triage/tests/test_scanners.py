@@ -400,3 +400,229 @@ def test_real_fixture_dedupes_without_dropping_everything():
 
     assert len(findings) > 0
     assert 0 < len(deduped) <= len(findings)
+
+
+# --- Day 26: Kubernetes audit events, the fourth shape -------------------------------
+
+
+def _audit_event(**overrides):
+    """One `audit.k8s.io/v1` Event, shaped like the real thing.
+
+    A `kubectl exec` at Metadata level, which is what the committed audit policy
+    produces -- the exec's command is in `requestURI`'s query string, and there is no
+    request or response body at all, on purpose (see the policy's comment about a Secret
+    read at RequestResponse level being a second copy of the secret).
+    """
+    event = {
+        "kind": "Event",
+        "apiVersion": "audit.k8s.io/v1",
+        "level": "Metadata",
+        "stage": "ResponseComplete",
+        "requestURI": "/api/v1/namespaces/sandbox/pods/flaky-app-7d9/exec?command=ls",
+        "verb": "create",
+        "user": {"username": "kubernetes-admin", "groups": ["kubeadm:cluster-admins"]},
+        "sourceIPs": ["172.18.0.1"],
+        "objectRef": {
+            "resource": "pods",
+            "subresource": "exec",
+            "namespace": "sandbox",
+            "name": "flaky-app-7d9",
+        },
+        "responseStatus": {"code": 101},
+        "stageTimestamp": "2026-08-21T13:40:12.000000Z",
+        "annotations": {"authorization.k8s.io/decision": "allow"},
+    }
+    event.update(overrides)
+    return event
+
+
+def _audit_envelope(*events):
+    return {"repo": "kind-audit", "scans": {"k8s_audit": list(events)}}
+
+
+def test_parses_a_kubectl_exec():
+    f = parse_envelope(_audit_envelope(_audit_event()))[0]
+
+    assert f.scanner == "k8s-audit"
+    assert f.rule_id == "K8S-EXEC"
+    assert f.target == "kubernetes-admin@sandbox/flaky-app-7d9"
+    assert "1 request," in f.title
+    assert "2026-08-21T13:40:12" in f.title
+    # Nothing assigned a severity here and this module does not invent one -- judging is
+    # triage.py's job, and a file/line/package on a runtime event would be fiction.
+    assert f.severity_raw is None
+    assert f.line is None
+    assert f.package is None
+
+
+def test_repeated_events_group_into_one_finding_with_a_count():
+    findings = parse_envelope(
+        _audit_envelope(
+            _audit_event(stageTimestamp="2026-08-21T13:40:12.000000Z"),
+            _audit_event(stageTimestamp="2026-08-21T13:41:30.000000Z"),
+            _audit_event(stageTimestamp="2026-08-21T13:40:55.000000Z"),
+        )
+    )
+
+    assert len(findings) == 1
+    assert "3 requests," in findings[0].title
+    # The newest, not the last one in the file -- an audit log is append-only in
+    # practice, but nothing in the format promises it.
+    assert "last 2026-08-21T13:41:30" in findings[0].title
+
+
+def test_two_actors_on_one_object_stay_two_findings():
+    # The reason the actor is spelled into `target`: it is one of the three fields
+    # _fingerprint reads for a finding with no package and no line, so without it these
+    # two share a fingerprint and dedupe drops one of them -- losing the fact that a
+    # second identity did the same thing.
+    findings = parse_envelope(
+        _audit_envelope(
+            _audit_event(),
+            _audit_event(user={"username": "system:serviceaccount:sandbox:default"}),
+        )
+    )
+
+    assert len(findings) == 2
+    assert len({f.fingerprint for f in findings}) == 2
+    assert len(dedupe(findings)) == 2
+
+
+def test_reading_a_secret_is_a_finding_but_creating_one_is_not():
+    secret_ref = {"resource": "secrets", "namespace": "sandbox", "name": "demo-creds"}
+
+    read = parse_envelope(
+        _audit_envelope(_audit_event(verb="get", objectRef=secret_ref))
+    )
+    written = parse_envelope(
+        _audit_envelope(_audit_event(verb="create", objectRef=secret_ref))
+    )
+
+    assert [f.rule_id for f in read] == ["K8S-SECRET-READ"]
+    # Creating a Secret is how the cluster is supposed to work. The audit policy logs it
+    # anyway -- volume is bounded by the policy, meaning by the rule table.
+    assert written == []
+
+
+def test_a_refused_request_is_a_finding_whatever_the_verb():
+    findings = parse_envelope(
+        _audit_envelope(
+            _audit_event(
+                verb="create",
+                objectRef={"resource": "secrets", "namespace": "kube-system"},
+                responseStatus={"code": 403},
+                annotations={"authorization.k8s.io/decision": "forbid"},
+            )
+        )
+    )
+
+    assert [f.rule_id for f in findings] == ["K8S-FORBIDDEN"]
+    assert "refused a create" in findings[0].title
+
+
+def test_impersonation_names_both_identities():
+    f = parse_envelope(
+        _audit_envelope(
+            _audit_event(
+                impersonatedUser={"username": "system:serviceaccount:sandbox:default"}
+            )
+        )
+    )[0]
+
+    assert f.target == (
+        "kubernetes-admin as system:serviceaccount:sandbox:default"
+        "@sandbox/flaky-app-7d9"
+    )
+
+
+def test_an_unaudited_resource_is_not_a_finding():
+    findings = parse_envelope(
+        _audit_envelope(
+            _audit_event(
+                verb="get",
+                objectRef={
+                    "resource": "configmaps",
+                    "namespace": "sandbox",
+                    "name": "app-config",
+                },
+            )
+        )
+    )
+
+    assert findings == []
+
+
+def test_the_four_rbac_resources_share_one_rule():
+    findings = parse_envelope(
+        _audit_envelope(
+            *(
+                _audit_event(
+                    verb="create",
+                    objectRef={"resource": resource, "name": f"grant-{resource}"},
+                    stageTimestamp="2026-08-21T13:40:12.000000Z",
+                )
+                for resource in (
+                    "roles",
+                    "rolebindings",
+                    "clusterroles",
+                    "clusterrolebindings",
+                )
+            )
+        )
+    )
+
+    assert {f.rule_id for f in findings} == {"K8S-RBAC-WRITE"}
+    # Cluster-scoped: no namespace in the objectRef, so the target is just the name.
+    assert findings[0].target == "kubernetes-admin@grant-roles"
+
+
+def test_a_nameless_request_keeps_its_resource_in_the_target():
+    # Found on the first real audit log, not by writing this test first: a create has no
+    # name in its objectRef and neither does a list, so without the resource standing in
+    # these two refusals were both `kubernetes-admin@cluster` -- one fingerprint for two
+    # unrelated events, and dedupe keeps one.
+    refused = {"authorization.k8s.io/decision": "forbid"}
+    findings = parse_envelope(
+        _audit_envelope(
+            _audit_event(
+                verb="list", objectRef={"resource": "secrets"}, annotations=refused
+            ),
+            _audit_event(
+                verb="create",
+                objectRef={"resource": "clusterrolebindings"},
+                annotations=refused,
+            ),
+        )
+    )
+
+    assert [f.target for f in findings] == [
+        "kubernetes-admin@secrets",
+        "kubernetes-admin@clusterrolebindings",
+    ]
+    assert len({f.fingerprint for f in findings}) == 2
+
+
+def test_an_empty_object_ref_falls_back_to_cluster():
+    f = parse_envelope(
+        _audit_envelope(
+            _audit_event(
+                verb="get",
+                objectRef={},
+                annotations={"authorization.k8s.io/decision": "forbid"},
+            )
+        )
+    )[0]
+
+    assert f.target == "kubernetes-admin@cluster"
+
+
+def test_runtime_events_and_scanner_findings_arrive_from_one_envelope():
+    # The day's actual claim: one envelope, one parse call, one Finding shape, whether
+    # the thing happened at build time or five minutes ago.
+    envelope = _trivy_envelope()
+    envelope["scans"]["k8s_audit"] = [_audit_event()]
+
+    findings = parse_envelope(envelope)
+
+    assert {f.scanner for f in findings} == {"trivy", "k8s-audit"}
+    assert len(dedupe(findings)) == 2
