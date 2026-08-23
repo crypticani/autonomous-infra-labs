@@ -4,6 +4,8 @@ from pydantic import ValidationError
 from errors import TriageProviderError
 from scanners import Finding
 from triage import (
+    EXPLANATION_MAX,
+    SYSTEM_PROMPT,
     TriageResult,
     build_prompt,
     triage_batch,
@@ -77,7 +79,26 @@ def test_triage_result_rejects_an_explanation_over_the_length_cap():
     # repeating conditional dozens of times over. The cap is meant to stop generation
     # during decoding, but this only proves the schema-level guarantee holds.
     with pytest.raises(ValidationError):
-        _result(explanation="x" * 281)
+        _result(explanation="x" * (EXPLANATION_MAX + 1))
+
+
+def test_the_prompt_quotes_the_same_length_the_schema_enforces():
+    # The Day 26 bug, as a test. The prompt said "one short sentence" and the schema
+    # allowed 280 characters; only the schema is real to the model, because Ollama
+    # grammar-constrains against it token by token, so it wrote 280-character
+    # "sentences". Two bounds that disagree means the soft one is decoration -- if a
+    # future edit moves one number, this fails.
+    assert f"{EXPLANATION_MAX} characters" in SYSTEM_PROMPT
+    assert TriageResult.model_fields["explanation"].metadata[0].max_length == (
+        EXPLANATION_MAX
+    )
+
+
+def test_the_prompt_forbids_contradicting_the_assigned_ratings():
+    # Day 26 shipped explanations announcing "the impact is high" on findings the same
+    # result rated impact low. Each field was individually valid, so every guard passed.
+    assert "impact is high" in SYSTEM_PROMPT
+    assert "impact low" in SYSTEM_PROMPT
 
 
 def test_triage_batch_returns_a_result_per_finding_sent():

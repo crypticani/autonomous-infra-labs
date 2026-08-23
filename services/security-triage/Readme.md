@@ -85,9 +85,35 @@ a partial envelope from a non-Python repo looks like.
 nothing to scrub). It's also the eval corpus Day 27 benchmarks against.
 
 ```
-raw findings:     629  (trivy 45, bandit 534, checkov 50)
-after dedupe:      559
+raw findings:     111  (trivy 45, bandit 13, checkov 53)
+after dedupe:       43
 ```
+
+**These numbers were 629 raw / 559 deduped until Day 27**, and the difference is one line in
+`scan.sh`. Measuring cost-per-run meant looking at the whole corpus for the first time rather than
+the first 15 findings, and 515 of the 559 — **92%** — turned out to be `bandit:B101`, "use of assert
+detected", inside test files. Five consecutive lines of `test_alertmanager.py` were five separate
+findings. An assert is what a test file is made of, so bandit's own guidance is to exclude test
+paths; the scan was asking for them.
+
+Excluding test paths from bandit takes it from 534 findings to 13. Trivy's count is identical
+across both scans, which is what confirms the delta is the exclusion and not the repo drifting.
+
+The cost of not having noticed:
+
+| | before | after |
+|---|---|---|
+| deduped findings | 559 | 43 |
+| model calls at `ST_BATCH_SIZE=5` | 112 | 9 |
+| full-corpus run, CPU Ollama | ~4 hours | ~25–30 min |
+
+And the part that isn't about cost at all: the model *declines* B101 findings. Sampling five of them
+returned `needs_human` five times out of five, so a full-corpus run would have marked ~92% of its
+output as needing human review — routing 515 non-issues to a person, which is the exact inverse of
+what this service is for. Every guard would have stayed green: no invented fingerprints, no dropped
+results, valid JSON throughout. Day 23 found that a model can satisfy every check and produce
+garbage; this is the same lesson one layer earlier, where the *input* satisfies every check and is
+still garbage. The cheapest model call is the one you don't make.
 
 ## `provider.py` — the Ollama/Gemini seam
 
@@ -140,8 +166,8 @@ Two guards:
   is indistinguishable from a real triage. The fifth option is what makes the other four
   trustworthy.
 
-Run it against a slice of the real fixture (defaults to the first 15 of the 559 deduped findings —
-the full corpus at batch size 5 is ~112 calls, which on CPU Ollama could be hours):
+Run it against a slice of the real fixture (defaults to the first 15 of the 43 deduped findings;
+since Day 27 the full corpus is 9 calls at batch size 5, so `bench.py` runs all of it):
 
 ```bash
 cd services/security-triage
@@ -360,9 +386,11 @@ GET  /health       -> unauthenticated, reports the policy this process actually 
 ```
 
 The ack-now/answer-later split is Day 13's Slack bot and Day 20's `/alerts` again, at a worse ratio:
-one model call per `ST_BATCH_SIZE` findings, and this repo's own fixture is 559 deduped findings —
-over a hundred calls, minutes each on CPU Ollama. A synchronous endpoint would time out on every
-real request, and the caller (a GitHub Actions job) would retry, doubling the work it just abandoned.
+one model call per `ST_BATCH_SIZE` findings, minutes each on CPU Ollama. Day 27's scan fix took this
+repo's own fixture from 559 deduped findings to 43 — 9 calls instead of 112 — but 9 calls still runs
+20+ minutes, so the split is not something the smaller corpus makes optional. A synchronous endpoint
+would time out on every real request, and the caller (a GitHub Actions job) would retry, doubling
+the work it just abandoned. A repo larger than this one puts it straight back into the hundreds.
 
 **Parsing and dedup happen synchronously**, in the request, even though they'd fit just as well in
 the background task. Both are string arithmetic and take milliseconds on a 2.7 MB envelope, and
@@ -627,12 +655,187 @@ repo does not commit machine-specific ones, so the committed file fails loudly i
 mounting the wrong thing. The envelope then POSTs to `/triage` exactly like a scanner envelope, and
 `comment.py` renders the result with no idea it came from a cluster.
 
+## Cost and latency — Day 27
+
+`bench.py` sets `ST_BATCH_SIZE` from a measurement instead of Day 23's guess of 5.
+
+**The design is shaped by a 15-minute Ollama budget, and that constraint made it better rather than
+worse.** A matched comparison — every batch size triaging the same findings — is the obvious
+benchmark and it is unaffordable: batch 1 over ten findings is ten CPU calls, ~20 minutes on its
+own. But latency per batch size does not need heavy sampling, because it is analytically predictable
+from token counts. The system prompt is a fixed cost charged once per call regardless of how many
+findings ride along; prompt and output tokens grow with the findings in it. So measure tokens
+carefully at a few sizes and the curve falls out. Wall clock is there to check the model, not to be
+it.
+
+### The sweep
+
+One call per config. Every row is measured, and both samples are shown rather than averaged — two
+points 15% apart tell you something an average hides.
+
+Sample 1, findings 1–5 (heterogeneous: a chromadb RCE, HEALTHCHECK, ConfigMap secrets, `:latest`):
+
+| batch | wall | p_tok | o_tok | p_tok/finding | find/min | ret/sent | needs_human | expl max | contra |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 82.3s | 442 | 91 | 442.0 | 0.73 | 1/1 | 0 | 84 | 0 |
+| 3 | 79.1s | 572 | 252 | 190.7 | **2.28** | 3/3 | 0 | 120 | 0 |
+| 5 | 158.7s | 724 | 405 | 144.8 | 1.89 | 5/5 | 0 | 131 | 0 |
+| 10 | *timed out at 300s* | — | — | — | — | — | — | — | — |
+
+Sample 2, findings 21–25 (five `bandit:B101` asserts in one test file):
+
+| batch | wall | p_tok | o_tok | p_tok/finding | find/min | ret/sent | needs_human | expl max | contra |
+|---|---|---|---|---|---|---|---|---|---|
+| 3 | 169.5s | 616 | 292 | 205.3 | 1.06 | 3/3 | 3 | 160 | 0 |
+| 5 | 208.4s | 813 | 470 | 162.6 | **1.44** | 5/5 | 5 | 158 | 0 |
+| 5 | *timed out at 300s on a third attempt with the same five findings* | | | | | | | | |
+
+### The token curve, and a prediction that held
+
+Least squares over sample 1's three points:
+
+```
+prompt tokens = 368 + 70.5 x findings
+output tokens =  14 + 78.5 x findings
+```
+
+The 368 is the system prompt. At batch 1 it is **85% of the call** — which is the entire argument
+for batching, in one number.
+
+Fitted on batches 1 and 3 alone, the model predicted batch 5 at 702 prompt tokens and 140.4 per
+finding *before that row was measured*. It came in at 724 and 144.8, within 3%. That is what makes
+extrapolating a larger corpus honest rather than decorative.
+
+### Why batch 10 is not available
+
+`ST_MAX_TOKENS=1536` is the obvious ceiling and it is the wrong one — at ~78 output tokens per
+finding it does not bind until roughly 19 findings. **`ST_LLM_TIMEOUT` binds first.** Wall clock
+here tracks output token count with a large per-call constant, and the observed generation rate was
+1.7–3.2 output tokens/sec on laptop CPU, so ten findings' worth of output needs ~270–320s. Batch 10
+straddled the old 300s ceiling and lost.
+
+Raising `ST_BATCH_SIZE` therefore means raising `ST_LLM_TIMEOUT` first. The token ceiling only
+becomes the binding one on a backend fast enough that the clock stops mattering, which is the hosted
+one.
+
+### Variance is the real finding
+
+The same five findings at batch 5 measured **158.7s, 208.4s, and then over 300s**. Same input, same
+batch size, a 2x spread ending in a timeout. Two causes, both real: a laptop CPU under sustained
+load throttles, and a batch the model *declines* writes longer explanations than one it judges — so
+output tokens, which set the wall clock, vary with the answer and not just the input.
+
+A timeout is the worst available outcome, because the full budget is spent and nothing comes back.
+That is what moved this service off the shared `LLM_TIMEOUT` onto its own **`ST_LLM_TIMEOUT`,
+defaulting to 600s**: patience converts a wasted 300s into a slow success, and nothing here is
+latency-sensitive enough to prefer the failure — `/triage` returns a `run_id` immediately and joins
+the work in the background. A copilot answer is one call a human is waiting on; a triage batch is
+one of many inside a background run. One shared knob could only ever be right for one of them.
+
+### The decision
+
+**`ST_BATCH_SIZE` stays 5**, now for a measured reason rather than a guessed one.
+
+The two samples disagree on wall clock — batch 3 led in sample 1, batch 5 led in sample 2 — so at
+n=1 each, throughput does not decide it. What does not disagree is the part with a mechanism behind
+it: batch 5 uses **18% fewer tokens** and **40% fewer requests** per finding than batch 3, in both
+samples, because a fixed 368-token system prompt is amortised across more findings. Requests are the
+scarce unit on a free-tier quota, which charges per call no matter how many findings were in it.
+
+Day 23 guessed 5. It was right, for reasons it could not have known.
+
+### The full corpus, and the token model checked against it
+
+The whole 43 findings, 9 calls at batch 5: **1,781s (29.7 min), 6,352 prompt + 3,472 output
+tokens, 43/43 returned, `needs_human` 4 (9.3%)**.
+
+The point of that run is what it does to the curve fitted from three single calls. Predicting
+9 calls over 43 findings from `368 + 70.5n` and `14 + 78.5n`:
+
+| | predicted | measured | error |
+|---|---|---|---|
+| prompt tokens | 6,343 | 6,352 | **0.13%** |
+| output tokens | 3,501 | 3,472 | **0.85%** |
+
+Three calls' worth of measurement predicted a nine-call run to within 1% on both axes. That is the
+justification for the whole approach: with the token curve in hand, a corpus figure does not need to
+be sat through. It also retires the "extrapolated" caveat the plan expected this table to carry — the
+number is measured, and the extrapolation is what got validated.
+
+`needs_human` at 9.3% is also the first trustworthy reading of that rate. The two 5-finding slices
+had said 0% and 100%; both were artefacts of what happened to be in them.
+
+### Field order is behaviour, not formatting
+
+The full-corpus output showed `priority` **anti-correlated with its own inputs** — `expl=medium
+imp=high` scoring `low`, `expl=low imp=medium` scoring `high`. The prompt says priority is "your
+overall call, weighing both of the above", and the cause is that "above" was false: `priority` was
+the first field in `TriageResult`, and Ollama grammar-constrains generation in declared field order,
+so it was decided before either rating existed.
+
+Reordering to `exploitability → impact → priority → explanation → confidence` — the dependency order
+the prompt always described — measurably changed three things on a 15-finding re-run:
+
+| | before | after |
+|---|---|---|
+| longest explanation | 160 (3 cut mid-clause) | **89** |
+| explanations pinned to the cap | 3 | **0** |
+| priority/rating mismatches | anti-correlated throughout | 8 of 10 |
+
+Explanations stopped truncating, got much terser, and began *citing the ratings above them* — "No
+HEALTHCHECK defined is low exploitability with medium impact." The model is visibly conditioning on
+fields generated earlier, which is chain-of-thought obtained through the schema rather than asked
+for in the prompt.
+
+**It did not fix priority calibration, and the honest version of that is worth more than a claim
+that it did.** The failure changed shape rather than going away: from random anti-correlation to
+consistent *over*-calling, with 8 of 10 judged findings landing on `high`, all at `expl=low,
+imp=medium`. The prompt rule added the same day forbids only the two extremes — high+high is not
+low, low+low is not high — and `low+medium` sits between them, unconstrained. When 80% of findings
+are `high`, the field carries no information whichever way the mismatch counter is banded.
+
+Fixing that means an explicit severity matrix, and validating one needs golden labels to measure
+against rather than 15 unlabelled findings. `bench.py` now reports the mismatch count (`primis`) so
+the defect is tracked rather than rediscovered.
+
+The same reorder, for the same reason, was applied to `log-analyzer`'s `LogAnalysis` on the same day.
+Two services, one structural bug: **whichever field a grammar-constrained schema declares first is
+decided before the model has reasoned about anything.**
+
+### Quality, which is why this is not a throughput benchmark
+
+`ret/sent` was perfect at every size that completed — no dropped or invented fingerprints. And both
+Day 26 prompt problems are fixed and verified on real output:
+
+- **Explanations ran ~270 characters against a prompt asking for one short sentence.** The cause was
+  two bounds disagreeing, only one of which the model treats as real: `max_length` is
+  grammar-constrained token by token during decoding, "one short sentence" is a suggestion. Given a
+  280-character budget it wrote 280 characters. `EXPLANATION_MAX` is now 160, quoted in the prompt
+  *and* enforced in the schema, with a test asserting the two still match. Measured: 84–131
+  characters on judgments.
+- **Explanations asserting "the impact is high" on findings rated `impact: low`.** Each field was
+  individually valid, so every guard passed. The prompt now requires the sentence to agree with the
+  ratings. `bench.py` counts violations; the count is **0** across every config above.
+
+And one correction worth recording, because it cost an hour of chasing the wrong thing: the
+full-corpus run reported **4 contradictions, and all 4 were the checker's fault**. It matched the
+substring `"easily exploit"` inside `"not easily exploitable"` — a phrase that *agrees* with an
+`exploitability: low` rating. A checker that invents violations is worse than one that misses them,
+because it sends you looking for a model bug that was never there. Negation guard and a test are in;
+the true count was 0 all along.
+
+Explanation length pressing the cap turned out to be a symptom of the field-order bug rather than a
+tuning problem. It reached 158–160 while `explanation` was generated before the ratings — the model
+was reasoning *toward* a verdict inside the sentence — and fell to 89 once the ratings came first and
+the sentence only had to report them. `EXPLANATION_MAX` stayed at 160 throughout; nothing about the
+cap changed, only what the model had to do inside it.
+
 ## Tests
 
 ```bash
 cd services/security-triage
-python -m pytest -v   # 26 scanners + 10 provider + 11 triage + 21 fixes + 14 risk
-                      #   + 14 app + 11 comment + 5 runtime = 112, if green
+python -m pytest -v   # 26 scanners + 15 provider + 13 triage + 21 fixes + 14 risk
+                      #   + 14 app + 11 comment + 5 runtime + 10 bench = 129, if green
 ```
 
 `test_scanners.py` (26, Days 22, 24 and 26): each scanner's real shape, a missing-scanner-key envelope, CVE
@@ -703,7 +906,14 @@ uvicorn app:app --port 7300 --workers 1     # --workers 1 is load-bearing, see a
 
 ## Not built yet
 
-- Cost/latency benchmark, Ollama vs. Gemini (Day 27), which is also where the two prompt problems
-  above get fixed with a token measurement attached: explanations that run to ~270 characters, and
-  explanations that assert "the impact is high" on findings the model rated `low`.
 - Metrics, Grafana dashboard, eval harness, deployment to appsrv (Day 28).
+- **Aggregating repeated same-rule findings** — a known ceiling, deliberately not built. Day 27 fixed
+  the B101 flood by not scanning test files, which is the right fix for that case but not a general
+  one: 7 `bandit:B104` and 6 `checkov:CKV2_GHA_1` findings survive, and for a human
+  "bind-to-all-interfaces in 7 places" is one item, not seven. The fingerprint is `(target, line)` by
+  design — right for one triage judgment, wrong for one *report* — so collapsing them is a
+  presentation change, not a dedupe change. 43 findings is a readable report, so this earns its place
+  only on a repo where it isn't.
+- **A `needs_human` rate worth trusting.** The rate measured 0% on a heterogeneous slice and 100% on
+  a lint-heavy one, so the sample decides the number and neither figure is the service's real
+  behaviour. `eval_set.json` (Day 28, already planned) is what turns it into a tracked metric.

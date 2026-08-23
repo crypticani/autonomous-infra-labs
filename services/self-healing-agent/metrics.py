@@ -67,3 +67,18 @@ MODEL_RETRIES = Counter(
     "Transient model failures retried rather than surfaced",
     ["status"],  # the HTTP status the model API returned
 )
+
+# Day 27. What a diagnosis costs, which for this service is the one number none of the
+# metrics above capture: DIAGNOSIS_DURATION says how long the user waited, and this says
+# what was spent getting there. A diagnosis is four to six chained turns and each turn
+# re-sends the whole transcript, so tokens grow super-linearly in turn count -- a
+# diagnosis that takes two extra turns does not cost two extra turns' worth.
+#
+# "output" includes reasoning tokens, which are billed at the output rate and which this
+# service generates more of than any other here: a tool-selection turn writes almost no
+# prose, so nearly all of its output is thinking.
+MODEL_TOKENS = Counter(
+    "sha_model_tokens",
+    "Tokens billed, by direction",
+    ["direction"],  # prompt | output
+)

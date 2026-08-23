@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import logging
+import time
 from typing import List, Dict, Any
 
 from rich.console import Console
@@ -38,9 +39,20 @@ def run_case(provider: BaseLLMProvider, case: Dict[str, Any]) -> Dict[str, Any]:
     """
     Executes a single test case.
     Returns the parsed actual severity, pass/fail status, and raw analysis.
+
+    Day 27 additions: wall clock and token counts per case. This harness already sends
+    five genuinely different logs -- a two-line retry, a multi-error cascade -- and the
+    spread of cost across them *is* this service's cost model, since prompt eval scales
+    with log length. Measuring it here rather than in a separate benchmark keeps one
+    runner, and makes the eval answer "what does this cost" as well as "is it still right".
     """
     expected = case.get("expected_severity")
     raw_log = case.get("raw_log")
+
+    # The provider's counters are cumulative across every case in this run, so each
+    # case's own usage is a delta.
+    prompt_before, output_before = provider.prompt_tokens, provider.output_tokens
+    started = time.monotonic()
 
     try:
         analysis = provider.generate(
@@ -59,6 +71,10 @@ def run_case(provider: BaseLLMProvider, case: Dict[str, Any]) -> Dict[str, Any]:
             "likely_cause": analysis.likely_cause,
             "suggested_fix": analysis.suggested_fix,
             "error": None,
+            "elapsed": time.monotonic() - started,
+            "prompt_tokens": provider.prompt_tokens - prompt_before,
+            "output_tokens": provider.output_tokens - output_before,
+            "log_chars": len(raw_log or ""),
         }
     except Exception as e:
         return {
@@ -68,6 +84,12 @@ def run_case(provider: BaseLLMProvider, case: Dict[str, Any]) -> Dict[str, Any]:
             "likely_cause": "N/A",
             "suggested_fix": "N/A",
             "error": str(e),
+            # A failed case still burned wall clock, and may still have been billed --
+            # a malformed-JSON response is generated and charged before it fails to parse.
+            "elapsed": time.monotonic() - started,
+            "prompt_tokens": provider.prompt_tokens - prompt_before,
+            "output_tokens": provider.output_tokens - output_before,
+            "log_chars": len(raw_log or ""),
         }
 
 
@@ -80,6 +102,10 @@ def print_report(results: List[Dict[str, Any]]) -> bool:
     table.add_column("Actual", style="magenta")
     table.add_column("Status", justify="center")
     table.add_column("Conf", justify="right")
+    table.add_column("Log ch", justify="right", style="dim")
+    table.add_column("Sec", justify="right", style="dim")
+    table.add_column("Tok in", justify="right", style="dim")
+    table.add_column("Tok out", justify="right", style="dim")
 
     total = len(results)
     passed_count = 0
@@ -97,9 +123,38 @@ def print_report(results: List[Dict[str, Any]]) -> bool:
         else:
             status_text = "[red]FAIL[/red]"
 
-        table.add_row(case_id, expected, actual, status_text, f"{confidence:.2f}")
+        table.add_row(
+            case_id,
+            expected,
+            actual,
+            status_text,
+            f"{confidence:.2f}",
+            str(r["result"]["log_chars"]),
+            f"{r['result']['elapsed']:.1f}",
+            str(r["result"]["prompt_tokens"]),
+            str(r["result"]["output_tokens"]),
+        )
 
     console.print(table)
+
+    # The cost line. Totals plus the per-call spread, because a mean over five logs of
+    # very different sizes hides the thing worth knowing -- what a big log costs versus a
+    # small one is the scaling behaviour, and one average reports neither end of it.
+    seconds = [r["result"]["elapsed"] for r in results]
+    prompt_tokens = sum(r["result"]["prompt_tokens"] for r in results)
+    output_tokens = sum(r["result"]["output_tokens"] for r in results)
+    console.print(
+        f"\n[bold]Cost:[/bold] {total} calls, {sum(seconds):.1f}s total, "
+        f"{min(seconds):.1f}-{max(seconds):.1f}s per call, "
+        f"{prompt_tokens} prompt + {output_tokens} output tokens "
+        f"({(prompt_tokens + output_tokens) / total:.0f} tokens/call avg)"
+    )
+    if prompt_tokens == 0:
+        # Loud rather than a quiet row of zeros: this provider reported no usage at all,
+        # so the cost columns above are meaningless and should not be copied anywhere.
+        console.print(
+            "[yellow]No token counts reported -- the cost figures above are not real.[/yellow]"
+        )
 
     console.print("\n[bold]Manual Review: Generative Fields[/bold]")
     for r in results:

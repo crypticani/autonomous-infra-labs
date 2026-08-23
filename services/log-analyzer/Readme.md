@@ -82,6 +82,113 @@ service can never drift apart.
 LLM_PROVIDER=ollama python eval/run_eval.py   # exits non-zero if any case fails (CI-friendly)
 ```
 
+### Day 27: it had silently regressed to 2/5
+
+The rubric above was validated against `qwen2.5-coder:3b`. The service's model later moved to
+`qwen2.5-coder:7b` and **nobody re-ran the eval**, so it went from passing to 2/5 without a signal.
+Day 27 found it only because measuring cost-per-run meant executing the harness for its token
+counts. An eval that exists, passes once, and is never run again is not a safety net — it is a
+record of one afternoon.
+
+All three failures collapsed to `MEDIUM`, at confidence 0.80–0.95:
+
+| case | log | expected | got |
+|---|---|---|---|
+| TC-001 | timeout, succeeded on retry 2/3 | LOW | MEDIUM |
+| TC-003 | `CrashLoopBackOff: OOMKilled … restart count 5` | HIGH | MEDIUM |
+| TC-005 | node `NotReady`, evicting 14 pods across 2 namespaces | CRITICAL | MEDIUM |
+
+**And on TC-001 the model was right and the rubric was wrong.** The old `MEDIUM` clause read
+"transient errors that self-recovered *or have a working retry/fallback*" — which describes TC-001
+exactly. The rubric instructed the answer the eval then marked as a failure.
+
+That is the actual defect: the rubric mixed **blast radius** and **recovery status** into one ladder,
+and the recovery axis dominated, because in a microservice/k8s world nearly everything technically
+recovers — retries succeed, pods restart. `MEDIUM` became an attractor that swallowed everything.
+TC-003 shows how far: `restart count 5` inside `CrashLoopBackOff` reads as "it's restarting, so it
+recovered", when five restarts is precisely the opposite.
+
+**The Day 27 fix** splits the two axes and demotes recovery from a category to a bounded modifier:
+rate on blast radius first, ignoring recovery; then lower by at most one level, and only if recovery
+was complete with no request affected; and explicitly, *repetition is not recovery* — retries that
+keep firing, a restart count above one, or `CrashLoopBackOff` do not get lowered at all.
+
+### But the score was never a measurement in the first place
+
+```python
+payload = {
+    ...
+    "temperature": temperature,   # top level -- Ollama ignores this
+}
+```
+
+**Ollama reads `temperature` from `options`, not the top level.** Every call this service has ever
+made ran at Ollama's default 0.8, including `run_eval.py`, which passes `0.0` explicitly and believed
+it. So identical logs returned different severities on consecutive runs, and "it scores 2/5" was
+never a fact about the prompt:
+
+| case | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| TC-003 | MEDIUM | MEDIUM | CRITICAL |
+| TC-004 | CRITICAL | HIGH | MEDIUM |
+| TC-005 | MEDIUM | CRITICAL | MEDIUM |
+
+Three runs, same five logs, no code change between two of them. An eval on a sampling model is a
+coin flip with a report attached — and this one had been used as evidence that the rubric worked.
+
+The repo already knew: `security-triage/tests/test_provider.py` asserts this exact thing about its
+own payload, in a comment written days earlier. Knowledge being recorded somewhere in the same repo
+is not the same as it being applied.
+
+**Fixing it is necessary but not sufficient**, and the honest version matters here. Even at
+`temperature: 0.0` this backend is not reproducible — Ollama's prompt-cache reuse and batch splits
+can flip a near-tie logit, which `security-triage/provider.py` had already noted as "temp 0 removes
+sampling noise, not batch-dependent variance". Post-fix runs scored 3/5 and 2/5 with byte-identical
+prompt token counts. So a 5-case exact-match eval on local Ollama cannot resolve a difference smaller
+than about one case, and no single run of it should be quoted as a score.
+
+What did stabilise is TC-001: `LOW` in both post-fix runs, having been `MEDIUM` before. That is the
+case the old rubric *instructed* wrongly, so the rubric split is doing real work. TC-003 and TC-004
+remain open, and are left open deliberately rather than tuned against a noisy five-point signal —
+that way lies fitting the prompt to the measurement error.
+
+Two guards were added so neither bug can return silently: one asserting `temperature` lands inside
+`options`, and one asserting `severity` is declared after the reasoning fields. Both are payload- and
+schema-shape tests, which is what the existing suite lacked — every other test here mocks `generate`
+outright, so nothing had ever looked at what gets sent.
+
+### Cost per run — Day 27
+
+Measured over the same five golden cases, Ollama `qwen2.5-coder:7b` on laptop CPU. `run_eval.py`
+now reports these itself, so the eval answers "what does it cost" alongside "is it still right".
+
+```
+5 calls, 168.6s total, 28.0-41.0s per call
+2,067 prompt + 388 output tokens  (491 tokens/call average)
+```
+
+This is the cheapest call in the repo and the reason is worth naming: **the prompt is mostly fixed
+overhead.** Logs ranged 106–289 characters while prompt tokens ranged only 382–455, which fits
+roughly `321 + 0.46 x chars` — so for logs this size, **65–85% of every call is the system prompt**
+(which carries the full JSON schema inline). Log length barely moves the bill.
+
+That is the same lesson security-triage's batch-size sweep produced from the other end: a fixed
+per-call prompt dominates, so the way to spend less is to make fewer, fuller calls. Here there is
+nothing to batch — one log per request is the service's contract — so the fixed cost is simply paid
+each time, and it is what a smaller model would save most on.
+
+Two other Day 27 changes came out of measuring this:
+
+- **`LLM_TIMEOUT`, replacing a hardcoded 60s.** The five cases measured 23.2–60.1s, so 60 sat inside
+  the noise: TC-001 took 40.3s on one run and timed out at 60.1s on the next, turning a passing case
+  into a `PARSE_ERROR` for reasons unrelated to the model's answer. Now the same env var
+  knowledge-copilot uses against the same Ollama host, defaulting to 300.
+- **`thoughts_token_count` was being dropped** from the Gemini branch of `LLM_TOKENS_TOTAL`, which
+  counted only `candidates_token_count`. Reasoning tokens bill at the output rate — a one-word answer
+  measured 1 candidate token against 119 thinking tokens — so **every Gemini completion figure this
+  counter has recorded since Day 5 is an undercount**, by up to two orders of magnitude on short
+  answers. Fixed here and avoided in the three other services instrumented the same day.
+
 ## Running locally
 
 **Direct:**

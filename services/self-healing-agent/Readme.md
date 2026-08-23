@@ -710,6 +710,37 @@ Retaking the recording needs a different `fingerprint` in step 2 (or a wait past
 `SHA_ALERT_DEDUP_TTL`, an hour by default) — `alerts.py`'s dedup table is exactly what would
 otherwise swallow every retake as a duplicate.
 
+## Day 27 — what a diagnosis costs
+
+`provider.py` now accumulates `prompt_tokens` / `output_tokens` across every `chat()` turn, and
+increments a `sha_model_tokens{direction}` counter on `/metrics`. Cumulative is the only useful shape
+here: `agent.py` runs four to six chained turns inside one diagnosis and never surfaces the
+individual ones, so "what did that diagnosis cost" is a delta around the whole loop rather than a
+per-call reading. Only the attempt that returned is counted — a retried 503 was never served and so
+was never billed, the same reasoning that keeps retries out of `guardrails.check_llm_call()`.
+
+`DIAGNOSIS_DURATION` already said how long a user waited; this says what was spent getting there. The
+two are not interchangeable, because each turn re-sends the whole transcript — so tokens grow
+super-linearly in turn count, and a diagnosis that takes two extra turns costs more than two extra
+turns' worth.
+
+Reasoning tokens are counted as output, and this is the service where that matters most: a
+tool-selection turn writes almost no prose, so nearly all of its output is thinking that
+`candidates_token_count` does not see.
+
+**This is the one service where Ollama was not an option.** `get_agent_provider()` accepts only
+`"gemini"` and raises otherwise — generation against CPU-only Ollama measured 165–204s per turn in
+week 2, which is twenty minutes for one answer. Day 27's rule was Ollama wherever feasible; here
+there is no Ollama path to be feasible.
+
+**No number is recorded yet**, deliberately marked not-measured rather than estimated: unlike the
+other three services this one needs a live cluster and an injected failure, not a fixture. The
+instrumentation is what Day 27 owed it — any real diagnosis now reports its own cost:
+
+```bash
+curl -s localhost:8080/metrics | grep sha_model_tokens
+```
+
 ## Not built yet
 
 - The Prometheus/Alertmanager auto-detection leg above (`kube-state-metrics` is deployed and

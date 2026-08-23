@@ -30,14 +30,20 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = int(os.getenv("ST_BATCH_SIZE", "5"))
 
-SYSTEM_PROMPT = """You are a security triage assistant. You are given findings already \
+# One number, used twice: as the schema's hard cap and as the figure the prompt quotes.
+# They have to agree, and on Day 26 they did not -- see the Field comment below.
+EXPLANATION_MAX = 160
+
+SYSTEM_PROMPT = f"""You are a security triage assistant. You are given findings already \
 produced by real scanners (Trivy, Bandit, Checkov) -- your job is not to find more \
 issues, it is to judge the ones you're given.
 
-For each finding, judge:
+For each finding, judge, in this order:
 - exploitability: how easy this is to actually trigger here (low/medium/high)
 - impact: the blast radius if it is triggered (low/medium/high)
-- priority: your overall call, weighing both of the above
+- priority: your overall call, and it must follow from the two ratings you just made. \
+High exploitability with high impact is not a low priority. Low exploitability with low \
+impact is not a high one. If your priority does not follow from them, change it.
 
 Rules:
 - Return exactly one result per finding you were given, using its fingerprint exactly \
@@ -47,22 +53,48 @@ genuinely needs a human's judgment -- set priority to "needs_human" instead of \
 guessing at a severity.
 - confidence is your own calibrated certainty in this specific judgment, 0.0-1.0. It is \
 not the scanner's severity field restated as a decimal.
-- explanation is one short sentence, plain language. State your judgment; do not \
-enumerate hypothetical cases ("if it can be exploited... if it cannot...").
+- explanation is one short sentence of at most {EXPLANATION_MAX} characters, plain \
+language. State your judgment; do not enumerate hypothetical cases ("if it can be \
+exploited... if it cannot...").
+- explanation must agree with the exploitability and impact you assigned to the same \
+finding. Do not write that the impact is high on a finding you rated impact low, and do \
+not describe something as easily exploitable when you rated exploitability low. If the \
+sentence and the ratings disagree, change one of them before answering.
 """
 
 
 class TriageResult(BaseModel):
+    # Field order is load-bearing. Ollama grammar-constrains generation to this schema in
+    # declared order, so a field is decided before every field below it exists. Until
+    # Day 27 `priority` came first, which made the prompt's "your overall call, weighing
+    # both of the above" impossible to follow -- there was nothing above it yet. The model
+    # guessed a verdict, then filled in the ratings, and the full-corpus run shows the
+    # result: priority came out *anti-correlated* with its own inputs, `expl=medium
+    # imp=high` landing on `low` while `expl=low imp=medium` landed on `high`.
+    #
+    # The order below is the dependency order the prompt always described: the two
+    # component judgments, then the call that weighs them, then the sentence explaining a
+    # verdict that already exists, then certainty about it. Same fix as
+    # log-analyzer/log_analyzer.py's LogAnalysis the same day -- reasoning before
+    # conclusion, expressed through the schema rather than asked for in the prompt.
     fingerprint: str
-    priority: Literal["critical", "high", "medium", "low", "needs_human"]
     exploitability: Literal["low", "medium", "high"]
     impact: Literal["low", "medium", "high"]
+    priority: Literal["critical", "high", "medium", "low", "needs_human"]
     # max_length is in the JSON schema Ollama grammar-constrains against, not just a
     # post-hoc check: found live on 2026-08-19, qwen2.5-coder:1.5b fell into a repeating
     # conditional ("if it can be exploited... if it cannot...") dozens of times over on
     # an unbounded `str`. A hard cap stops the loop during decoding; repeat_penalty
     # alone (below) wasn't enough to stop it from starting.
-    explanation: str = Field(max_length=280)
+    #
+    # 160, down from Day 23's 280, because 280 was doing two jobs badly. Day 26's output
+    # ran ~270 characters against a prompt asking for one short sentence, and the reason
+    # is that only one of those two bounds is real to the model: the grammar constraint
+    # is enforced token by token during decoding, "one short sentence" is a suggestion.
+    # Given a 280-character budget it wrote 280 characters. The fix is to make the hard
+    # bound mean what the soft one asked for, and to quote the same number in the prompt
+    # so they cannot drift apart again -- test_triage.py asserts they still match.
+    explanation: str = Field(max_length=EXPLANATION_MAX)
     confidence: float = Field(ge=0.0, le=1.0)
 
 

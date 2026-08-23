@@ -24,6 +24,15 @@ class BaseLLMProvider(ABC):
     name: str
     model_name: str
 
+    # Cumulative tokens across every generate(), read by delta -- snapshot, call,
+    # subtract. Day 27 needs the numbers; generate()'s return type stays a plain string
+    # because retrieval.py consumes it and has no business knowing tokens exist. Plain
+    # ints so `+=` rebinds per instance rather than sharing a mutable class default.
+    # Prompt eval is the number that matters here: it scales with k and with chunk size,
+    # which is why a RAG answer costs what it does on CPU.
+    prompt_tokens = 0
+    output_tokens = 0
+
     @abstractmethod
     def generate(
         self, system_prompt: str, user_prompt: str, temperature: float = 0.1
@@ -69,7 +78,11 @@ class OllamaProvider(BaseLLMProvider):
                 f"the model backend is unreachable: {e}", 503, provider=self.name
             ) from e
 
-        answer = (response.json().get("response") or "").strip()
+        body = response.json()
+        self.prompt_tokens += body.get("prompt_eval_count") or 0
+        self.output_tokens += body.get("eval_count") or 0
+
+        answer = (body.get("response") or "").strip()
         if not answer:
             raise UpstreamError(
                 "the model returned an empty response", 502, provider=self.name
@@ -103,6 +116,15 @@ class GeminiProvider(BaseLLMProvider):
             raise UpstreamError(
                 f"the model API returned an error: {e}", 502, provider=self.name
             ) from e
+
+        if usage := response.usage_metadata:
+            self.prompt_tokens += usage.prompt_token_count or 0
+            # Thinking tokens bill as output. See log_analyzer.py for the measurement
+            # that caught this being dropped.
+            self.output_tokens += (usage.candidates_token_count or 0) + (
+                usage.thoughts_token_count or 0
+            )
+
         answer = (response.text or "").strip()
         if not answer:
             raise UpstreamError(

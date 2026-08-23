@@ -101,6 +101,14 @@ class BaseAgentProvider(ABC):
     name: str
     model_name: str
 
+    # Cumulative tokens across every chat() turn this provider has served. Cumulative is
+    # the only useful shape here: agent.py runs four to six chained turns inside one
+    # diagnosis and never surfaces the individual ones, so "what did that diagnosis
+    # cost" is a delta around the whole loop, not a per-call reading. Plain ints so `+=`
+    # rebinds per instance rather than sharing a mutable class default.
+    prompt_tokens = 0
+    output_tokens = 0
+
     @abstractmethod
     def user(self, text: str) -> Any:
         """A user message, in this provider's transcript format."""
@@ -240,6 +248,24 @@ class GeminiProvider(BaseAgentProvider):
                     f"(attempt {attempt}/{MAX_RETRIES})"
                 )
                 time.sleep(delay)
+
+        # Only the attempt that came back is counted. A retried 503 was never served, so
+        # it was never billed either -- same reasoning that keeps retries out of
+        # guardrails.check_llm_call().
+        if usage := response.usage_metadata:
+            prompt_tokens = usage.prompt_token_count or 0
+            # Thinking tokens bill as output, and this service is the one that would feel
+            # it most: a tool-selection turn writes almost no prose, so nearly all of its
+            # output cost is reasoning that candidates_token_count does not see.
+            output_tokens = (usage.candidates_token_count or 0) + (
+                usage.thoughts_token_count or 0
+            )
+            self.prompt_tokens += prompt_tokens
+            self.output_tokens += output_tokens
+            # Both sinks on purpose: the attributes are for a caller measuring one
+            # diagnosis by delta, the counter is for Grafana across all of them.
+            metrics.MODEL_TOKENS.labels(direction="prompt").inc(prompt_tokens)
+            metrics.MODEL_TOKENS.labels(direction="output").inc(output_tokens)
 
         calls = tuple(
             ToolCall(name=call.name, args=call.args or {}, id=call.id)

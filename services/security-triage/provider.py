@@ -36,10 +36,24 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Shared with knowledge-copilot's LLM_TIMEOUT: same physical CPU-Ollama host on appsrv,
-# same reason 120s wasn't enough there (195s measured for one grounded answer). Day 23's
-# own verify step measures whether a batch needs longer than that.
-LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "300"))
+# Its own variable as of Day 27, no longer sharing knowledge-copilot's LLM_TIMEOUT. Two
+# reasons, and the measurement forced both.
+#
+# 300s was not enough. One batch of 5 findings measured 158.7s, 208.4s, and then >300s --
+# the same five findings, the same batch size, timing out on the third attempt. A CPU
+# under sustained load throttles, and a batch the model declines writes longer
+# explanations than one it judges, so output tokens (which set the wall clock here at
+# ~2.5-3 tok/s) vary with the *answer*, not just the input. A timeout is the worst
+# available outcome: the full 300s is spent and nothing comes back, so the batch is
+# re-run from scratch. 600s buys the headroom that turns a wasted 300s into a slow
+# success, and nothing here is latency-sensitive enough to prefer the failure -- /triage
+# returns a run_id immediately and joins the work in the background (Day 25).
+#
+# And these two services genuinely want different numbers: a copilot answer is one call a
+# human is waiting on, a triage batch is one of many inside a background run. One shared
+# knob could only ever be right for one of them. Every other setting here already carries
+# the ST_ prefix; this one was the outlier.
+LLM_TIMEOUT = int(os.getenv("ST_LLM_TIMEOUT", "600"))
 
 # Found live on 2026-08-19: an identical prompt to a clean 47s/~750-token run instead
 # generated 3,613+ tokens and never stopped, filling the 4096 context. Greedy decoding
@@ -53,6 +67,23 @@ MAX_TOKENS = int(os.getenv("ST_MAX_TOKENS", "1536"))
 class BaseTriageProvider(ABC):
     name: str
     model_name: str
+
+    # Cumulative tokens across every generate() this provider has served. Attributes
+    # rather than a second return value because triage.py consumes generate()'s text and
+    # has to keep working without knowing tokens exist -- Day 27 needs the numbers, the
+    # pipeline does not. Cumulative rather than per-call so a caller that makes several
+    # calls (bench.py sweeping a batch size, or self-healing-agent's multi-turn diagnosis
+    # using the same shape) reads one delta instead of summing. Same read-by-delta
+    # contract log-analyzer's LLM_TOKENS_TOTAL counter already has.
+    #
+    # Plain ints, not a dict: `self.prompt_tokens += n` rebinds on the instance, so a
+    # class-level default cannot be silently shared the way a mutable one would be.
+    #
+    # ponytail: unsynchronised on an lru_cache'd singleton, so concurrent /triage runs
+    # interleave their increments. Totals stay right, a delta straddling another run's
+    # calls does not; bench.py is sequential and is the only reader that takes deltas.
+    prompt_tokens = 0
+    output_tokens = 0
 
     @abstractmethod
     def generate(self, system: str, user: str, schema: type[BaseModel]) -> str:
@@ -123,7 +154,14 @@ class OllamaProvider(BaseTriageProvider):
                 f"the model backend is unreachable: {e}", 503, provider=self.name
             ) from e
 
-        answer = (response.json().get("response") or "").strip()
+        body = response.json()
+        # prompt_eval_count is the system prompt plus the batch; eval_count is the JSON
+        # it wrote back. The first is what makes batching pay -- the system prompt is
+        # charged once per call regardless of how many findings ride along.
+        self.prompt_tokens += body.get("prompt_eval_count") or 0
+        self.output_tokens += body.get("eval_count") or 0
+
+        answer = (body.get("response") or "").strip()
         if not answer:
             raise TriageProviderError(
                 "the model returned an empty response", 502, provider=self.name
@@ -139,8 +177,14 @@ class GeminiProvider(BaseTriageProvider):
             logger.error("GEMINI_API_KEY is not set in the environment")
         # Its own variable, not GEMINI_MODEL or SHA_GEMINI_MODEL: Gemini's free-tier
         # quota is scoped per-project-per-model, and Day 21 already lost a diagnosis to
-        # two services silently sharing one model name's bucket.
-        self.model_name = os.getenv("ST_GEMINI_MODEL", "gemini-3.6-flash")
+        # two services silently sharing one model name's bucket. That is also why this
+        # moved to 3.7 alone on Day 27 rather than every service moving with it -- a repo
+        # where all four name the same model has one bucket for four workloads, and the
+        # isolation is worth more here than uniformity.
+        #
+        # 3.7-flash over 3.6: cheaper per token on the paid tier, and verified reachable
+        # on this key on 2026-08-22 before anything was pointed at it.
+        self.model_name = os.getenv("ST_GEMINI_MODEL", "gemini-3.7-flash")
         self.client = genai.Client()
         logger.info(f"GeminiProvider using {self.model_name}")
 
@@ -160,6 +204,19 @@ class GeminiProvider(BaseTriageProvider):
             raise TriageProviderError(
                 f"the model API returned an error: {e}", 502, provider=self.name
             ) from e
+
+        # usage_metadata is None when the request never reached billing at all -- a safety
+        # block, say -- so this is a real branch, not defensive noise.
+        if usage := response.usage_metadata:
+            self.prompt_tokens += usage.prompt_token_count or 0
+            # thoughts_token_count belongs in output, not dropped: reasoning tokens are
+            # billed at the output rate. Measured on 2026-08-22 while checking the quota
+            # was still alive -- "reply with the single word ok" spent 119 thinking tokens
+            # to produce 1 candidate token, so counting candidates alone would have
+            # understated that call's output cost by 120x and made Gemini look free.
+            self.output_tokens += (usage.candidates_token_count or 0) + (
+                usage.thoughts_token_count or 0
+            )
 
         answer = (response.text or "").strip()
         if not answer:

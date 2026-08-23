@@ -39,6 +39,13 @@ LLM_TOKENS_TOTAL = Counter(
     ["provider", "token_type"],
 )
 
+# Was a hardcoded 60. Day 27 measured this service's five golden cases at 23.2-60.1s per
+# call on laptop CPU, so 60 sat inside the noise -- the same TC-001 log took 40.3s on one
+# run and timed out at 60.1s on the next, turning a passing case into a PARSE_ERROR for
+# reasons that had nothing to do with the model's answer. Matches knowledge-copilot's
+# LLM_TIMEOUT, which is the same env var against the same Ollama host.
+LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "300"))
+
 ANALYSIS_SYSTEM_PROMPT = """
 You are a Senior DevOps Engineer with expertise in analyzing error logs.
 Analyze the following log.
@@ -47,22 +54,52 @@ Analyze the following log.
 3. Suggest one concrete remediation step.
 Do not hallucinate or invent metrics not present in the log.
 
-CRITICAL INSTRUCTION - You MUST use the following severity rubric:
-- CRITICAL: cascading impact across multiple services, unrecoverable data loss/corruption, security breach, or complete customer-facing outage with no fallback.
-- HIGH: significant degradation or outage of a single service, no data loss, but trending toward escalation if unaddressed.
-- MEDIUM: degraded performance or transient errors that self-recovered or have a working retry/fallback, limited user impact.
-- LOW: isolated, non-recurring anomaly with no meaningful user impact.
+CRITICAL INSTRUCTION - You MUST use the following severity rubric.
+
+Step 1. Rate on blast radius alone. Ignore, for now, whether anything recovered.
+- CRITICAL: more than one service affected, or unrecoverable data loss/corruption, or a security
+  breach, or a complete customer-facing outage.
+- HIGH: one service is down, crashing, or significantly degraded.
+- MEDIUM: one service is still serving but degraded, with limited user impact.
+- LOW: an isolated anomaly with no meaningful user impact.
+
+Step 2. Then apply recovery as an adjustment, at most one level down.
+- Recovery is NOT a severity level of its own. Do not rate something MEDIUM because it recovered;
+  rate it on step 1 and then adjust.
+- Lower by one level only if recovery was complete AND no request or user was affected.
+- Repetition is not recovery. Retries that keep firing, a restart count above one, or
+  CrashLoopBackOff mean the failure is ongoing - do not lower those at all.
 """
 
 
 class LogAnalysis(BaseModel):
-    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    # Field order is load-bearing, not cosmetic. Ollama grammar-constrains generation to
+    # this schema in declared order, so whichever field comes first is decided before the
+    # others exist. With `severity` first, the model committed to a label before writing a
+    # word of reasoning, then reasoned correctly about a verdict it could no longer
+    # revise -- measured on Day 27, where TC-004's own likely_cause named two failing
+    # services under a HIGH label, and TC-003's said "being killed again" under MEDIUM.
+    # Prose right, label wrong, same call.
+    #
+    # Reasoning first, label second, is chain-of-thought expressed through the schema
+    # rather than through the prompt: severity is now generated conditioned on the text
+    # above it. `confidence` stays last for the same reason -- it should be a judgment
+    # about a verdict that already exists.
     likely_cause: str
     suggested_fix: str
+    severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
     confidence: float = Field(ge=0.0, le=1.0)
 
 
 class BaseLLMProvider(ABC):
+    # Cumulative tokens, alongside the Prometheus counter above rather than instead of
+    # it: the counter feeds Grafana, these feed Day 27's cost benchmark, which would
+    # otherwise have to reach into the registry to read a number this module already has.
+    # Read by delta -- snapshot, call, subtract. Plain ints so `+=` rebinds per instance
+    # and a class-level default is never shared.
+    prompt_tokens = 0
+    output_tokens = 0
+
     @abstractmethod
     def generate(
         self, system_prompt: str, user_prompt: str, temperature: float = 0.1
@@ -93,25 +130,40 @@ class OllamaProvider(BaseLLMProvider):
             "model": self.model_name,
             "system": json_system_prompt,
             "prompt": user_prompt,
-            "temperature": temperature,
+            # "options", not top level. Ollama silently ignores a top-level temperature,
+            # which is where this sat until Day 27 -- so every call this service has ever
+            # made ran at Ollama's default 0.8, including the eval harness that passes
+            # 0.0 explicitly. That is why the golden set returned different severities for
+            # byte-identical logs on three consecutive runs, and why "it scores 2/5" was
+            # never a fact about the prompt. An eval on a sampling model is a coin flip
+            # with a report attached.
+            #
+            # The repo already knew: security-triage's test_provider.py asserts this exact
+            # thing about its own payload. The knowledge it takes to avoid a bug being
+            # written down somewhere else in the same repo is not the same as avoiding it.
+            "options": {"temperature": temperature},
             "stream": False,
             "format": LogAnalysis.model_json_schema(),
         }
 
         try:
             logger.info("Sending request to Ollama API")
-            response = requests.post(url, json=payload, timeout=60)
+            response = requests.post(url, json=payload, timeout=LLM_TIMEOUT)
             response.raise_for_status()
             body = response.json()
             raw_text = body.get("response", "")
 
+            prompt_tokens = body.get("prompt_eval_count", 0)
+            output_tokens = body.get("eval_count", 0)
             LLM_TOKENS_TOTAL.labels(provider="ollama", token_type="prompt").inc(
-                body.get("prompt_eval_count", 0)
+                prompt_tokens
             )
 
             LLM_TOKENS_TOTAL.labels(provider="ollama", token_type="completion").inc(
-                body.get("eval_count", 0)
+                output_tokens
             )
+            self.prompt_tokens += prompt_tokens
+            self.output_tokens += output_tokens
 
             try:
                 parsed_json = json.loads(raw_text)
@@ -162,12 +214,22 @@ class GeminiProvider(BaseLLMProvider):
             raw_text = response.text
             usage = response.usage_metadata
             if usage:
+                prompt_tokens = usage.prompt_token_count or 0
+                # thoughts_token_count was missing here and it is not a rounding error:
+                # measured 2026-08-22, a one-word answer cost 1 candidate token and 119
+                # thinking tokens, all of them billed at the output rate. Every completion
+                # number this counter has recorded for Gemini is an undercount.
+                output_tokens = (usage.candidates_token_count or 0) + (
+                    usage.thoughts_token_count or 0
+                )
                 LLM_TOKENS_TOTAL.labels(provider="gemini", token_type="prompt").inc(
-                    usage.prompt_token_count or 0
+                    prompt_tokens
                 )
                 LLM_TOKENS_TOTAL.labels(provider="gemini", token_type="completion").inc(
-                    usage.candidates_token_count or 0
+                    output_tokens
                 )
+                self.prompt_tokens += prompt_tokens
+                self.output_tokens += output_tokens
 
             try:
                 parsed_json = json.loads(raw_text)

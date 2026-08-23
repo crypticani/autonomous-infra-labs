@@ -1,11 +1,64 @@
+import json
 import pytest
 from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 import requests
 
-from log_analyzer import app, llm_provider, LogAnalysis
+from log_analyzer import app, llm_provider, LogAnalysis, OllamaProvider
 
 client = TestClient(app)
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        return self._payload
+
+
+def test_ollama_sends_temperature_inside_options(monkeypatch):
+    """The bug that made the golden-set eval non-deterministic.
+
+    Ollama ignores a top-level `temperature` and reads `options.temperature`, so this
+    service ran every call at the default 0.8 while the eval harness passed 0.0 and
+    believed it. Identical logs came back with different severities on consecutive runs,
+    which made every score a coin flip. Every other test here mocks `generate` outright,
+    so nothing looked at the payload -- which is exactly how it survived.
+    """
+    sent = {}
+
+    def capture(url, json=None, timeout=None):
+        sent.update(json)
+        return _FakeResponse(
+            {
+                "response": LogAnalysis(
+                    likely_cause="c", suggested_fix="f", severity="LOW", confidence=0.5
+                ).model_dump_json()
+            }
+        )
+
+    monkeypatch.setattr(requests, "post", capture)
+    OllamaProvider().generate("sys", "usr", temperature=0.0)
+
+    assert sent["options"] == {"temperature": 0.0}
+    assert "temperature" not in sent, "a top-level temperature is silently ignored"
+
+
+def test_severity_is_generated_after_the_reasoning_fields():
+    """Field order is a behavioural contract here, not formatting.
+
+    Ollama grammar-constrains generation to the declared order, so a `severity` declared
+    first is chosen before any reasoning exists. Day 27 moved it after `likely_cause` and
+    `suggested_fix`; this fails if someone reorders the model back.
+    """
+    fields = list(LogAnalysis.model_json_schema()["properties"])
+    assert fields.index("severity") > fields.index("likely_cause")
+    assert fields.index("severity") > fields.index("suggested_fix")
+    assert fields.index("confidence") > fields.index("severity")
 
 
 def test_analyze_log_success(monkeypatch):

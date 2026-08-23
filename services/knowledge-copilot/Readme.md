@@ -1452,6 +1452,38 @@ Related, and unfixed: the grounded prompt says "Plain prose, no preamble" and th
 numbered list with three code blocks anyway. Better for that question, but it means the formatting
 instruction is not being honoured — which matters the moment anything depends on it.
 
+## Day 27 — token accounting, and a cost curve not measured
+
+`llm.py`'s provider seam now carries cumulative `prompt_tokens` / `output_tokens`, read by delta,
+matching the shape added to the other three services the same day. The Gemini branch counts
+`thoughts_token_count` alongside `candidates_token_count`, because reasoning tokens bill at the
+output rate — a one-word answer was measured at 1 candidate token against 119 thinking tokens, so
+counting candidates alone understates a short answer by two orders of magnitude.
+
+`bench.py` sweeps **`k`**, not repeated identical questions. Four calls at one `k` would be one
+number with an error bar; four calls across `k` is a scaling curve, and for this service the curve
+*is* the cost model — prompt eval dominates on CPU and prompt length is set almost entirely by how
+many chunks were retrieved. It is the mirror image of security-triage's batch sweep: there a fixed
+system prompt is amortised across more findings so bigger is cheaper per unit, here every extra chunk
+is pure added prompt with nothing amortised against it, so bigger is simply dearer and the question
+is what the retrieval quality is worth.
+
+**The curve is not measured yet, and is marked not-measured rather than estimated.** Two runs were
+attempted on Day 27 and both failed on missing models rather than on anything in this service:
+`nomic-embed-text` and then `qwen2.5:7b-instruct` returned 404 from Ollama. Both are consequences of
+Ollama moving from appsrv to the laptop on 2026-08-21 — the chat model security-triage uses came
+across, these two did not. `ollama pull` for each, then:
+
+```bash
+LLM_PROVIDER=ollama python bench.py \
+  --question "pods keep dying and restarting right after a deploy, exit code 137"
+```
+
+One real cost datum did come out of the failed attempts, and it is worth keeping: **a refusal costs
+0.2s and 0 tokens.** Four `k` values against a question the corpus does not cover all stopped at the
+0.64 similarity floor — best score 0.625 — and never reached the model. The floor pays for itself
+before generation, which is the cheapest possible answer and, when nothing clears it, the correct one.
+
 ## Not built yet
 
 The project ends at Day 14, so nothing here says "next week". These are the things a
