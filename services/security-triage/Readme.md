@@ -91,25 +91,33 @@ after dedupe:       43
 
 **These numbers were 629 raw / 559 deduped until Day 27**, and the difference is one line in
 `scan.sh`. Measuring cost-per-run meant looking at the whole corpus for the first time rather than
-the first 15 findings, and 515 of the 559 — **92%** — turned out to be `bandit:B101`, "use of assert
-detected", inside test files. Five consecutive lines of `test_alertmanager.py` were five separate
-findings. An assert is what a test file is made of, so bandit's own guidance is to exclude test
-paths; the scan was asking for them.
+the first 15 findings, and the overwhelming majority of it turned out to be `bandit:B101`, "use of
+assert detected", inside test files. Five consecutive lines of `test_alertmanager.py` were five
+separate findings. An assert is what a test file is made of, so bandit's own guidance is to exclude
+test paths; the scan was asking for them.
 
-Excluding test paths from bandit takes it from 534 findings to 13. Trivy's count is identical
-across both scans, which is what confirms the delta is the exclusion and not the repo drifting.
+`BANDIT_EXCLUDE` is overridable precisely so this is checkable rather than asserted — running the
+same scan both ways, same repo, same afternoon:
 
-The cost of not having noticed:
+```bash
+BANDIT_EXCLUDE="./venv,./.venv,./node_modules" scan.sh . /tmp/before.json
+scan.sh . /tmp/after.json
+```
 
-| | before | after |
+| | tests scanned | tests excluded |
 |---|---|---|
-| deduped findings | 559 | 43 |
-| model calls at `ST_BATCH_SIZE=5` | 112 | 9 |
-| full-corpus run, CPU Ollama | ~4 hours | ~25–30 min |
+| deduped findings | **841** | **44** |
+| of which `bandit:B101` | 791 (**94%**) | 0 |
+| model calls at `ST_BATCH_SIZE=5` | 168 | 9 |
+| full-corpus run, CPU Ollama | ~6 hours | ~20 min |
+
+(The committed fixture is 43 rather than 44 — it was generated a few commits earlier. The 559 figure
+in the first paragraph is the fixture as committed on 2026-08-21; the 841 above is a same-day
+both-ways scan, which is the honest comparison since the repo grew in between.)
 
 And the part that isn't about cost at all: the model *declines* B101 findings. Sampling five of them
-returned `needs_human` five times out of five, so a full-corpus run would have marked ~92% of its
-output as needing human review — routing 515 non-issues to a person, which is the exact inverse of
+returned `needs_human` five times out of five, so a full-corpus run would have marked ~94% of its
+output as needing human review — routing 791 non-issues to a person, which is the exact inverse of
 what this service is for. Every guard would have stayed green: no invented fingerprints, no dropped
 results, valid JSON throughout. Day 23 found that a model can satisfy every check and produce
 garbage; this is the same lesson one layer earlier, where the *input* satisfies every check and is
@@ -142,18 +150,21 @@ stopping it: `num_predict` (`ST_MAX_TOKENS`, default 1536) turns an infinite han
 `TriageProviderError` in seconds, but a milder `repeat_penalty: 1.05` still let the model fall into
 the same repeating conditional ("if it can be exploited... if it cannot...") dozens of times over —
 just now truncated at 1536 tokens instead of running to 4096. Two changes closed it: a real
-`repeat_penalty: 1.3`, and — the more reliable of the two — a `max_length=280` on
+`repeat_penalty: 1.3`, and — the more reliable of the two — a `max_length` on
 `TriageResult.explanation`, which is part of the JSON schema Ollama grammar-constrains generation
 against, not a check applied after the fact. A sampling parameter is a nudge; a schema bound is a
-guarantee the grammar itself won't produce a longer string, loop or not.
+guarantee the grammar itself won't produce a longer string, loop or not. (That bound was 280 here
+and is `EXPLANATION_MAX = 160` since Day 27 — see the cost section below for why the prompt now
+quotes the same number the schema enforces.)
 
 ## `triage.py` — batched, structured triage
 
 `triage_findings()` chunks deduped findings into groups of `ST_BATCH_SIZE` (default 5) and sends
-one model call per group, asking for `{fingerprint, priority, exploitability, impact,
+one model call per group, asking for `{fingerprint, exploitability, impact, priority,
 explanation, confidence}` per finding — schema-constrained decoding (Ollama's `format`, Gemini's
 `response_schema`) rather than parsing free text, so a malformed answer is a validation error to
-catch, not a regex to write.
+catch, not a regex to write. **That field order is deliberate and was wrong until Day 27** — see
+"Field order is behaviour" below.
 
 Two guards:
 
@@ -387,7 +398,7 @@ GET  /health       -> unauthenticated, reports the policy this process actually 
 
 The ack-now/answer-later split is Day 13's Slack bot and Day 20's `/alerts` again, at a worse ratio:
 one model call per `ST_BATCH_SIZE` findings, minutes each on CPU Ollama. Day 27's scan fix took this
-repo's own fixture from 559 deduped findings to 43 — 9 calls instead of 112 — but 9 calls still runs
+repo's own scan from 841 deduped findings to 44 — 9 calls instead of 168 — but 9 calls still runs
 20+ minutes, so the split is not something the smaller corpus makes optional. A synchronous endpoint
 would time out on every real request, and the caller (a GitHub Actions job) would retry, doubling
 the work it just abandoned. A repo larger than this one puts it straight back into the hundreds.
@@ -670,25 +681,29 @@ it.
 
 ### The sweep
 
-One call per config. Every row is measured, and both samples are shown rather than averaged — two
-points 15% apart tell you something an average hides.
+One call per config, against the cleaned 43-finding corpus. Every row measured.
 
-Sample 1, findings 1–5 (heterogeneous: a chromadb RCE, HEALTHCHECK, ConfigMap secrets, `:latest`):
+| batch | wall | p_tok | o_tok | p_tok/finding | find/min | ret/sent | nhuman | expl max | trunc | contra | primis | tok/1k | calls/1k |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 83.5s | 488 | 90 | 488.0 | 0.72 | 1/1 | 1 | 62 | 0 | 0 | 0 | 578,000 | 1000 |
+| 3 | 77.3s | 618 | 262 | 206.0 | **2.33** | 3/3 | 0 | 118 | 0 | 0 | 2 | 293,333 | 333 |
+| 5 | 129.9s | 770 | 392 | 154.0 | 2.31 | 5/5 | 0 | 89 | 0 | 0 | 4 | 232,400 | 200 |
+| 10 | 339.7s | 1176 | 825 | **117.6** | 1.77 | 10/10 | 0 | 118 | 0 | 0 | 9 | **200,100** | **100** |
 
-| batch | wall | p_tok | o_tok | p_tok/finding | find/min | ret/sent | needs_human | expl max | contra |
-|---|---|---|---|---|---|---|---|---|---|
-| 1 | 82.3s | 442 | 91 | 442.0 | 0.73 | 1/1 | 0 | 84 | 0 |
-| 3 | 79.1s | 572 | 252 | 190.7 | **2.28** | 3/3 | 0 | 120 | 0 |
-| 5 | 158.7s | 724 | 405 | 144.8 | 1.89 | 5/5 | 0 | 131 | 0 |
-| 10 | *timed out at 300s* | — | — | — | — | — | — | — | — |
+`p_tok/finding` falls monotonically — 488 → 206 → 154 → 117.6 — which is the fixed system prompt
+being spread across more findings, and the whole case for batching in one column.
 
-Sample 2, findings 21–25 (five `bandit:B101` asserts in one test file):
+Refitting the curve on these four points: `prompt = 396 + 77.2n`, `output = 6.6 + 81.2n`. Close to
+the fit taken from three calls on the old corpus (`368 + 70.5n` / `14 + 78.5n`), which is the more
+useful result — the per-finding and per-call constants survived the corpus changing underneath them,
+so they are properties of the prompt and the model rather than of one fixture.
 
-| batch | wall | p_tok | o_tok | p_tok/finding | find/min | ret/sent | needs_human | expl max | contra |
-|---|---|---|---|---|---|---|---|---|---|
-| 3 | 169.5s | 616 | 292 | 205.3 | 1.06 | 3/3 | 3 | 160 | 0 |
-| 5 | 208.4s | 813 | 470 | 162.6 | **1.44** | 5/5 | 5 | 158 | 0 |
-| 5 | *timed out at 300s on a third attempt with the same five findings* | | | | | | | | |
+An earlier partial sweep, run before the corpus was cleaned and while `ST_LLM_TIMEOUT` was still
+300s, produced two things this table cannot show. Batch 10 **timed out** at the old ceiling. And the
+same five findings at batch 5 measured 158.7s, 208.4s, then over 300s — a 2x spread on identical
+work, from CPU throttling under sustained load plus the fact that a batch the model declines writes
+longer explanations than one it judges, so output tokens vary with the *answer*. That variance is
+why the timeout moved to 600s, and it is load-bearing for the decision below.
 
 ### The token curve, and a prediction that held
 
@@ -706,17 +721,19 @@ Fitted on batches 1 and 3 alone, the model predicted batch 5 at 702 prompt token
 finding *before that row was measured*. It came in at 724 and 144.8, within 3%. That is what makes
 extrapolating a larger corpus honest rather than decorative.
 
-### Why batch 10 is not available
+### What actually bounds batch size
 
 `ST_MAX_TOKENS=1536` is the obvious ceiling and it is the wrong one — at ~78 output tokens per
-finding it does not bind until roughly 19 findings. **`ST_LLM_TIMEOUT` binds first.** Wall clock
-here tracks output token count with a large per-call constant, and the observed generation rate was
+finding it does not bind until roughly 19 findings. **The timeout binds first.** Wall clock here
+tracks output token count with a large per-call constant, and the observed generation rate was
 1.7–3.2 output tokens/sec on laptop CPU, so ten findings' worth of output needs ~270–320s. Batch 10
-straddled the old 300s ceiling and lost.
+straddled the then-default 300s ceiling and lost.
 
-Raising `ST_BATCH_SIZE` therefore means raising `ST_LLM_TIMEOUT` first. The token ceiling only
-becomes the binding one on a backend fast enough that the clock stops mattering, which is the hosted
-one.
+So raising `ST_BATCH_SIZE` means raising `ST_LLM_TIMEOUT` first, and that is the order this was done
+in — the 600s default makes batch 10 reachable where 300s did not, and the table above is that
+change paying off: **339.7s, completed, 10/10 returned.** The row exists because the timeout moved.
+`ST_MAX_TOKENS` becomes the binding ceiling only on a backend fast enough that the clock stops
+mattering, which is the hosted one.
 
 ### Variance is the real finding
 
@@ -734,15 +751,25 @@ one of many inside a background run. One shared knob could only ever be right fo
 
 ### The decision
 
-**`ST_BATCH_SIZE` stays 5**, now for a measured reason rather than a guessed one.
+**`ST_BATCH_SIZE` stays 5**, and the honest version is that it is not the cheapest option.
 
-The two samples disagree on wall clock — batch 3 led in sample 1, batch 5 led in sample 2 — so at
-n=1 each, throughput does not decide it. What does not disagree is the part with a mechanism behind
-it: batch 5 uses **18% fewer tokens** and **40% fewer requests** per finding than batch 3, in both
-samples, because a fixed 368-token system prompt is amortised across more findings. Requests are the
-scarce unit on a free-tier quota, which charges per call no matter how many findings were in it.
+**Batch 10 is cheaper.** 200,100 tokens per 1,000 findings against batch 5's 232,400, and 100
+requests where batch 5 needs 200 — and on a free-tier quota, requests are the scarce unit. On cost
+alone the default should be 10.
 
-Day 23 guessed 5. It was right, for reasons it could not have known.
+What keeps it at 5 is **margin against the variance measured above**. Batch 10 ran 339.7s, which is
+57% of the 600s timeout; double it, as the same config demonstrably did on a loaded laptop, and it
+exceeds the ceiling and returns nothing. Batch 5 at 129.9s doubles to 260s and still lands. A
+timeout is not a slow answer, it is a lost batch plus the full budget spent — so the cheaper
+configuration is only cheaper when it completes, and 2x variance says batch 10 will not always.
+Throughput agrees but weakly: 2.31 findings/min at batch 5 against 1.77 at batch 10.
+
+There is a quality argument in the same direction, though it is a weaker one because the checker is
+coarse: `primis` — verdicts that contradict their own ratings — climbs with batch size, 0, 2, 4, 9.
+Whatever is going wrong with priority gets worse the more findings share a call.
+
+Day 23 guessed 5. It was right, and not for the reason it assumed: not because bigger batches are
+worse, but because bigger batches on this hardware are less reliable.
 
 ### The full corpus, and the token model checked against it
 

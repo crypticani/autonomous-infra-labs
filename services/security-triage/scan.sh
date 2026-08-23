@@ -66,7 +66,11 @@ checkov -d . --compact -o json \
 # tree including tests with its secret scanner above -- only bandit's Python lint is
 # narrowed, and what is dropped with it (hardcoded passwords in fixtures, binding a test
 # server to 0.0.0.0) is the same category of intentional-in-a-test finding.
-BANDIT_EXCLUDE="./venv,./.venv,./node_modules,*/tests/*,*/test_*.py,*_test.py,*/conftest.py"
+# Overridable, because an onboarding repo's tests may not live in */tests/ -- and because
+# being able to run this both ways is what makes the 92% claim above checkable rather than
+# asserted:
+#   BANDIT_EXCLUDE="./venv,./.venv,./node_modules" scan.sh . /tmp/before.json
+BANDIT_EXCLUDE="${BANDIT_EXCLUDE:-./venv,./.venv,./node_modules,*/tests/*,*/test_*.py,*_test.py,*/conftest.py}"
 if find . -name '*.py' -not -path './venv/*' -not -path './.venv/*' -not -path './node_modules/*' \
     | grep -q .; then
   # Checked here rather than beside trivy and checkov: a repo with no Python genuinely
