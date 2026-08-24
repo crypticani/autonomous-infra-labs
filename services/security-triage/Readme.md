@@ -1140,6 +1140,41 @@ label the metric does not carry renders an empty graph, which is indistinguishab
 service. A `by (repo)` on a metric with no `repo` label is worse, because it collapses every series
 into one and looks like it works.
 
+### Measured on the live deploy, 2026-08-24
+
+Two single-finding runs through the deployed container on appsrv, against Ollama on the laptop over
+Tailscale. Both sent byte-identical work — 430 prompt, 88 output tokens.
+
+| run | wall clock | throughput |
+|---|---|---|
+| first, cold | 86.59s | 1.02 tok/s |
+| second, warm | 22.61s | 3.89 tok/s |
+| model load | **64.0s** | — |
+
+Two things fall out, and the second is the useful one.
+
+**Day 27's token curve holds on a machine it was not fitted on.** It predicted
+`prompt = 368 + 70.5n` and `output = 14 + 78.5n`; at n=1 that is 438.5 and 92.5 against a measured
+430 and 88 — **1.9% and 4.9%**. Fitted on laptop-local calls, validated through a container on
+appsrv over the tailnet.
+
+**The wall clock is dominated by model load, not by the network hop.** The 64s gap is Ollama loading
+`qwen2.5-coder:7b`; warm, this path runs *faster* than the bench machine's measured 1.7–3.2 tok/s
+band, so batch 5 extrapolates to ~104s rather than the 158.7s Day 27 measured locally. The 600s
+`ST_LLM_TIMEOUT` has more headroom here than the measurement that set it, not less.
+
+The operational consequence is that **most real runs will be cold.** Ollama unloads a model after
+`keep_alive` — five minutes by default — and this deploy is triggered sporadically by CI. For a
+full-corpus run the load amortises across nine batches and disappears; for a two-finding pull
+request it *is* the runtime. Deliberately not fixed with a longer `OLLAMA_KEEP_ALIVE`: 64s against
+the reusable workflow's 45-minute poll budget is noise, and pinning ~5GB of laptop RAM permanently
+for a service that runs a few times a day is the wrong trade.
+
+Also worth recording: both runs returned `needs_human` on `bandit:B105`, with identical token counts.
+That is not a contradiction of Day 27's finding that local Ollama is not reproducible at
+`temperature: 0` — that was about *batch composition* changing the prompt. Two identical
+single-finding calls producing identical output is the consistent case.
+
 ### The backend is a laptop, and that is not a bug
 
 The model runs on a laptop over Tailscale, and the laptop does not need to be awake outside a demo.
