@@ -1011,12 +1011,18 @@ start, because the kubelet cannot verify that a *name* is not root. Pinning `--u
 `USER 10001` means the manifest's `runAsUser` and the image agree by construction rather than by
 whatever the base image had spare on build day.
 
-**The manifests pass this service's own gate.** Their own namespace instead of `default`
-(`KSV-0110`, `CKV_K8S_21` — both of which this repo's scan flags on log-analyzer's manifests), an
-explicit `securityContext` at both levels (`KSV-0118`, `KSV-0001`, `CKV_K8S_20`),
-`readOnlyRootFilesystem` with a `/tmp` `emptyDir` under it, and `capabilities: drop: [ALL]`. Shipping
-a fifth manifest set carrying findings that this service exists to triage would be the project
-arguing with itself.
+**The manifests are written against this service's own gate**, and the first dogfood run proved
+that is a claim worth checking rather than making. They carry their own namespace instead of
+`default` (`KSV-0110`, `CKV_K8S_21` — both of which this repo's scan flags on log-analyzer's
+manifests), an explicit `securityContext` at both levels (`KSV-0118`, `KSV-0001`, `CKV_K8S_20`),
+`readOnlyRootFilesystem` with a `/tmp` `emptyDir` under it, and `capabilities: drop: [ALL]`.
+
+The run then flagged two more on them. **`CKV_K8S_38`** was a fair hit and is fixed:
+`automountServiceAccountToken: false`, because this service never calls the Kubernetes API and a
+token it cannot use is a credential in the pod for nothing. **`KSV-0013`, the `:latest` image tag**,
+stands as-is — CI publishes only `:latest` and `.env.example` documents `SECURITY_TRIAGE_TAG` for
+anyone who starts pushing immutable tags. Which is the honest shape of the thing: a gate that finds
+something on its author's own work, one fix and one documented refusal.
 
 `OLLAMA_BASE_URL` in the ConfigMap is `http://ollama-host.invalid:11434` — `.invalid` is reserved by
 RFC 2606 and never resolves, so a deploy that forgot to set it gets a DNS failure recorded on the run
@@ -1353,6 +1359,44 @@ docker compose -f docker-compose.prod.yml pull security-triage
 docker compose -f docker-compose.prod.yml up -d security-triage
 curl -s localhost:7300/health | jq       # `healthy`, or `degraded` with the reason
 ```
+
+## The first dogfood run — 2026-08-24
+
+`SECURITY_TRIAGE_ENDPOINT` set, a throwaway pull request opened, and the comment landed. 131
+findings from the scanners, 58 after dedup, 58 triaged, score capped at **100** against this repo's
+threshold of 60 — a `fail`.
+
+**The gate found two things on this service's own manifests**, written the same day and claimed in
+this Readme to pass it. One is fixed (`CKV_K8S_38`), one is a documented refusal (`:latest`). Details
+above.
+
+**The workflow had a bug that only a live endpoint could surface.** `gh pr comment` needs
+`-R "$GITHUB_REPOSITORY"`, because the `report` job deliberately never checks the caller out and so
+has no git remote to infer the repo from. It failed with `fatal: not a git repository` *after*
+rendering the comment perfectly. Day 25 wrote that step and it had never once run.
+
+**Priority calibration is the open problem, and it moved rather than resolved.** Day 27 found
+`priority` anti-correlated with its own inputs and fixed it by reordering the schema so the ratings
+are generated first. This run is the first full corpus since, and the anti-correlation is gone — but
+the model now over-calls almost everything: **8 critical and 47 high out of 58**, with `B104`
+bind-to-all-interfaces rated `critical` three times and `:latest` rated `critical` once.
+
+The explanations give it away. One row reads `high` with the sentence *"Hardcoded password can be
+exploited, but impact is limited"* — the prose and the label disagree in the same result, which is
+exactly what `bench.py::_priority_mismatches` counts and what the schema reorder was supposed to
+stop. Reasoning-before-conclusion fixed the *direction* of the error without fixing its *magnitude*.
+
+Two of those are already committed bets in `eval_set.json`: `KSV-0013` carries `max: medium` and
+`B106` carries `max: low`. Both came back above their ceiling, so **`eval_triage.py` should fail on
+this model as it stands** — which is the eval working. It has still never been run; that number is
+the next thing worth having.
+
+**The proposed fixes need the caveat they ship with.** Three diffs came back, and one inserts
+`runAsUser: 10001` into log-analyzer's Deployment. That image builds its user with
+`adduser --system` and no `--uid`, so it gets whatever is free in 100–999 — only security-triage's
+image pins 10001. Applying that diff would run the process as a uid that owns none of its files.
+`fixes.py` says this in its own note (*"the value is arbitrary but the effect is not"*), and the
+comment says *review, never apply blind*. This is what that sentence was for.
 
 ## Not built yet
 

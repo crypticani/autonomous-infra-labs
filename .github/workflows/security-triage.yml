@@ -165,10 +165,14 @@ jobs:
           # The caller's token. The service never holds a credential for any repo.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
+          # -R is not optional: this job never checks the caller out, so gh has no git
+          # remote to infer the repo from and dies with "not a git repository". Found on
+          # the first real run, after the endpoint went live.
+          REPO: ${{ github.repository }}
         run: |
           # --edit-last so a five-push PR carries one verdict, not five.
-          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md" --edit-last \
-            || gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" -R "$REPO" --body-file "$RUNNER_TEMP/comment.md" --edit-last \
+            || gh pr comment "$PR" -R "$REPO" --body-file "$RUNNER_TEMP/comment.md"
 
       - name: Apply the gate
         run: |
