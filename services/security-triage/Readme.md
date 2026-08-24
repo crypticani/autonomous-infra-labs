@@ -1085,21 +1085,33 @@ server {
 }
 ```
 
-**Verified 2026-08-24**, and the debugging is worth recording because the symptom is ambiguous in
-this repo in a way it would not be elsewhere. A misconfigured `proxy_pass` returned
-`{"detail":"Not Found"}` — the app's own JSON, so nginx was clearly proxying — and there are *two*
-causes that produce exactly that body:
+**Verified end to end 2026-08-24**, and the debugging is worth recording because both faults
+produced a 404 and neither 404 said which.
 
-- **The wrong upstream port.** All four services here are FastAPI, and every one answers
-  `{"detail":"Not Found"}` for an unknown path. Pointing at `7100` or `7200` gets a sibling
-  service's 404, which is byte-identical to this one's.
-- **A trailing slash on `proxy_pass`.** `proxy_pass http://127.0.0.1:7300/` replaces the matched
-  `location` prefix, so `/triage` arrives as `/` and this app 404s on it. A bare `/` counts as a
-  URI; without one the request URI passes through unchanged.
+**First: the wrong upstream port**, which returned `{"detail":"Not Found"}` -- the app's own JSON, so
+nginx was plainly proxying. That body is ambiguous here in a way it would not be elsewhere: all four
+services in this repo are FastAPI, and every one answers `{"detail":"Not Found"}` for an unknown
+path, so pointing at 7100 or 7200 gets a *sibling service's* 404, byte-identical to this one's. A
+trailing slash on `proxy_pass` produces the same body by a different route -- `proxy_pass
+http://127.0.0.1:7300/` replaces the matched prefix, so `/triage` arrives as `/`. A bare `/` counts
+as a URI; without one the request URI passes through unchanged.
 
-It was the port. The distinguishing signal is `GET /triage`: **405** means the path arrived intact
-and FastAPI recognised the route but refused the method, which no wrong-port or rebased-URI
-configuration can produce. A 404 on that probe says nothing about which of the two it is.
+**Then: `location = /triage` instead of `location /triage`.** The exact-match form proxies `/triage`
+and nothing else, so `POST /triage` worked while `GET /triage/{run_id}` fell through to
+`location / { return 404; }` and returned nginx's own HTML page. This service needs the prefix form
+because the poll URL carries a run id -- unlike the agent's `location = /slack/interactive`, which is
+correctly exact and is the easy thing to copy from.
+
+Two probes separate all of it, and neither needs a live run or a model call:
+
+- **`GET /triage` should be 405.** Path arrived intact, FastAPI knows the route and refused the
+  method. No wrong-port or rebased-URI configuration can produce that.
+- **`GET /triage/does-not-exist` should be `{"detail":"no run 'does-not-exist'"}`.** Proves the
+  *prefix* matches and reaches the app. nginx HTML here means the location is still exact.
+
+A third thing cost time and was nobody's fault: redeploying the container mid-debug wiped `_runs`, so
+a previously valid run id started 404ing from the app just as the nginx fix landed -- two different
+404s a minute apart. That is the in-process store's documented tradeoff arriving live.
 
 `/metrics` and `/health` are deliberately **not** routed. Both are unauthenticated, both are reached
 over loopback on the host — Prometheus for the first, the container's own healthcheck for the second
