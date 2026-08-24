@@ -40,8 +40,57 @@ jobs:
         # error in it breaks every onboarded repo's CI rather than this one's.
         run: bash -n services/security-triage/scan.sh
 
-  # No validate-manifests and no build-and-push yet, unlike the other three workflows:
-  # this service has neither a Dockerfile nor k8s/ until Day 28, and a publish job
-  # pointing at a context that does not exist is a red X on every merge to main. Both
-  # jobs land with the image, copying self_healing_agent_ci.yml including its
-  # push-to-main-only guard.
+      - name: Check the cross-service eval runner
+        # eval_all.py lives at the repo root and is not covered by any service's tests.
+        # --selftest checks its EVAL_RESULT parsing and that every command it names still
+        # exists -- the failure it catches is a renamed eval script, which would otherwise
+        # surface as a permanently empty column in the capstone table.
+        run: python eval_all.py --selftest
+
+  validate-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Install kubeconform
+        run: |
+          curl -sL https://github.com/yannh/kubeconform/releases/download/v0.4.0/kubeconform-linux-amd64.tar.gz \
+            | tar xz kubeconform && sudo mv kubeconform /usr/local/bin/
+
+      - name: Validate Kubernetes Manifests
+        run: kubeconform -strict -summary services/security-triage/k8s/
+
+  build-and-push:
+    needs: [lint-and-test, validate-manifests]
+    # Same guard as the other three workflows: without it, the `pull_request` trigger
+    # above would publish :latest from unmerged pull-request code. It matters here for a
+    # specific reason -- this image holds the API tokens of every onboarded repo at
+    # runtime, so anyone who could get a branch built could get a build that exfiltrates
+    # them.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Github Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Qemu and Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/security-triage
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ghcr.io/${{ github.repository }}/security-triage:latest

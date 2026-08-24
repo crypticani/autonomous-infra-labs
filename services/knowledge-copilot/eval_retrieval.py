@@ -6,6 +6,7 @@ seconds rather than 195s per answer.
 
 import argparse
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,14 @@ from rich.console import Console
 from rich.table import Table
 
 from hybrid import MMR_LAMBDA
-from retrieval import CANDIDATE_POOL, DEFAULT_K, MODES, retrieve
+from retrieval import (
+    CANDIDATE_POOL,
+    DEFAULT_K,
+    DEFAULT_LAM,
+    MODES,
+    RETRIEVAL_MODE,
+    retrieve,
+)
 from store import open_collection
 
 EVAL_SET = Path(__file__).parent / "eval_set.json"
@@ -231,7 +239,7 @@ def floor_sweep_table(answerable: list[float], absent: list[float]) -> Table:
     return table
 
 
-def main() -> None:
+def main() -> int | None:
     parser = argparse.ArgumentParser(description="Day 11: retrieval quality sweep")
     parser.add_argument("--k", type=int, default=DEFAULT_K)
     parser.add_argument("--modes", nargs="+", default=list(MODES), choices=MODES)
@@ -251,6 +259,13 @@ def main() -> None:
         "--floor-sweep",
         action="store_true",
         help="measure where the similarity floor should sit, then exit",
+    )
+    parser.add_argument(
+        "--floor",
+        type=int,
+        help="Day 28: fail (exit 1) if the shipped config scores fewer than this many "
+        "soft hit@1 out of the eval set. No default on purpose -- a regression bar "
+        "picked before the baseline was measured is just a number chosen to pass.",
     )
     args = parser.parse_args()
 
@@ -297,6 +312,43 @@ def main() -> None:
                     f"[red]{label}[/] {case['question'][:40]!r}: {outcome.error}"
                 )
 
+    return report_shipped_config(results, args.floor)
+
+
+def report_shipped_config(results, floor: int | None) -> int:
+    """Day 28: one machine-readable line, so the repo-root runner can put this service
+    in the same table as the other three.
+
+    This is a **sweep**, not a pass/fail harness -- it exists to compare configurations,
+    and most rows in the table above are controls that are supposed to score worse. So
+    the reported number is the row for the configuration actually shipped
+    (RETRIEVAL_MODE at DEFAULT_LAM), and the metric is soft hit@1: the top result being
+    the primary source or an acceptable one, which is the claim /ask depends on.
+
+    Reports by default and only gates when `--floor` is given, because this repo has no
+    measured baseline to set a bar from yet and inventing one would make the gate
+    decorative. Once a run is on record, put its number behind --floor in eval_all.py.
+    """
+    shipped = f"{RETRIEVAL_MODE} lam={DEFAULT_LAM}"
+    match = next((r for r in results if r[0] == shipped), None)
+    if match is None:
+        # Reachable whenever --modes or --lam excluded the shipped configuration. Say so
+        # rather than reporting the first row, which would silently be a control.
+        console.print(
+            f"[yellow]{shipped!r} was not in this sweep -- no EVAL_RESULT emitted.[/]"
+        )
+        return 0
+
+    _, outcomes = match
+    passed, total = sum(o.soft_hit1 for o in outcomes), len(outcomes)
+    console.print(f"\n[bold]Shipped config ({shipped}): {passed}/{total} soft hit@1[/]")
+    print("EVAL_RESULT " + json.dumps({"passed": passed, "total": total}))
+
+    if floor is not None and passed < floor:
+        console.print(f"[red]below the --floor of {floor}[/]")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

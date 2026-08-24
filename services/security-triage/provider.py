@@ -30,6 +30,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from pydantic import BaseModel
 
+import metrics
 from errors import TriageProviderError
 
 load_dotenv()
@@ -85,6 +86,20 @@ class BaseTriageProvider(ABC):
     prompt_tokens = 0
     output_tokens = 0
 
+    def _count(self, prompt: int, output: int) -> None:
+        """Record one call's usage in both places it has to land -- Day 28.
+
+        Here rather than at each provider's own increment site, because there are two of
+        those and adding the Prometheus half to one and not the other is a silent
+        undercount that nothing fails on. The two readers want genuinely different
+        things: bench.py takes deltas off the attributes within one process, and the
+        /metrics counters survive it into a deploy nobody is watching.
+        """
+        self.prompt_tokens += prompt
+        self.output_tokens += output
+        metrics.MODEL_TOKENS.labels(direction="prompt").inc(prompt)
+        metrics.MODEL_TOKENS.labels(direction="output").inc(output)
+
     @abstractmethod
     def generate(self, system: str, user: str, schema: type[BaseModel]) -> str:
         """Raw JSON text constrained to `schema`. Caller parses and validates it --
@@ -103,7 +118,21 @@ class OllamaProvider(BaseTriageProvider):
         # prompt correctly at ~3.3x the wall-clock. Slow and right beats fast and useless;
         # see the measurement table in Readme.md.
         self.model_name = os.getenv("ST_OLLAMA_MODEL", "qwen2.5-coder:7b")
-        self.base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        # ST_OLLAMA_BASE_URL first, falling back to the shared one -- Day 28, and it is a
+        # deploy problem rather than a preference. appsrv runs all four services off a
+        # single `.env`, and this is the only one whose backend moved to a laptop over
+        # Tailscale. Editing the shared `OLLAMA_BASE_URL` to point there would silently
+        # take log-analyzer and knowledge-copilot with it, onto a host that is asleep most
+        # of the time, for no reason either of them asked for. The override keeps that
+        # blast radius to one service; the fallback means a host where every service does
+        # share one backend needs no new variable at all.
+        #
+        # Third time this shape has been needed here (ST_GEMINI_MODEL for quota
+        # isolation, ST_LLM_TIMEOUT for a background run vs. a waiting human, now this):
+        # one shared knob can only ever be right for one of its readers.
+        self.base_url = os.getenv("ST_OLLAMA_BASE_URL") or os.getenv(
+            "OLLAMA_BASE_URL", "http://localhost:11434"
+        )
         logger.info(f"OllamaProvider using {self.model_name} at {self.base_url}")
 
     def generate(self, system: str, user: str, schema: type[BaseModel]) -> str:
@@ -158,8 +187,7 @@ class OllamaProvider(BaseTriageProvider):
         # prompt_eval_count is the system prompt plus the batch; eval_count is the JSON
         # it wrote back. The first is what makes batching pay -- the system prompt is
         # charged once per call regardless of how many findings ride along.
-        self.prompt_tokens += body.get("prompt_eval_count") or 0
-        self.output_tokens += body.get("eval_count") or 0
+        self._count(body.get("prompt_eval_count") or 0, body.get("eval_count") or 0)
 
         answer = (body.get("response") or "").strip()
         if not answer:
@@ -208,14 +236,14 @@ class GeminiProvider(BaseTriageProvider):
         # usage_metadata is None when the request never reached billing at all -- a safety
         # block, say -- so this is a real branch, not defensive noise.
         if usage := response.usage_metadata:
-            self.prompt_tokens += usage.prompt_token_count or 0
             # thoughts_token_count belongs in output, not dropped: reasoning tokens are
             # billed at the output rate. Measured on 2026-08-22 while checking the quota
             # was still alive -- "reply with the single word ok" spent 119 thinking tokens
             # to produce 1 candidate token, so counting candidates alone would have
             # understated that call's output cost by 120x and made Gemini look free.
-            self.output_tokens += (usage.candidates_token_count or 0) + (
-                usage.thoughts_token_count or 0
+            self._count(
+                usage.prompt_token_count or 0,
+                (usage.candidates_token_count or 0) + (usage.thoughts_token_count or 0),
             )
 
         answer = (response.text or "").strip()

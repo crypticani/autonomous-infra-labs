@@ -857,12 +857,242 @@ was reasoning *toward* a verdict inside the sentence — and fell to 89 once the
 the sentence only had to report them. `EXPLANATION_MAX` stayed at 160 throughout; nothing about the
 cap changed, only what the model had to do inside it.
 
+## `metrics.py` and `/metrics` — Day 28
+
+Same shape as [self-healing-agent/metrics.py](../self-healing-agent/metrics.py), with one label that
+none of the other three services needed: **`repo`**. This is the only multi-tenant service here, so
+"how many runs" and "how much risk" are the wrong questions on their own — the useful ones are
+whose. A `failed` counter climbing for one repo is a broken envelope; climbing across all of them is
+the model backend.
+
+| metric | labels | what it answers |
+|---|---|---|
+| `st_runs` | `repo`, `outcome` | volume and failure rate per tenant (`accepted`/`done`/`failed`) |
+| `st_findings` | `repo`, `stage` | `raw` → `deduped` is the dedup ratio; `deduped` → `triaged` is the model dropping findings |
+| `st_verdicts` | `repo`, `verdict` | how often the gate actually blocks a repo |
+| `st_risk_score` | `repo` | score distribution, bucketed on `risk.WEIGHTS`' own boundaries |
+| `st_priorities` | `priority` | the `needs_human` rate — a model property, deliberately not per-repo |
+| `st_run_duration_seconds` | — | wall clock, buckets to an hour, failures included |
+| `st_model_tokens` | `direction` | Day 27's token counters where a deploy can read them |
+| `st_refusals` | `reason` | which of the three controls refused (`auth`/`rate_limit`/`body_size`) |
+
+Two of those are worth the words.
+
+`st_risk_score` is a **histogram, not a gauge.** A gauge holds the last run's score, which on a repo
+that scans every push is whatever landed most recently and says nothing about the trend. The buckets
+are `1, 4, 15, 40, 55, 70, 85, 100` — one low, one medium, one high, one critical (and the default
+threshold), three highs, and so on — so a bucket boundary means something rather than being a round
+number.
+
+`st_priorities` carries **no `repo` label** and that is the one deliberate asymmetry. The
+`needs_human` rate is a property of the model, not of a tenant: Day 23 established that a model can
+satisfy every guard and decline everything, and splitting that signal across repos would divide the
+evidence for a question nobody is asking per-repo.
+
+### The label that arrives from the internet
+
+`repo` is a bare string in the request body — `app.py` never validates it, because it is a display
+value rather than an identifier. That makes it an **unbounded-cardinality hazard**: a holder of one
+valid token can send a distinct `repo` per request and grow the registry until the process dies,
+carrying the whole set on every scrape along the way. So `metrics.repo_label()` bounds it — the
+first `ST_MAX_REPO_LABELS` (default 50) distinct repos get their own series and everything after
+folds into `other`. Well above any plausible deploy, since each onboarded repo needs a token added
+by hand, so in practice it never fires and the graphs stay per-repo.
+
+## `eval_triage.py` — the gate the test suite cannot be
+
+153 unit tests can be green while the model has quietly got worse, because **no unit test in this
+repo ever calls a model**. Day 27 is the worked example: moving `priority` below `exploitability`
+and `impact` in the schema inverted the judgments, and the only reason anybody noticed is that a
+full corpus happened to get read that afternoon. Nothing failed. This is that afternoon in one
+command.
+
+```bash
+cd services/security-triage
+python eval_triage.py                 # the committed fixture, ST_BATCH_SIZE findings per call
+python eval_triage.py --batch-size 1  # one per call, removes batch interaction from the result
+python eval_triage.py --limit 4       # a quick check against a slow backend
+```
+
+`eval_set.json` is 12 findings from the committed corpus, each with a **band rather than an exact
+priority**, and that is the central design decision. Local Ollama is not reproducible even at
+`temperature: 0` — Day 27 made two changes off eval movements that turned out to be pure
+batch-dependent variance — so an eval asserting `priority == "high"` would flap, get ignored, and
+then get deleted. Each case declares only what is defensible about that finding:
+
+| case | band | why |
+|---|---|---|
+| `CVE-2026-45829` chromadb RCE | `>= high` | a published CVE with arbitrary code execution, in a dependency this repo installs |
+| `jwt-token` in `.secrets/kubeconfig` | `>= high` | a live ServiceAccount token on disk — the highest-stakes finding in the corpus |
+| `KSV-0118` no securityContext | `>= medium` | real, but on a read-only metrics exporter |
+| `KSV-0001` privilege escalation | `>= medium` | a genuine container-escape precondition |
+| `KSV-0048` RBAC can manage pods | `>= medium` | the self-healing agent's own Role — the permission that lets it delete things |
+| `CKV2_GHA_1` workflow `write-all` | `>= medium` | the supply-chain finding: anything in that workflow can push to the repo |
+| `B101` assert in `triage.py` | `<= low` | in a `__main__` demo block. Day 27 deleted 791 of these as noise; this one is kept so the eval notices if they start getting inflated again |
+| `B105` "hardcoded password" | `<= low` | the literal is `/var/run/secrets/.../token`, a well-known path |
+| `B106` "password: prompt" | `<= low` | Bandit matched a keyword argument name |
+| `DS-0026` / `CKV_DOCKER_2` no HEALTHCHECK | `<= low` | an availability nicety, reported twice by two scanners |
+| `KSV-0013` image tag `:latest` | `<= medium` | a real operability problem, a security one only at one remove |
+
+**`needs_human` is graded by which bound the case carries**, which follows from what declining
+means rather than from where it would sit on a scale. A case with a `min` is one this repo says is
+definitely serious, so declining it is a miss. A case with only a `max` is noise, and declining it
+is conservative rather than wrong — the finding reaches a human through `review_required` instead of
+being scored, which is where it belonged. The consequence is the useful one: **Day 23's 1.5b model,
+which declined all five findings it was shown while satisfying every guard, fails this eval
+outright.**
+
+Two smaller things the harness does because they were cheap and the alternative is silent:
+
+- **A case naming a fingerprint that is not in the fixture exits `2`.** A fingerprint is
+  `(scanner, rule_id, target, line)` hashed, so a regenerated fixture — a moved line, a renamed file
+  — changes it. Without the check that case just stops being evaluated, and the eval keeps passing
+  while testing less than it claims.
+- **Cases run in eval-set order, not fixture order,** so which findings share a call is stable. Batch
+  composition changes the prompt, and a shuffled corpus would show up as model variance rather than
+  as the eval's own doing.
+
+Not measured yet: an actual run of this against Ollama. The bands are written from the corpus, and
+the first real run is what says whether the model clears them — that number goes here when it exists.
+
+## Every service's eval, one command
+
+```bash
+python eval_all.py                    # all four, from the repo root
+python eval_all.py security-triage    # one
+python eval_all.py --selftest         # the runner's own parsing; needs no backend
+```
+
+The claim this repo makes at the end of thirty days is that four AI services are production-ready,
+and for an AI system "every service has an eval you can run in one command" is that claim in a form
+somebody can check. [`eval_all.py`](../../eval_all.py) is it: four subprocesses, one table.
+
+| service | measures | backend |
+|---|---|---|
+| log-analyzer | severity vs a 5-case golden set | ollama |
+| knowledge-copilot | soft hit@1 on the shipped retrieval config | ollama + chroma |
+| self-healing-agent | the proposed action, including when it should be none | gemini |
+| security-triage | priority bands | ollama |
+
+Subprocesses rather than imports, because `app`, `provider` and `errors` each exist three times over
+in this repo and would collide in one process — and because a subprocess is the only boundary that
+makes "run this service's eval" mean the same thing here as it does by hand. The contract is one
+line: each eval prints `EVAL_RESULT {"passed": n, "total": n}` last, and its exit status is the
+verdict. Both are reported, because they answer different questions. An eval that prints no such
+line still gets its row and a `-` rather than crashing the runner.
+
+The `measures` column is not decoration. The four evals grade genuinely different things, and a table
+of bare pass counts would imply they are comparable — 12/12 on triage bands and 10/12 on retrieval
+hit@1 are not the same kind of number.
+
+**knowledge-copilot reports rather than gates,** and that is deliberate: `eval_retrieval.py` is a
+configuration *sweep* where most rows are controls that are supposed to score worse, and this repo
+has no measured baseline to set a regression bar from. It grew a `--floor N` flag that exits 1 below
+a threshold; the flag has no default, because a bar picked before the baseline was measured is just
+a number chosen to pass. Set it in `eval_all.py` once a run is on record.
+
+## Deploying it — Day 28
+
+`Dockerfile`, a multi-arch GHCR publish job in `security_triage_ci.yml`, a `docker-compose.prod.yml`
+entry behind a loopback bind, and `k8s/` manifests. Three things in there are not copies of the
+sibling services.
+
+**`--workers 1` is load-bearing three times over here,** where in the other services it was once.
+`_runs` holds every run's verdict in process memory, `_starts` holds the per-token rate-limit
+buckets, and `prometheus_client`'s default registry is per-process — so a second worker would 404 on
+runs it never saw, allow double the rate limit, and export half the metrics on each scrape. The
+Deployment pins `replicas: 1` for the same reason, with `strategy: Recreate`, because a
+RollingUpdate would briefly run two pods and that is the two-worker problem arriving during every
+deploy.
+
+**The uid is numeric.** `adduser --system` picks whatever is free in 100–999 and `USER appuser`
+leaves the image config with a non-numeric user — which a pod running `runAsNonRoot: true` refuses to
+start, because the kubelet cannot verify that a *name* is not root. Pinning `--uid 10001` and
+`USER 10001` means the manifest's `runAsUser` and the image agree by construction rather than by
+whatever the base image had spare on build day.
+
+**The manifests pass this service's own gate.** Their own namespace instead of `default`
+(`KSV-0110`, `CKV_K8S_21` — both of which this repo's scan flags on log-analyzer's manifests), an
+explicit `securityContext` at both levels (`KSV-0118`, `KSV-0001`, `CKV_K8S_20`),
+`readOnlyRootFilesystem` with a `/tmp` `emptyDir` under it, and `capabilities: drop: [ALL]`. Shipping
+a fifth manifest set carrying findings that this service exists to triage would be the project
+arguing with itself.
+
+`OLLAMA_BASE_URL` in the ConfigMap is `http://ollama-host.invalid:11434` — `.invalid` is reserved by
+RFC 2606 and never resolves, so a deploy that forgot to set it gets a DNS failure recorded on the run
+rather than quietly triaging against something unexpected.
+
+### `ST_OLLAMA_BASE_URL`, and why it had to exist
+
+The compose deploy runs all four services off **one shared `.env`**, and this is the only one whose
+model backend is a laptop over Tailscale. Editing the shared `OLLAMA_BASE_URL` to point there would
+have taken log-analyzer and knowledge-copilot along with it, onto a host that is asleep most of the
+time, for no reason either of them asked for — the deploy would have "worked" and quietly broken two
+other services. `provider.py` reads `ST_OLLAMA_BASE_URL` first and falls back to the shared name, so
+the blast radius is one service and a host where everything does share a backend needs no new
+variable at all.
+
+Third time this shape has been needed here — `ST_GEMINI_MODEL` for per-model quota isolation,
+`ST_LLM_TIMEOUT` for a background run against a waiting human, now the backend host. One shared knob
+can only ever be right for one of its readers.
+
+### nginx, and the cap that would have silently overridden the other cap
+
+One hostname per service, matching the other three — a service means one directory, one image, one
+compose entry, one CI workflow, one hostname.
+
+```nginx
+server {
+    server_name triage.crypticani.dev;
+
+    # POST /triage and GET /triage/{id}. A prefix match, unlike the agent's exact one,
+    # because the poll URL carries a run id.
+    location /triage {
+        proxy_pass http://127.0.0.1:7300;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # THE ONE THAT MATTERS. nginx defaults client_max_body_size to 1 MB, and this
+        # repo's own scan envelope is 2.7 MB. Without this line every real caller gets
+        # nginx's own 413 -- HTML, not the service's JSON detail -- and ST_MAX_BODY_BYTES
+        # never gets a say, because nginx refuses the body before the app sees a byte.
+        # A cap silently overridden by a smaller cap one layer up is worse than no cap:
+        # the control you tested is not the control that fired.
+        client_max_body_size 16m;
+    }
+
+    location / { return 404; }
+
+    # certbot --nginx fills in listen 443 / ssl_certificate / etc.
+}
+```
+
+`/metrics` and `/health` are deliberately **not** routed. Both are unauthenticated, both are reached
+over loopback on the host — Prometheus for the first, the container's own healthcheck for the second
+— and `/metrics` publishes per-repo volume, which is somebody else's business.
+
+No `proxy_read_timeout` tuning is needed, and that is Day 25's ack-now/answer-later split paying off:
+`POST /triage` returns `202` in milliseconds and the caller polls. A synchronous endpoint would have
+needed a proxy timeout longer than a triage run, which is to say longer than nginx will sensibly hold
+a connection open.
+
+### The backend is a laptop, and that is not a bug
+
+The model runs on a laptop over Tailscale, and the laptop does not need to be awake outside a demo.
+A CI-triggered run while it sleeps ends as a recorded `failed` run saying the backend is
+unreachable, which is the correct and visible outcome. There is no fallback logic, no keepalive and
+no `ST_LLM_PROVIDER=gemini` failover — the seam exists if it is ever wanted, and this is a learning
+build, not a service anyone depends on. `/health` reports `degraded` in that state but still answers
+`200`, which is why the readiness probe uses it: an unreachable model is not a reason to pull the pod
+out of service.
+
 ## Tests
 
 ```bash
 cd services/security-triage
-python -m pytest -v   # 26 scanners + 15 provider + 13 triage + 21 fixes + 14 risk
-                      #   + 14 app + 11 comment + 5 runtime + 10 bench = 129, if green
+python -m pytest -v   # 26 scanners + 17 provider + 13 triage + 21 fixes + 14 risk
+                      #   + 14 app + 11 comment + 5 runtime + 10 bench
+                      #   + 7 metrics + 17 eval = 155, if green
 ```
 
 `test_scanners.py` (26, Days 22, 24 and 26): each scanner's real shape, a missing-scanner-key envelope, CVE
@@ -878,9 +1108,12 @@ whatever its verb, impersonation naming both identities, an unaudited resource p
 nameless `objectRef` keeping its resource so two refusals cannot share a fingerprint, and one
 envelope carrying both scanner and audit findings through a single `parse_envelope` call.
 
-`test_provider.py` (10, Day 23): transport-failure status mapping and the schema/JSON-body shape
-sent to each provider, using the same fake-response/monkeypatch style as
+`test_provider.py` (17, Days 23, 27 and 28): transport-failure status mapping and the schema/JSON-body
+shape sent to each provider, using the same fake-response/monkeypatch style as
 [knowledge-copilot's test_llm.py](../knowledge-copilot/tests/test_llm.py) — no real network call.
+Day 27 added the token counters, including Gemini's reasoning tokens landing in `output`. Day 28
+added the two that matter to the deploy: `ST_OLLAMA_BASE_URL` beating the shared `OLLAMA_BASE_URL`,
+and an empty override falling back rather than pointing the service at an empty string.
 
 `test_triage.py` (11, Day 23): the two guards above, using a `FakeProvider` injected in place of
 `get_triage_provider()` rather than mocking `requests` or `google.genai` a second time — the same
@@ -917,6 +1150,23 @@ fixes staying out of the diff block, a `pending` run being refused rather than r
 no commit omitting it instead of printing empty backticks, and the one that matters most: a `failed`
 run producing a comment that cannot be mistaken for a clean bill of health.
 
+`test_metrics.py` (7, Day 28): the counters, through the endpoint rather than by calling `metrics.*`
+directly — a test that increments a counter and reads it back tests `prometheus_client`, and the
+question worth asking is whether `app.py`'s own paths reach it. Reads through the registry, so a
+metric incremented under the wrong *label* fails here rather than showing up later as an empty graph.
+Covers a completed run's volume/verdict/priority rows including the zero ones, a failed run being
+counted as failed *and* still timed, each of the three refusal controls naming itself, the `repo`
+label cap holding at its ceiling while already-seen repos keep their series, and `/metrics` serving
+without a token.
+
+`test_eval_triage.py` (17, Day 28): the eval's own grading, which is the part that can be wrong in a
+way nobody notices — an eval that passes everything looks exactly like a healthy model. Day 27 has
+the worked example: two prompt changes made off eval movements that turned out to be a checker bug
+and batch nondeterminism. So the checker gets tests before it gets trusted. Every band shape against
+every priority, `needs_human` failing a `min` case and passing a `max` one, a finding the model never
+answered about failing rather than being absent, `needs_human` staying off the severity scale, and a
+check that every committed case actually asserts something.
+
 `test_runtime.py` (5, Day 26): the collector — one event per line, a torn last line being *counted*
 rather than swallowed (the API server appends to this file live, so a log captured mid-write
 routinely ends in half an event, and a file of nothing but torn lines is a different problem that a
@@ -931,9 +1181,20 @@ cd services/security-triage
 uvicorn app:app --port 7300 --workers 1     # --workers 1 is load-bearing, see above
 ```
 
+Or the published image, alongside the other three:
+
+```bash
+docker compose -f docker-compose.prod.yml pull security-triage
+docker compose -f docker-compose.prod.yml up -d security-triage
+curl -s localhost:7300/health | jq       # `healthy`, or `degraded` with the reason
+```
+
 ## Not built yet
 
-- Metrics, Grafana dashboard, eval harness, deployment to appsrv (Day 28).
+- **A Grafana dashboard.** `/metrics` is live and scrapeable; the panels are not built. The three
+  worth having are the per-repo verdict rate, the `needs_human` trend, and `st_run_duration_seconds`'
+  tail against `ST_LLM_TIMEOUT` — but a dashboard drawn before there is a week of data on it is a
+  screenshot, not an instrument.
 - **Aggregating repeated same-rule findings** — a known ceiling, deliberately not built. Day 27 fixed
   the B101 flood by not scanning test files, which is the right fix for that case but not a general
   one: 7 `bandit:B104` and 6 `checkov:CKV2_GHA_1` findings survive, and for a human
@@ -943,4 +1204,6 @@ uvicorn app:app --port 7300 --workers 1     # --workers 1 is load-bearing, see a
   only on a repo where it isn't.
 - **A `needs_human` rate worth trusting.** The rate measured 0% on a heterogeneous slice and 100% on
   a lint-heavy one, so the sample decides the number and neither figure is the service's real
-  behaviour. `eval_set.json` (Day 28, already planned) is what turns it into a tracked metric.
+  behaviour. Day 28 built the two things that fix that — `eval_set.json`, which is a *fixed* sample,
+  and `st_priorities`, which tracks the rate in production — but neither has a run behind it yet.
+  The number goes here after the first one, not before.

@@ -238,6 +238,15 @@ python eval_retrieval.py --modes hybrid --lam 1.0 0.5 0.3
 It prints quality and latency per configuration, plus `soft_hit@1` broken out by query kind —
 which is where a technique that helps one kind and hurts another becomes visible at all.
 
+Day 28 added one line at the end and one flag. The line is `EVAL_RESULT {"passed": n, "total": n}`,
+reporting `soft_hit@1` for the **shipped** configuration (`RETRIEVAL_MODE` at `DEFAULT_LAM`) so the
+repo-root [`eval_all.py`](../../eval_all.py) can put this service in the same table as the other
+three — not the first row of the sweep, which is usually a control that is supposed to score worse.
+The flag is `--floor N`, which exits 1 below a threshold. It has **no default on purpose**: this is a
+sweep rather than a pass/fail harness, and a regression bar picked before the baseline was measured
+is just a number chosen to pass. Once a run is on record, put its number behind `--floor` in
+`eval_all.py` and this service starts gating like the other three.
+
 The Day 8 experiment is still runnable on its own: `python day8_embeddings.py --reset`.
 
 The script prints four sections: what a vector looks like and how cosine similarity separates

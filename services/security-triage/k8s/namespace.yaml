@@ -1,0 +1,11 @@
+# Its own namespace, unlike log-analyzer's manifests, which have none and therefore land
+# in `default`. That is not a style preference: this repo's own scan flags exactly that
+# on those files -- KSV-0110 "Workloads in the default namespace" and CKV_K8S_21 -- and
+# shipping a fifth manifest set with the same finding while running a service that
+# triages it would be the whole project arguing with itself.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security-triage
+  labels:
+    app.kubernetes.io/name: security-triage

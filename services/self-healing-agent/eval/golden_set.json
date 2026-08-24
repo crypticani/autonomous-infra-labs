@@ -1,0 +1,219 @@
+[
+    {
+        "id": "TC-001",
+        "description": "OOMKilled crashloop. The correct answer is no action: nothing in the write toolset can raise a memory limit, and restarting the pod puts it straight back into the same loop. This is the case the system prompt names by hand, and the one that catches an agent proposing a restart because the field exists.",
+        "alert": {
+            "alertname": "CrashLoopBackOff",
+            "namespace": "sandbox",
+            "pod": "checkout-api-7f9c4d8b6-x2klm",
+            "deployment": "checkout-api",
+            "summary": "Pod checkout-api-7f9c4d8b6-x2klm has restarted 11 times in 20 minutes"
+        },
+        "expected_action": null,
+        "tool_outputs": {
+            "get_pod_logs": {
+                "namespace": "sandbox",
+                "pod": "checkout-api-7f9c4d8b6-x2klm",
+                "container": "checkout-api",
+                "tail_lines": 200,
+                "logs": "java.lang.OutOfMemoryError: Java heap space\n\tat com.shop.checkout.CartLoader.loadAll(CartLoader.java:88)\nLast state: Terminated, reason OOMKilled, exit code 137\nContainer limits: memory 256Mi, requests: memory 128Mi"
+            },
+            "get_recent_deploys": {
+                "namespace": "sandbox",
+                "deployment": "checkout-api",
+                "revisions": [
+                    {
+                        "revision": "4",
+                        "replicas": 2,
+                        "ready_replicas": 0,
+                        "image": "ghcr.io/shop/checkout-api:1.9.2",
+                        "created_at": "2026-08-24T02:41:00+00:00"
+                    },
+                    {
+                        "revision": "3",
+                        "replicas": 0,
+                        "ready_replicas": 0,
+                        "image": "ghcr.io/shop/checkout-api:1.9.1",
+                        "created_at": "2026-08-19T11:05:00+00:00"
+                    }
+                ]
+            },
+            "search_runbooks": {
+                "hits": [
+                    {
+                        "source": "oomkilled-pod.md",
+                        "text": "Exit code 137 with reason OOMKilled means the kernel killed the container for exceeding its memory limit. Restarting does not help: the new pod inherits the same limit and dies the same way. Raise resources.limits.memory in the Deployment, or find the leak."
+                    }
+                ]
+            },
+            "get_recent_alerts": {
+                "alerts": [
+                    {
+                        "alertname": "CrashLoopBackOff",
+                        "service": "checkout-api",
+                        "state": "firing"
+                    }
+                ]
+            }
+        }
+    },
+    {
+        "id": "TC-002",
+        "description": "A deployment scaled to zero by a bad rollout. Every replica is gone, the previous revision ran two, and scale_deployment is exactly the tool for it. Day 21 demonstrated this remediation live against the sandbox cluster.",
+        "alert": {
+            "alertname": "KubeDeploymentReplicasMismatch",
+            "namespace": "sandbox",
+            "deployment": "sandbox-demo",
+            "summary": "Deployment sandbox/sandbox-demo has 0 of 2 desired replicas available"
+        },
+        "expected_action": "scale_deployment",
+        "tool_outputs": {
+            "get_recent_deploys": {
+                "namespace": "sandbox",
+                "deployment": "sandbox-demo",
+                "revisions": [
+                    {
+                        "revision": "7",
+                        "replicas": 0,
+                        "ready_replicas": 0,
+                        "image": "ghcr.io/shop/sandbox-demo:2.3.0",
+                        "created_at": "2026-08-24T03:02:00+00:00"
+                    },
+                    {
+                        "revision": "6",
+                        "replicas": 2,
+                        "ready_replicas": 2,
+                        "image": "ghcr.io/shop/sandbox-demo:2.3.0",
+                        "created_at": "2026-08-23T09:14:00+00:00"
+                    }
+                ]
+            },
+            "get_pod_logs": {
+                "error": "no pods found for deployment 'sandbox-demo' in 'sandbox'"
+            },
+            "search_runbooks": {
+                "hits": [
+                    {
+                        "source": "replicas-mismatch.md",
+                        "text": "A Deployment showing 0 of N available with no pods at all was almost always scaled down, not crashed. Check the previous ReplicaSet revision for the replica count it was running and scale back to it."
+                    }
+                ]
+            },
+            "get_recent_alerts": {
+                "alerts": [
+                    {
+                        "alertname": "KubeDeploymentReplicasMismatch",
+                        "service": "sandbox-demo",
+                        "state": "firing"
+                    }
+                ]
+            }
+        }
+    },
+    {
+        "id": "TC-003",
+        "description": "One wedged pod out of three, no recent deploy, threads deadlocked and no traffic served. This is the narrow case a restart genuinely fixes, and the counterweight to TC-001 and TC-004: an agent that has learned to answer null to everything scores two out of four here rather than looking cautious.",
+        "alert": {
+            "alertname": "PodNotReady",
+            "namespace": "sandbox",
+            "pod": "orders-api-5b7d9f4c2-qq81t",
+            "deployment": "orders-api",
+            "summary": "Pod orders-api-5b7d9f4c2-qq81t has failed its readiness probe for 12 minutes"
+        },
+        "expected_action": "restart_pod",
+        "tool_outputs": {
+            "get_pod_logs": {
+                "namespace": "sandbox",
+                "pod": "orders-api-5b7d9f4c2-qq81t",
+                "container": "orders-api",
+                "tail_lines": 200,
+                "logs": "[WARN] connection pool watchdog: no progress in 720s\n[WARN] deadlock detected between threads pool-2-thread-4 and pool-2-thread-9, neither will release\n[INFO] readiness probe /healthz timed out after 5000ms (x144)\n(no further log output; process alive, serving nothing)"
+            },
+            "get_recent_deploys": {
+                "namespace": "sandbox",
+                "deployment": "orders-api",
+                "revisions": [
+                    {
+                        "revision": "12",
+                        "replicas": 3,
+                        "ready_replicas": 2,
+                        "image": "ghcr.io/shop/orders-api:4.1.0",
+                        "created_at": "2026-08-11T08:30:00+00:00"
+                    }
+                ]
+            },
+            "search_runbooks": {
+                "hits": [
+                    {
+                        "source": "deadlocked-pod.md",
+                        "text": "A single pod alive but serving nothing, with a deadlock in the logs and no recent rollout, is the one situation where deleting the pod is the fix. The ReplicaSet recreates it and the other replicas keep serving during the gap."
+                    }
+                ]
+            },
+            "get_recent_alerts": {
+                "alerts": [
+                    {
+                        "alertname": "PodNotReady",
+                        "service": "orders-api",
+                        "state": "firing"
+                    }
+                ]
+            }
+        }
+    },
+    {
+        "id": "TC-004",
+        "description": "Latency caused by an upstream this cluster does not run. Every replica is healthy and the slow calls all go to a third-party payment API. Restarting or scaling changes nothing, so the correct answer is null again -- but for a completely different reason than TC-001, which is the point of having both.",
+        "alert": {
+            "alertname": "HighRequestLatency",
+            "namespace": "sandbox",
+            "deployment": "checkout-api",
+            "summary": "p99 latency for checkout-api is 8.4s (threshold 1s) over 15 minutes"
+        },
+        "expected_action": null,
+        "tool_outputs": {
+            "get_pod_logs": {
+                "namespace": "sandbox",
+                "pod": "checkout-api-6d4b8c9a1-mn45p",
+                "container": "checkout-api",
+                "tail_lines": 200,
+                "logs": "[INFO] POST /checkout 200 in 8241ms\n[WARN] upstream api.payments-vendor.example responded 503 in 8003ms, retry 1/2\n[WARN] upstream api.payments-vendor.example responded 503 in 7994ms, retry 2/2\n[INFO] health check ok, 3/3 replicas ready, heap 41%, cpu 12%"
+            },
+            "get_recent_deploys": {
+                "namespace": "sandbox",
+                "deployment": "checkout-api",
+                "revisions": [
+                    {
+                        "revision": "4",
+                        "replicas": 3,
+                        "ready_replicas": 3,
+                        "image": "ghcr.io/shop/checkout-api:1.9.2",
+                        "created_at": "2026-08-19T11:05:00+00:00"
+                    }
+                ]
+            },
+            "search_runbooks": {
+                "hits": [
+                    {
+                        "source": "upstream-dependency-latency.md",
+                        "text": "When the slow span is an outbound call to a vendor API and local replicas are healthy, the problem is not in this cluster. Restarting or scaling adds load to an already failing dependency. Escalate to the vendor and consider shedding load at the edge."
+                    }
+                ]
+            },
+            "get_recent_alerts": {
+                "alerts": [
+                    {
+                        "alertname": "HighRequestLatency",
+                        "service": "checkout-api",
+                        "state": "firing"
+                    },
+                    {
+                        "alertname": "UpstreamVendorErrors",
+                        "service": "payments-vendor",
+                        "state": "firing"
+                    }
+                ]
+            }
+        }
+    }
+]

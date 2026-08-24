@@ -32,10 +32,12 @@ from typing import Any, Literal
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
+import metrics
 import risk
 import triage
 from errors import TriageProviderError
@@ -94,6 +96,7 @@ def require_token(request: Request) -> str:
             if hmac.compare_digest(presented, token):
                 return hashlib.sha256(token.encode()).hexdigest()[:8]
 
+    metrics.REFUSALS.labels(reason="auth").inc()
     raise HTTPException(
         status_code=401,
         detail="a valid bearer token is required",
@@ -131,6 +134,7 @@ def check_rate(caller: str) -> None:
     now = time.monotonic()
     recent = [t for t in _starts.get(caller, []) if t > now - RATE_WINDOW]
     if len(recent) >= MAX_RUNS_PER_HOUR:
+        metrics.REFUSALS.labels(reason="rate_limit").inc()
         raise HTTPException(
             status_code=429,
             detail=(
@@ -165,6 +169,7 @@ async def cap_body_size(request: Request, call_next):
         error = body_size_error(request.headers.get("content-length"))
         if error:
             status, detail = error
+            metrics.REFUSALS.labels(reason="body_size").inc()
             logger.warning(f"refused a body: {detail}")
             return JSONResponse({"detail": detail}, status_code=status)
     return await call_next(request)
@@ -243,6 +248,8 @@ def _triage_in_background(
         logger.warning(f"run {run_id} was evicted before its triage began")
         return
 
+    label = metrics.repo_label(run.repo)
+    started = time.monotonic()
     try:
         results = triage_findings(deduped)
         run.triaged = len(results)
@@ -250,6 +257,17 @@ def _triage_in_background(
         run.top = top_findings(results, deduped)
         run.fixes = propose_fixes(raw)
         run.status = "done"
+
+        metrics.RUNS.labels(repo=label, outcome="done").inc()
+        metrics.FINDINGS.labels(repo=label, stage="triaged").inc(run.triaged)
+        metrics.VERDICTS.labels(repo=label, verdict=run.risk.verdict).inc()
+        metrics.RISK_SCORE.labels(repo=label).observe(run.risk.score)
+        # From `counts` rather than by walking `results` again: risk.assess already
+        # tallied every priority including the zero rows, and counting twice is how the
+        # two numbers eventually disagree.
+        for priority, count in run.risk.counts.items():
+            metrics.PRIORITIES.labels(priority=priority).inc(count)
+
         logger.info(
             f"run {run_id} done: {run.triaged}/{len(deduped)} triaged, "
             f"score {run.risk.score} -> {run.risk.verdict}"
@@ -257,11 +275,19 @@ def _triage_in_background(
     except TriageProviderError as e:
         run.status = "failed"
         run.error = f"{e.provider}: {e}"
+        metrics.RUNS.labels(repo=label, outcome="failed").inc()
         logger.error(f"run {run_id} abandoned, {e.provider} failed: {e}")
     except Exception as e:
         run.status = "failed"
         run.error = str(e)
+        metrics.RUNS.labels(repo=label, outcome="failed").inc()
         logger.exception(f"run {run_id} abandoned by an unexpected failure")
+    finally:
+        # Observed for failures too, and the failures are the ones worth timing: a run
+        # that dies on the ninth of ten batches has already spent twenty minutes of
+        # somebody's CPU, and a histogram over successes alone would report that as a
+        # quiet afternoon. Same reasoning as the agent's DIAGNOSIS_DURATION.
+        metrics.RUN_DURATION.observe(time.monotonic() - started)
 
 
 @app.post("/triage", status_code=202, response_model=TriageAccepted)
@@ -295,6 +321,12 @@ def start_triage(
         findings=len(deduped),
     )
     _remember(run)
+
+    label = metrics.repo_label(request.repo)
+    metrics.RUNS.labels(repo=label, outcome="accepted").inc()
+    metrics.FINDINGS.labels(repo=label, stage="raw").inc(len(raw))
+    metrics.FINDINGS.labels(repo=label, stage="deduped").inc(len(deduped))
+
     logger.info(
         f"/triage run {run.id} repo={request.repo!r} commit={request.commit[:8]} "
         f"{len(raw)} findings -> {len(deduped)} deduped"
@@ -326,6 +358,24 @@ def get_run(run_id: str):
     if run is None:
         raise HTTPException(status_code=404, detail=f"no run {run_id!r}")
     return run
+
+
+@app.get("/metrics")
+def metrics_endpoint():
+    """Prometheus scrape target.
+
+    Unauthenticated, like the other two services' and like /health here: Prometheus
+    reaches this over loopback on appsrv, and a bearer token in a scrape config is a
+    secret in a third place buying nothing. It does leak per-repo volume to anyone who
+    can reach the port, which on this deploy is nginx and nothing else -- the compose
+    entry binds 127.0.0.1.
+
+    Nothing is computed at scrape time. Every metric is incremented at the moment the
+    thing happened, so a scrape cannot fail on a wedged background run -- which matters
+    more here than in the other services, because a wedged run is this service's normal
+    kind of outage.
+    """
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")

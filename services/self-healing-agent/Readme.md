@@ -741,6 +741,49 @@ instrumentation is what Day 27 owed it — any real diagnosis now reports its ow
 curl -s localhost:8080/metrics | grep sha_model_tokens
 ```
 
+## `eval/` — the golden set, Day 28
+
+```bash
+cd services/self-healing-agent
+python eval/run_eval.py        # 4 cases against Gemini, exits non-zero if any fails
+```
+
+Built for the cross-service eval runner ([`eval_all.py`](../../eval_all.py) at the repo root), and
+the design question was what is actually gradeable here. Not the summary, not the evidence list, not
+confidence — those are prose, and grading prose needs a human or a second model, neither of which
+belongs in a command that has to run in one line. **The proposed action is the only output of this
+service a human can click to make something happen in a cluster,** so it is the only one worth a
+regression gate.
+
+Four cases, and **two of them expect `null`**:
+
+| case | alert | expected |
+|---|---|---|
+| TC-001 | `CrashLoopBackOff`, logs show `OOMKilled` exit 137 | *none* — nothing in the write toolset raises a memory limit |
+| TC-002 | `KubeDeploymentReplicasMismatch`, 0 of 2, previous revision ran 2 | `scale_deployment` |
+| TC-003 | `PodNotReady`, one pod of three deadlocked, no recent rollout | `restart_pod` |
+| TC-004 | `HighRequestLatency`, all replicas healthy, upstream vendor returning 503s | *none* — restarting adds load to a failing dependency |
+
+`proposed_action: null` is this service's `needs_human`, and the balance is the point: **an agent
+that always proposes something scores 2/4, and so does one that never proposes anything.** Passing
+requires telling the two situations apart. TC-001 and TC-004 both expect `null` for completely
+different reasons — one because no tool fits, one because the problem is not in this cluster — which
+is why both are there rather than one.
+
+An incomplete diagnosis fails a `null` case rather than passing it. Without that check the loop
+giving up entirely would score as a correct "propose nothing", which is the one way this grader
+could call a total failure a success.
+
+**The cluster is stubbed, the model is not.** `agent._dispatch` is swapped for a lookup into each
+case's `tool_outputs`, so the model makes real calls, reads real-shaped results and takes real
+decisions while the tools answer from a fixture. A tool with no canned output returns an `error`,
+matching what the real dispatch does when a tool raises. The alternative — a live `kind` cluster
+wedged into four specific broken states — is not something anybody runs before a commit, and an eval
+nobody runs is not a gate.
+
+Not measured yet: a run of it. The cases are written from the tool table and the Day 21 capstone;
+what the model actually scores goes here after the first run.
+
 ## Not built yet
 
 - The Prometheus/Alertmanager auto-detection leg above (`kube-state-metrics` is deployed and
@@ -749,7 +792,10 @@ curl -s localhost:8080/metrics | grep sha_model_tokens
   manual `curl` already exercises the identical `/alerts` code path Alertmanager would use, and the
   capstone's point (a real diagnose → approve → fix loop against a real cluster) doesn't depend on
   who originates the webhook.
-- Eval harness over recorded tool transcripts — `later`.
+- Eval over *recorded* tool transcripts, as opposed to Day 28's stubbed-cluster golden set above.
+  The difference is that a transcript replays what a real cluster said on a real day, which is the
+  only way to catch a diagnosis that only works against fixtures written by the same person who
+  wrote the prompt.
 
 ## Capstone: recorded 2026-08-17
 

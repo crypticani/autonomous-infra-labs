@@ -10,7 +10,7 @@
 # A fresh host still needs the copilot's index populated once, before first start:
 #   docker compose -f docker-compose.prod.yml run --rm knowledge-copilot python ingest.py
 #
-# Both services read the same root .env. See .env.example for every key.
+# All four services read the same root .env. See .env.example for every key.
 
 services:
   log-analyzer:
@@ -106,4 +106,40 @@ services:
       interval: 60s
       timeout: 30s
       retries: 3
+      start_period: 10s
+
+  security-triage:
+    image: ghcr.io/crypticani/autonomous-infra-labs/security-triage:${SECURITY_TRIAGE_TAG:-latest}
+    pull_policy: always
+    container_name: security-triage
+    env_file:
+      - .env
+    # --workers 1 for three reasons at once here, not one: `_runs` holds every run's
+    # verdict in process memory, `_starts` holds the per-token rate-limit buckets, and
+    # prometheus_client's registry is per-process. A second worker would 404 on runs it
+    # never saw, allow double the rate limit, and export half the metrics per scrape.
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${ST_PORT:-7300}", "--workers", "1"]
+    ports:
+      # Loopback only, same reasoning as the other two: nginx terminates TLS on this host
+      # and proxies to it. This is the one service here whose callers are other repos'
+      # GitHub Actions runners, so the public path genuinely matters -- and it is nginx,
+      # not this bind.
+      - "127.0.0.1:${ST_PORT:-7300}:${ST_PORT:-7300}"
+    # No `user:` override and no volumes, unlike the other two: nothing is bind-mounted,
+    # so there is no host uid to match. The image's own numeric uid 10001 stands.
+    extra_hosts:
+      # Ollama runs on the laptop over Tailscale rather than on this host, so
+      # OLLAMA_BASE_URL in .env is a tailnet address and this mapping is not what
+      # resolves it. It stays for consistency with the sibling services and because a
+      # host-local Ollama is the obvious fallback if the laptop stops being the backend.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:$ST_PORT/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      # The same 10s as the others despite this service's requests taking minutes: what
+      # starts slowly here is /triage, not the process. /health touches nothing but the
+      # provider factory.
       start_period: 10s

@@ -194,6 +194,18 @@ if __name__ == "__main__":
 
     all_passed = print_report(results)
 
+    # Day 28: the one machine-readable line eval_all.py at the repo root reads, so the
+    # cross-service table does not have to parse four different report formats.
+    print(
+        "EVAL_RESULT "
+        + json.dumps(
+            {
+                "passed": sum(r["result"]["passed"] for r in results),
+                "total": len(results),
+            }
+        )
+    )
+
     if not all_passed:
         sys.exit(1)
     sys.exit(0)

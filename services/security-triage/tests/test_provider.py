@@ -204,3 +204,28 @@ def test_counters_are_per_instance_not_shared():
     first, second = OllamaProvider(), OllamaProvider()
     first.prompt_tokens += 10
     assert second.prompt_tokens == 0
+
+
+def test_the_service_specific_ollama_host_wins_over_the_shared_one(monkeypatch):
+    """Day 28. appsrv runs all four services off one shared `.env`, and only this one's
+    backend moved to a laptop over Tailscale -- so editing the shared name would have
+    silently taken log-analyzer and knowledge-copilot with it, onto a host that is asleep
+    most of the time. The precedence is the whole point of the variable.
+    """
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://shared:11434")
+    monkeypatch.setenv("ST_OLLAMA_BASE_URL", "http://triage-only:11434")
+
+    assert OllamaProvider().base_url == "http://triage-only:11434"
+
+
+def test_without_the_override_the_shared_ollama_host_is_used(monkeypatch):
+    """The fallback, which is what keeps a host where every service does share one
+    backend from needing a new variable at all. An empty override falls back too --
+    `ST_OLLAMA_BASE_URL=` in a .env is a variable somebody meant to unset.
+    """
+    monkeypatch.setenv("OLLAMA_BASE_URL", "http://shared:11434")
+    monkeypatch.delenv("ST_OLLAMA_BASE_URL", raising=False)
+    assert OllamaProvider().base_url == "http://shared:11434"
+
+    monkeypatch.setenv("ST_OLLAMA_BASE_URL", "")
+    assert OllamaProvider().base_url == "http://shared:11434"

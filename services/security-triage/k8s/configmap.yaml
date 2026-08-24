@@ -1,0 +1,36 @@
+# Non-secret policy only. ST_API_TOKENS and GEMINI_API_KEY are not here -- see the
+# secretKeyRef entries in deployment.yaml and the `kubectl create secret` line in
+# Readme.md. A ConfigMap holding a credential is CKV-01010 in this repo's own corpus.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-triage-config
+  namespace: security-triage
+data:
+  ST_LLM_PROVIDER: "ollama"
+
+  # A placeholder that fails loudly and immediately: `.invalid` is reserved by RFC 2606
+  # and never resolves, so a deploy that forgot to set this gets a DNS failure recorded
+  # on the run rather than quietly triaging against something unexpected. Point it at
+  # whichever host runs Ollama for this cluster.
+  #
+  # The shared name rather than ST_OLLAMA_BASE_URL, which provider.py prefers when set:
+  # a ConfigMap is already scoped to this Deployment, so there is nothing here to collide
+  # with. The ST_ override exists for the compose deploy, where all four services read one
+  # shared .env file.
+  OLLAMA_BASE_URL: "http://ollama-host.invalid:11434"
+
+  ST_OLLAMA_MODEL: "qwen2.5-coder:7b"
+
+  # Both set from Day 27's measurement, not guessed, and they move together: raising the
+  # batch size raises the output tokens per call, and output tokens are what set the wall
+  # clock at ~2.5-3 tok/s on CPU. See the cost table in Readme.md.
+  ST_BATCH_SIZE: "5"
+  ST_LLM_TIMEOUT: "600"
+  ST_MAX_TOKENS: "1536"
+
+  # This deploy's default bar. Each onboarded repo can override it per request with
+  # `risk_threshold`, which is why the default does not have to be right for everyone.
+  ST_RISK_THRESHOLD: "40"
+
+  LOG_LEVEL: "INFO"

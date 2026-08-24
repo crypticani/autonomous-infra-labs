@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-triage
+  namespace: security-triage
+  labels:
+    app: security-triage
+spec:
+  # ClusterIP: reaching this from outside is an Ingress' job, and on the deploy that
+  # actually runs today it is nginx in front of the compose container instead. Exposing
+  # a NodePort here would be a second way in that nothing authenticates differently.
+  type: ClusterIP
+  selector:
+    app: security-triage
+  ports:
+    - name: http
+      port: 7300
+      targetPort: http
+      protocol: TCP

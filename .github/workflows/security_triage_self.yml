@@ -25,9 +25,11 @@ jobs:
     with:
       endpoint: ${{ vars.SECURITY_TRIAGE_ENDPOINT }}
       # This repo's own bar, and higher than the shipped default of 40 on purpose: the
-      # committed fixture corpus is 559 deduped findings from this very tree, most of
-      # them transitive CVEs in a lab repo that ships nothing. Set from a real run's
-      # score once Day 28 has one.
+      # scan of this tree is dominated by findings in a lab repo that ships nothing --
+      # k8s manifests for a sandbox cluster, HEALTHCHECK hygiene, workflow permissions.
+      # Day 27 cut the corpus from 559 deduped findings to 43 by excluding test files
+      # from Bandit, which changes what a score even means here; 60 stays a placeholder
+      # until a real run against the live endpoint produces one.
       risk-threshold: '60'
       # Local, not the pinned default: a change to scan.sh has to be exercised by the
       # pull request that makes it, not by main after the fact.

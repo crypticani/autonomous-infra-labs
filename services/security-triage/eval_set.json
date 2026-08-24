@@ -1,0 +1,74 @@
+[
+    {
+        "fingerprint": "c782b1e40f2e9b3a",
+        "label": "CVE-2026-45829 chromadb RCE",
+        "min": "high",
+        "why": "A published CVE with arbitrary code execution in a dependency this repo actually installs. If a prompt change ever brings this back as medium, the gate stops being worth running."
+    },
+    {
+        "fingerprint": "38088a46ca95467d",
+        "label": "jwt-token in .secrets/kubeconfig",
+        "min": "high",
+        "why": "A live ServiceAccount token for the sandbox cluster, sitting on disk. The single highest-stakes finding in the corpus and the one a triage pass has the least excuse to soften."
+    },
+    {
+        "fingerprint": "314e40a4f666be2d",
+        "label": "KSV-0118 default security context (kube-state-metrics)",
+        "min": "medium",
+        "why": "A workload running with no securityContext at all, in kube-system. Scanner says HIGH; medium is the floor because the component is a read-only metrics exporter, not a front door."
+    },
+    {
+        "fingerprint": "27a837e2795d8dcc",
+        "label": "KSV-0001 can elevate its own privileges",
+        "min": "medium",
+        "why": "allowPrivilegeEscalation unset is a real container-escape precondition. Not a critical on its own, but never a low."
+    },
+    {
+        "fingerprint": "9146ceb41620237d",
+        "label": "KSV-0048 RBAC can manage pods",
+        "min": "medium",
+        "why": "This is the self-healing agent's own Role -- the permission that lets it delete pods. Whether it is scoped correctly is exactly the thing a human should be looking at."
+    },
+    {
+        "fingerprint": "5aa492d9e6477883",
+        "label": "CKV2_GHA_1 workflow permissions write-all",
+        "min": "medium",
+        "why": "A workflow with write-all is the supply-chain finding in this corpus: anything that runs in it can push to the repo. Six of these exist and the model sees them one per batch, so it also tests that the judgment does not drift between identical findings."
+    },
+    {
+        "fingerprint": "af615889b3fbaa87",
+        "label": "B101 assert in triage.py",
+        "max": "low",
+        "why": "The assert is in triage.py's __main__ demo block, which -O never runs in production because production runs uvicorn. Day 27 deleted 791 of these from the corpus for being noise; this one is kept precisely so the eval notices if the model starts inflating them again."
+    },
+    {
+        "fingerprint": "a5679e7bc1bf21d2",
+        "label": "B105 'hardcoded password' that is a filesystem path",
+        "max": "low",
+        "why": "The literal is /var/run/secrets/kubernetes.io/serviceaccount/token -- a well-known path, not a credential. A model that cannot tell a path from a secret will fail every real repo the same way."
+    },
+    {
+        "fingerprint": "1f57e60f1ac3d917",
+        "label": "B106 'hardcoded password: prompt'",
+        "max": "low",
+        "why": "Bandit matched the keyword argument name `prompt`. There is no password anywhere near it. Straightforward false positive and it should be triaged as one."
+    },
+    {
+        "fingerprint": "a7552ff3605503bb",
+        "label": "DS-0026 no HEALTHCHECK in Dockerfile",
+        "max": "low",
+        "why": "An availability nicety with no security content at all. Compose defines the healthcheck for this image anyway."
+    },
+    {
+        "fingerprint": "ab0a6a6e604b58a4",
+        "label": "CKV_DOCKER_2 no HEALTHCHECK (checkov's copy)",
+        "max": "low",
+        "why": "The same non-issue as DS-0026, reported by a second scanner against the same file. Dedup keeps both because the fingerprints differ by scanner, so the pair also checks the two get the same judgment."
+    },
+    {
+        "fingerprint": "6bc3382ee638db3a",
+        "label": "KSV-0013 image tag :latest",
+        "max": "medium",
+        "why": "A real operability problem -- an unpinned tag means you cannot say what is running -- and a security one only at one remove. Medium is the ceiling; critical would mean the model is scoring the scanner's vocabulary rather than the risk."
+    }
+]
