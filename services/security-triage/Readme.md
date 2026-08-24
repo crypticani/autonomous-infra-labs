@@ -1088,6 +1088,36 @@ out of service.
 
 ## Tests
 
+### Green locally, red on the runner, for four days
+
+`Security Triage CI` failed on **every run from Day 25 to Day 28** — seven pushes, never once green
+— and the suite passed on my machine every one of those days. Six of `test_provider.py`'s Gemini
+tests are the cause: `genai.Client()` reads the environment at construction and raises without a key,
+and no test here reaches the real backend but `GeminiProvider()` *is* instantiated to test its
+translation logic, which runs the constructor. Locally `provider.py`'s `load_dotenv()` finds the
+repo's `.env` and the key is there. A runner has no `.env`.
+
+Three things about it are worth more than the fix.
+
+**The fix already existed in this repo and could not reach here.**
+[self-healing-agent/tests/conftest.py](../self-healing-agent/tests/conftest.py) has carried
+`os.environ.setdefault("GEMINI_API_KEY", "test-key-never-sent")` before its provider import since
+Day 15, with a comment explaining exactly this. security-triage never inherited it because it had
+**no `conftest.py` at all** until Day 28 added one for the metrics helper. A shared convention does
+not propagate to a service that has nowhere to put it, and "the other service already solved this"
+is not the same as "this service has it".
+
+**The failure was invisible in the place it should have shouted.** `build-and-push` is
+`needs: [lint-and-test, validate-manifests]`, so every red run rendered the publish job as
+*skipped*, not failed. Skipped reads like a deliberate condition — which it was, until Day 28, when
+the job genuinely did not exist yet and the workflow said so in a comment. Two different reasons for
+the same grey circle, and the honest one was covering for the other.
+
+**It is the round trip again, one layer out.** Days 24, 25, 26 and 27 each found a real bug by
+running the thing after the suite was green. This one is the same lesson applied to the suite
+itself: *green* is a claim about the machine that ran it, and the machine that matters is the one
+nobody was watching.
+
 ```bash
 cd services/security-triage
 python -m pytest -v   # 26 scanners + 17 provider + 13 triage + 21 fixes + 14 risk
