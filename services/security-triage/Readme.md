@@ -1085,6 +1085,22 @@ server {
 }
 ```
 
+**Verified 2026-08-24**, and the debugging is worth recording because the symptom is ambiguous in
+this repo in a way it would not be elsewhere. A misconfigured `proxy_pass` returned
+`{"detail":"Not Found"}` — the app's own JSON, so nginx was clearly proxying — and there are *two*
+causes that produce exactly that body:
+
+- **The wrong upstream port.** All four services here are FastAPI, and every one answers
+  `{"detail":"Not Found"}` for an unknown path. Pointing at `7100` or `7200` gets a sibling
+  service's 404, which is byte-identical to this one's.
+- **A trailing slash on `proxy_pass`.** `proxy_pass http://127.0.0.1:7300/` replaces the matched
+  `location` prefix, so `/triage` arrives as `/` and this app 404s on it. A bare `/` counts as a
+  URI; without one the request URI passes through unchanged.
+
+It was the port. The distinguishing signal is `GET /triage`: **405** means the path arrived intact
+and FastAPI recognised the route but refused the method, which no wrong-port or rebased-URI
+configuration can produce. A 404 on that probe says nothing about which of the two it is.
+
 `/metrics` and `/health` are deliberately **not** routed. Both are unauthenticated, both are reached
 over loopback on the host — Prometheus for the first, the container's own healthcheck for the second
 — and `/metrics` publishes per-repo volume, which is somebody else's business.
