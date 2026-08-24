@@ -17,18 +17,8 @@ os.environ.setdefault("ALERT_SYNC_ENABLED", "false")
 # override an existing environment variable.
 os.environ.setdefault("SLACK_ENABLED", "false")
 
-# Same hazard as the two above, and the comment on SLACK_ENABLED predicted it without
-# covering it: the moment a real KC_API_TOKEN landed in .env, load_dotenv() made auth
-# genuinely active and 18 tests that POST without a bearer token got 401 instead of 200.
-# Happened for real on 2026-08-24, when the token was set to deploy security-triage --
-# a suite that had passed for ten days broke on a file it does not read.
-#
-# Assigned, not setdefault, unlike the two above -- and the difference is deliberate.
-# Those are feature flags somebody might reasonably want to flip for a run. This is a
-# credential the suite assumes is absent, so an exported value leaking in from a shell
-# where somebody was curling the deployed service is never what they meant. The tests
-# that are *about* auth monkeypatch app_module.KC_API_TOKEN directly, so pinning the
-# environment costs no coverage.
+# Same hazard, and assigned rather than setdefault: a credential the suite assumes absent
+# must not inherit one from .env or the shell. The auth tests patch the constant directly.
 os.environ["KC_API_TOKEN"] = ""
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))

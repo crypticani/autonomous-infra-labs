@@ -165,9 +165,7 @@ jobs:
           # The caller's token. The service never holds a credential for any repo.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR: ${{ github.event.pull_request.number }}
-          # -R is not optional: this job never checks the caller out, so gh has no git
-          # remote to infer the repo from and dies with "not a git repository". Found on
-          # the first real run, after the endpoint went live.
+          # -R is required: this job has no checkout, so gh cannot infer the repo.
           REPO: ${{ github.repository }}
         run: |
           # --edit-last so a five-push PR carries one verdict, not five.
@@ -175,15 +173,7 @@ jobs:
             || gh pr comment "$PR" -R "$REPO" --body-file "$RUNNER_TEMP/comment.md"
 
       - name: Apply the gate
-        # always(), because this step is the product and the comment step above is
-        # delivery. Without it, a failed comment skips the gate entirely -- which is what
-        # happened on the first live run: score 100 was computed and rendered, then the
-        # job died on `gh` and never evaluated the verdict. Worse in the passing case,
-        # where a transient GitHub API error would fail a build the scan had cleared.
-        #
-        # The comment step is deliberately still allowed to fail the job. A verdict
-        # nobody can read is not a delivered verdict, and this service's whole argument
-        # is that a failure has to be visible rather than swallowed.
+        # always(): without it a failed comment step skips the verdict entirely.
         if: always()
         run: |
           python3 - <<'PY'

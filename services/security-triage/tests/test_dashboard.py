@@ -1,14 +1,4 @@
-"""The committed Grafana dashboard, checked against the metrics it queries.
-
-A panel naming a metric or label that does not exist renders as an empty graph. Nothing
-fails, nothing logs, and the dashboard looks like a quiet service -- which is the same
-failure test_metrics.py guards against one layer down, where a counter incremented under
-the wrong label reads zero forever.
-
-Derived from the metric objects rather than from `REGISTRY.collect()`: a labelled counter
-with no observations emits no samples at all, so collect() would report every metric in
-this service as missing until something happened to touch it.
-"""
+"""The committed Grafana dashboard, checked against the metrics it queries."""
 
 import json
 import re
@@ -23,8 +13,8 @@ DASHBOARD = (
     / "observability/grafana/dashboards/security-triage.json"
 )
 
-# prometheus_client appends `_total` to a counter and expands a histogram into
-# _bucket/_count/_sum, so the exposed names are never the declared ones.
+# prometheus_client renames on the wire: `_total` on counters, _bucket/_count/_sum
+# on histograms.
 _SUFFIXES = {
     "Counter": {"_total": set(), "_created": set()},
     "Histogram": {"_bucket": {"le"}, "_count": set(), "_sum": set()},
@@ -65,8 +55,7 @@ def test_every_panel_queries_a_metric_this_service_exports(title, expr):
 
 @pytest.mark.parametrize("title,expr", expressions())
 def test_every_label_a_panel_uses_exists_on_the_metric(title, expr):
-    """Selectors and `by (...)` clauses both. A `by (repo)` on a metric with no `repo`
-    label collapses every series into one and reads as a working panel."""
+    """A `by (repo)` on a metric without that label collapses every series into one."""
     names = set(re.findall(r"\bst_[a-z_]+\b", expr))
     available = {label for name in names for label in exposed().get(name, ())}
 
@@ -80,8 +69,7 @@ def test_every_label_a_panel_uses_exists_on_the_metric(title, expr):
 
 
 def test_the_datasource_is_a_placeholder_not_a_hardcoded_uid():
-    """A dashboard exported with a real datasource uid imports against nothing on anyone
-    else's Grafana, and the panels are silently empty rather than erroring."""
+    """A real uid imports against nothing elsewhere, and the panels are silently empty."""
     dashboard = json.loads(DASHBOARD.read_text(encoding="utf-8"))
     assert dashboard["__inputs"][0]["name"] == "DS_PROMETHEUS"
     for panel in dashboard["panels"]:
@@ -91,9 +79,7 @@ def test_the_datasource_is_a_placeholder_not_a_hardcoded_uid():
 
 
 def test_every_panel_says_why_it_is_there():
-    """The other three services' dashboards carry a description per panel, and it is the
-    only place a reader learns that a low number is sometimes the healthy one.
-    """
+    """It is the only place a reader learns a low number is sometimes the healthy one."""
     dashboard = json.loads(DASHBOARD.read_text(encoding="utf-8"))
     for panel in dashboard["panels"]:
         assert panel.get("description", "").strip(), panel["title"]

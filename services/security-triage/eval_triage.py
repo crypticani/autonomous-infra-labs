@@ -160,14 +160,9 @@ def main() -> int:
         f"({provider.model_name}), batch size {args.batch_size}"
     )
 
-    # Eval-set order, not fixture order, so which findings share a call is stable across
-    # runs. The order is also *interleaved* -- floor-case, ceiling-case, floor-case -- and
-    # that is a correction, not a style choice. The first version listed all six floor
-    # cases first, which at batch 5 put them all in batch 1; that batch declined 5/5 while
-    # batches 2 and 3 declined 0/7, and "the model declines serious findings" was
-    # indistinguishable from "the model declined batch 1". Interleaving means a
-    # batch-level effect shows up as a mix rather than as a clean band split.
-    # `--batch-size 1` remains the control that removes the question entirely.
+    # Eval-set order, so batch composition is stable. The set is interleaved by band, so
+    # a batch-level effect cannot be mistaken for a band-level one; --batch-size 1 is the
+    # control.
     selected = [findings[case["fingerprint"]] for case in cases]
 
     before = provider.prompt_tokens, provider.output_tokens

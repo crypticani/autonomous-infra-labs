@@ -24,9 +24,7 @@ spec:
         prometheus.io/port: "7300"
         prometheus.io/path: "/metrics"
     spec:
-      # CKV_K8S_38, and the gate found it on its own manifest during the first dogfood
-      # run. This service never calls the Kubernetes API, so mounting a token it cannot
-      # use is a credential in the pod for nothing.
+      # CKV_K8S_38. This service never calls the Kubernetes API.
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
