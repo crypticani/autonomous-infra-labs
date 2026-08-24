@@ -1398,6 +1398,56 @@ image pins 10001. Applying that diff would run the process as a uid that owns no
 `fixes.py` says this in its own note (*"the value is arbitrary but the effect is not"*), and the
 comment says *review, never apply blind*. This is what that sentence was for.
 
+## First eval run — 1/12, and the eval's own flaw
+
+```
+1/12 in band -- 458.0s, 2108 prompt + 1003 output tokens
+```
+
+The result is **inverted**, not merely miscalibrated. Every case carrying a floor came back
+`needs_human`; every case carrying a ceiling came back above it. The model declines the findings
+this repo says are definitely serious — a published RCE CVE, a live ServiceAccount token on disk —
+and inflates the ones it says are noise: `B105` (a filesystem path) and `B106` (the keyword argument
+`prompt`) both came back **critical**.
+
+**The eval's ordering confounded it, and that is my bug.** The first `eval_set.json` listed all six
+floor cases first and all six ceiling cases second. At `ST_BATCH_SIZE=5` that put every floor case in
+batch 1:
+
+| batch | composition | declined |
+|---|---|---|
+| 1 | all six floor cases (five of them) | 5/5 |
+| 2 | one floor, four ceiling | 0/5 |
+| 3 | one floor, one ceiling | 0/2 |
+
+So "the model declines serious findings" and "the model declined batch 1" produce identical output.
+That it is at least partly batch-level is not speculation: the full-corpus dogfood run an hour
+earlier triaged 58 findings through the same model and prompt and returned **one** `needs_human`.
+5/12 against 1/58 is the decline rate moving with batch composition, which is precisely what Day 27
+warned about.
+
+The eval set is now **interleaved** — floor, ceiling, floor — so band type can never align with a
+batch boundary again, and `--batch-size 1` remains the control that removes batching from the
+question entirely.
+
+**What is not confounded.** Two things survive the ordering problem:
+
+- **The ceiling failures are real.** Batches 2 and 3 declined nothing, so `B101` → high,
+  `B105` → critical, `B106` → critical, `DS-0026` → high, `CKV_DOCKER_2` → high and `KSV-0013` → high
+  are judgments the model actually made. Six for six above their ceiling, matching the dogfood run's
+  8 critical and 47 high out of 58.
+- **`confidence` remains worthless**, three days after Day 23 said so and one day after Day 27
+  measured it flat. `CKV_DOCKER_2` scored **1.00** confidence on an answer four bands too high. This
+  is why `risk.py` refuses to weight the score by it.
+
+And the explanations show the model is not confused so much as unwilling. On the declined CVE it
+wrote *"arbitrary code execution via pre-authentication requires specific conditions and context to
+exploit effectively"* — a correct sentence, attached to a refusal. On the declined ServiceAccount
+token: *"JWT token in kubeconfig file without proper validation is a potential security risk"* —
+a judgment, filed as `needs_human`. The prose and the label disagree in the same result, in the
+opposite direction from the over-calling rows. That is the same defect `bench.py` counts, and it is
+the open problem this service ends the day with.
+
 ## Not built yet
 
 - **A `RequestValidationError` handler that drops `input`.** Found while testing the body cap
