@@ -1398,57 +1398,117 @@ image pins 10001. Applying that diff would run the process as a uid that owns no
 `fixes.py` says this in its own note (*"the value is arbitrary but the effect is not"*), and the
 comment says *review, never apply blind*. This is what that sentence was for.
 
-## First eval run — 1/12, and the eval's own flaw
+## The eval, run both ways — 1/12 and 3/12
 
 ```
-1/12 in band -- 458.0s, 2108 prompt + 1003 output tokens
+batch 5 : 1/12 in band --  458.0s, 2108 prompt + 1003 output tokens
+batch 1 : 3/12 in band -- 2657.2s, 5411 prompt + 1127 output tokens
 ```
 
-The result is **inverted**, not merely miscalibrated. Every case carrying a floor came back
-`needs_human`; every case carrying a ceiling came back above it. The model declines the findings
-this repo says are definitely serious — a published RCE CVE, a live ServiceAccount token on disk —
-and inflates the ones it says are noise: `B105` (a filesystem path) and `B106` (the keyword argument
-`prompt`) both came back **critical**.
+The first run was ambiguous through a flaw of mine: `eval_set.json` originally listed all six
+floor-cases first, which at batch 5 put them all in batch 1, and that batch declined 5/5 while the
+rest declined 0/7. "The model declines serious findings" and "the model declined batch 1" produced
+identical output. The set is now **interleaved** — floor, ceiling, floor — so band type can never
+align with a batch boundary again.
 
-**The eval's ordering confounded it, and that is my bug.** The first `eval_set.json` listed all six
-floor cases first and all six ceiling cases second. At `ST_BATCH_SIZE=5` that put every floor case in
-batch 1:
+**`--batch-size 1` settled it: the declines are real.** All five floor-cases came back
+`needs_human` one finding per call, with the entire prompt to themselves. Not batching.
 
-| batch | composition | declined |
-|---|---|---|
-| 1 | all six floor cases (five of them) | 5/5 |
-| 2 | one floor, four ceiling | 0/5 |
-| 3 | one floor, one ceiling | 0/2 |
+| case | band | batch 5 | batch 1 |
+|---|---|---|---|
+| `CVE-2026-45829` chromadb RCE | ≥ high | needs_human | needs_human |
+| `jwt-token` in `.secrets/kubeconfig` | ≥ high | needs_human | needs_human |
+| `KSV-0118` no securityContext | ≥ medium | needs_human | needs_human |
+| `KSV-0001` privilege escalation | ≥ medium | needs_human | needs_human |
+| `KSV-0048` RBAC can manage pods | ≥ medium | needs_human | needs_human |
+| `B101` assert in a `__main__` block | ≤ low | high | high |
+| `B105` a filesystem path | ≤ low | critical | high |
+| `B106` the kwarg `prompt` | ≤ low | critical | high |
+| `CKV_DOCKER_2` no HEALTHCHECK | ≤ low | high | high |
+| `DS-0026` no HEALTHCHECK | ≤ low | high | needs_human ✓ |
+| `KSV-0013` image tag `:latest` | ≤ medium | high | needs_human ✓ |
+| `CKV2_GHA_1` workflow `write-all` | ≥ medium | high ✓ | high ✓ |
 
-So "the model declines serious findings" and "the model declined batch 1" produce identical output.
-That it is at least partly batch-level is not speculation: the full-corpus dogfood run an hour
-earlier triaged 58 findings through the same model and prompt and returned **one** `needs_human`.
-5/12 against 1/58 is the decline rate moving with batch composition, which is precisely what Day 27
-warned about.
+**3/12 is softer than it reads.** Two of the three passes are *declines* that the max-only rule
+tolerates by design. Exactly one case — `CKV2_GHA_1` — is a judgment the model made that landed in
+band. Of the five real calls it made, four were over-called.
 
-The eval set is now **interleaved** — floor, ceiling, floor — so band type can never align with a
-batch boundary again, and `--batch-size 1` remains the control that removes batching from the
-question entirely.
+### Two defects, not one
 
-**What is not confounded.** Two things survive the ordering problem:
+**The declines are a missing-input problem, and the model names it five times unprompted:**
 
-- **The ceiling failures are real.** Batches 2 and 3 declined nothing, so `B101` → high,
-  `B105` → critical, `B106` → critical, `DS-0026` → high, `CKV_DOCKER_2` → high and `KSV-0013` → high
-  are judgments the model actually made. Six for six above their ceiling, matching the dogfood run's
-  8 critical and 47 high out of 58.
-- **`confidence` remains worthless**, three days after Day 23 said so and one day after Day 27
-  measured it flat. `CKV_DOCKER_2` scored **1.00** confidence on an answer four bands too high. This
-  is why `risk.py` refuses to weight the score by it.
+> *"Highly exploitable, but impact is medium without more context."*
+> *"exploitability unclear without more context"* · *"impact unclear without more details"*
+> *"Insufficient context to judge exploitability and impact accurately without more details about
+> the environment"* (twice)
 
-And the explanations show the model is not confused so much as unwilling. On the declined CVE it
-wrote *"arbitrary code execution via pre-authentication requires specific conditions and context to
-exploit effectively"* — a correct sentence, attached to a refusal. On the declined ServiceAccount
-token: *"JWT token in kubeconfig file without proper validation is a potential security risk"* —
-a judgment, filed as `needs_human`. The prose and the label disagree in the same result, in the
-opposite direction from the over-calling rows. That is the same defect `bench.py` counts, and it is
-the open problem this service ends the day with.
+`_format_finding` sends rule_id, title, target, line and scanner severity. It does not send
+`Finding.context` — the lines `scanners.py` captures from all three scanners and only `fixes.py`
+reads. The model is naming the exact field it is not given, and declining is the correct response to
+the question actually asked.
+
+**The over-calling is a missing-rubric problem.** Nothing in `SYSTEM_PROMPT` says what `critical`
+versus `high` versus `low` *means* for a scanner finding. It asks for exploitability, impact and a
+priority that follows from them, and never defines the scale. This is the same gap Day 1's golden set
+found in log-analyzer, which Day 7 closed with an explicit severity rubric.
+
+Both are written up under **Not built yet** rather than patched at the end of a long day: sending
+context roughly triples per-finding prompt tokens, and prompt eval is what dominates wall clock, so
+it is a cost/quality trade that needs measuring rather than a prompt edit.
+
+### What the two runs prove about batching
+
+Day 27's argument — the system prompt is charged once per call whatever rides along — measured in
+reverse:
+
+| | total tokens | wall clock | tokens/s |
+|---|---|---|---|
+| batch 5 | 3,111 | 458s | 6.79 |
+| batch 1 | 6,538 | 2,657s | 2.46 |
+
+Twelve findings either way. Batch 1 sent **2.6× the prompt tokens**, because the system prompt was
+charged twelve times instead of three, and cost **5.8× the wall clock**. Prompt eval dominates on
+CPU, which is the whole reason `ST_BATCH_SIZE` is not 1.
+
+One number is unexplained and left that way: 221s per single-finding call here, against 22.6s
+measured warm through the deployed container earlier the same day. Forty-four minutes of sustained
+CPU inference and thermal throttling is the obvious guess, and one session is not evidence.
+
+### `confidence`, for the third time
+
+`CKV_DOCKER_2` scored **1.00** confidence on an answer four bands above its ceiling. Day 23 measured
+confidence flat, Day 27 measured it flat again, and this is the third confirmation — which is exactly
+why `risk.py` refuses to weight the score by it. Batch 1 did show slightly more spread (0.30 on two
+declines), so it carries *some* signal about declining, and none about being right.
 
 ## Not built yet
+
+- **A `RequestValidationError` handler that drops `input`.** Found while testing the body cap
+  through nginx: FastAPI's 422 includes the offending body in `detail[].input`, so a malformed
+  1.5 MB envelope came back as a 1.5 MB error. At `ST_MAX_BODY_BYTES=16777216` that is a 16 MiB
+  response to a caller who already has the data, landing in their Actions log. Not a security hole
+  -- the caller sent it -- but it is bandwidth amplification on the one endpoint whose callers are
+  other people's CI runners. One `@app.exception_handler(RequestValidationError)` that rewrites
+  each error to `{type, loc, msg}` fixes it.
+
+- **Context lines in the triage prompt, and a severity rubric.** The two defects the eval found,
+  and the first work after the challenge closes. Both runs of `eval_triage.py` put the model at one
+  in-band judgment out of twelve, by two separate mechanisms:
+
+  *Declines* come from missing input. `_format_finding` sends rule_id, title, target, line and
+  severity but not `Finding.context`, and the model said *"insufficient context to judge
+  exploitability and impact"* five times unprompted. Sending it is a few lines; the cost is not.
+  Day 27 measured prompt at `368 + 70.5n` tokens, ten context lines per finding roughly triples the
+  per-finding prompt cost, and the batch-1 run showed prompt eval is what dominates wall clock —
+  2.6× the prompt tokens cost 5.8× the clock. So it needs a measured before/after, with the eval as
+  the instrument, not a prompt edit.
+
+  *Over-calling* comes from a missing rubric. `SYSTEM_PROMPT` asks for exploitability, impact and a
+  priority that follows from them, and never says what the levels mean for a scanner finding — the
+  same gap Day 1 found in log-analyzer and Day 7 closed with an explicit rubric.
+
+  Sequencing matters here: fix context first, re-run, *then* the rubric. Doing both at once makes the
+  eval unable to say which one moved the number.
 
 - **A `RequestValidationError` handler that drops `input`.** Found while testing the body cap
   through nginx: FastAPI's 422 includes the offending body in `detail[].input`, so a malformed

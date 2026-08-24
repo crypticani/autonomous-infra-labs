@@ -15,6 +15,31 @@ outcomes, per-stage latency and the retrieval-similarity distribution to Prometh
 Grafana dashboard built on them. `POST /ask-runbook` takes a bearer token. The similarity floor
 is no longer a guess — it was **measured** at 0.64, and the measurement overturned the
 assumption that had been sitting in the backlog. See [Day 14](#day-14--metrics-auth-and-a-measured-floor).
+## A suite that broke on a file it does not read
+
+`tests/` passed for ten days and then went 18-red without a line of this service changing. The cause
+was `KC_API_TOKEN` being set in the repo's shared `.env` — to deploy a *different* service — which
+`load_dotenv()` then made real at import, turning auth on and giving 401 to every test that POSTs
+`/ask-runbook` without a bearer token.
+
+`conftest.py` already neutralised `ALERT_SYNC_ENABLED` and `SLACK_ENABLED` for exactly this reason,
+and the comment above the second one predicts the bug almost word for word: *"once real SLACK_* keys
+land in .env, load_dotenv() would make the route genuinely active."* The reasoning was right and the
+coverage was one variable short.
+
+It is now pinned with an assignment rather than `setdefault`, unlike those two, and the asymmetry is
+the point: a feature flag is something somebody might reasonably flip for a run, while a credential
+the suite assumes absent leaking in from a shell — where somebody was curling the deployed service —
+is never what they meant. The tests that are *about* auth monkeypatch `app_module.KC_API_TOKEN`
+directly, so pinning the environment costs no coverage. Verified 197 green with every token exported,
+with none, and with no `.env` on disk at all.
+
+Third instance of the same root cause in one day. security-triage's CI had been red since the day it
+was written because `genai.Client()` reads `GEMINI_API_KEY` at construction and a runner has no
+`.env`; that fix could not propagate here, because these are two conftest files and nothing makes
+them agree. **A test suite that depends on ambient environment state is only green on the machine
+that ran it.**
+
 
 ## How it fits together
 

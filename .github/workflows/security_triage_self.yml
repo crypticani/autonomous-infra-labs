@@ -21,7 +21,10 @@ jobs:
     with:
       endpoint: ${{ vars.SECURITY_TRIAGE_ENDPOINT }}
       # Higher than the shipped default of 40: this tree's findings are dominated by a
-      # sandbox cluster and hygiene rules. A placeholder until a real run produces one.
+      # sandbox cluster and hygiene rules. Still a placeholder, and the first real run did
+      # not settle it -- it scored 100 with 8 critical and 47 high out of 58, which
+      # eval_triage.py then showed to be over-calling rather than risk. Set this from a
+      # corpus the model judges correctly, not from this one.
       risk-threshold: '60'
       # Local, so a change to scan.sh is exercised by the PR that makes it.
       triage-ref: ${{ github.event.pull_request.head.sha }}
