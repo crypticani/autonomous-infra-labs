@@ -1,0 +1,394 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Select your existing Prometheus datasource on import.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "datasource",
+      "id": "prometheus",
+      "name": "Prometheus",
+      "version": "1.0.0"
+    },
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "9.0.0"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "type": "dashboard",
+        "name": "Annotations & Alerts",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)"
+      }
+    ]
+  },
+  "editable": true,
+  "id": null,
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": [
+    "security-triage",
+    "security",
+    "ci"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "title": "Security Triage \u2014 Volume, Verdicts & Judgment Quality",
+  "uid": "security-triage-overview",
+  "version": 1,
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Runs by outcome and repo (per hour)",
+      "description": "failed climbing for one repo is a broken envelope; climbing across all of them is the model backend, which is this deploy's commoner outage -- the laptop hosting Ollama is not always awake, and a run started while it sleeps ends as a recorded failure. accepted far above done+failed means runs are wedged, not slow.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (repo, outcome) (increase(st_runs_total[1h]))",
+          "legendFormat": "{{repo}} {{outcome}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Findings through the pipeline (per hour)",
+      "description": "Two gaps, both real failures. raw -> deduped is the dedup ratio: collapsing toward 1.0 means fingerprinting stopped working. deduped -> triaged is the model answering about fewer findings than it was given, which triage.py drops silently and no other panel would show.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (stage) (increase(st_findings_total[1h]))",
+          "legendFormat": "{{stage}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Judgments by priority (per hour)",
+      "description": "The model's own behaviour, deliberately not split by repo. needs_human rising is the model declining more of what it is shown -- the failure mode where every guard passes and the run looks clean. Watch it against the other four, not on its own.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (priority) (increase(st_priorities_total[1h]))",
+          "legendFormat": "{{priority}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Verdicts by repo (per hour)",
+      "description": "How often the gate actually blocks each repo. A repo at 100% fail has its risk_threshold set wrong, which is a conversation about policy rather than about the model.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (repo, verdict) (increase(st_verdicts_total[1h]))",
+          "legendFormat": "{{repo}} {{verdict}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Run duration p50/p95 (s)",
+      "description": "The tail is the interesting end: nobody sees a slow run except as a CI job that never finishes. A run is ceil(findings / ST_BATCH_SIZE) sequential model calls, so p95 approaching poll-timeout-minutes (45m) in the reusable workflow is the number that fails somebody's build without failing anything here.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(st_run_duration_seconds_bucket[6h])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(st_run_duration_seconds_bucket[6h])))",
+          "legendFormat": "p50"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tokens billed per hour",
+      "description": "What the deploy costs. Both backends are free at the margin, so this is the unit that matters if it ever moves to a paid tier -- multiply by the rate. output includes reasoning tokens, billed at the output rate.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (direction) (increase(st_model_tokens_total[1h]))",
+          "legendFormat": "{{direction}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Refusals by control (per hour)",
+      "description": "\"Requests were refused\" is not actionable; which control refused is. rate_limit or body_size is a misconfigured CI job to go and fix. auth is somebody trying tokens.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum by (reason) (increase(st_refusals_total[1h]))",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Risk score p50/p95",
+      "description": "Buckets are risk.WEIGHTS' own boundaries -- 1 is one low, 4 one medium, 15 one high, 40 one critical and also the default threshold. A histogram rather than a gauge because a gauge holds whatever landed most recently and says nothing about the trend.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 24
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(st_risk_score_bucket[24h])))",
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "B",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(st_risk_score_bucket[24h])))",
+          "legendFormat": "p50"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "needs_human rate (%)",
+      "description": "Deliberately uncoloured: a high number here is not automatically a failure. _format_finding sends rule_id, title, target and severity but NOT the scanner's context lines, so for a finding like bandit B105 the model is shown \"possible hardcoded password at settings.py:3, LOW\" and cannot see the line. Declining that is the correct answer to the question asked. Read this as \"how much of the corpus is unjudgeable as currently prompted\", and the fix is the prompt, not the model.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "none",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * sum(increase(st_priorities_total{priority=\"needs_human\"}[24h])) / clamp_min(sum(increase(st_priorities_total[24h])), 0.0001)"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Findings dropped by the model (24h)",
+      "description": "deduped minus triaged. Should be zero. Anything else is the model returning results for fewer findings than it was sent -- triage.py refuses fingerprints that were never sent, so they vanish here and the run still reports success. Coloured, unlike the two beside it, because there is no benign reading.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "sum(increase(st_findings_total{stage=\"deduped\"}[24h])) - sum(increase(st_findings_total{stage=\"triaged\"}[24h]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Gate fail rate (%)",
+      "description": "Also uncoloured. A high fail rate can be a gate doing its job on a repo that needs work, and a zero fail rate can be a threshold set too high to ever fire. Neither number is good or bad without knowing the repo.",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 32
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent"
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        },
+        "colorMode": "none",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": "${DS_PROMETHEUS}",
+          "expr": "100 * sum(increase(st_verdicts_total{verdict=\"fail\"}[24h])) / clamp_min(sum(increase(st_verdicts_total[24h])), 0.0001)"
+        }
+      ]
+    }
+  ]
+}

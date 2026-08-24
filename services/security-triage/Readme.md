@@ -1036,10 +1036,28 @@ Third time this shape has been needed here — `ST_GEMINI_MODEL` for per-model q
 `ST_LLM_TIMEOUT` for a background run against a waiting human, now the backend host. One shared knob
 can only ever be right for one of its readers.
 
-### nginx, and the cap that would have silently overridden the other cap
+### The subdomain, and the cap that would have silently overridden the other cap
 
 One hostname per service, matching the other three — a service means one directory, one image, one
-compose entry, one CI workflow, one hostname.
+compose entry, one CI workflow, one hostname. `triage.crypticani.dev` gets its own server block
+rather than a `location` on an existing one, for the reason the agent's Readme gives about
+`sha.crypticani.dev`: a mis-scoped `location` is one edit away from serving this endpoint under
+another service's name, and this one holds every onboarded repo's API token.
+
+Three steps, in order, because each depends on the one above:
+
+```bash
+# 1. DNS: an A record for triage.crypticani.dev at appsrv's public address.
+#    Confirm it resolves before touching nginx -- certbot's HTTP-01 challenge needs it.
+dig +short triage.crypticani.dev
+
+# 2. The server block below, then a syntax check before a reload.
+sudo nginx -t && sudo systemctl reload nginx
+
+# 3. TLS. --expand adds this name to the existing certificate rather than issuing a
+#    second one, the same way sha.crypticani.dev was added.
+sudo certbot --nginx --expand -d triage.crypticani.dev
+```
 
 ```nginx
 server {
@@ -1075,6 +1093,52 @@ No `proxy_read_timeout` tuning is needed, and that is Day 25's ack-now/answer-la
 `POST /triage` returns `202` in milliseconds and the caller polls. A synchronous endpoint would have
 needed a proxy timeout longer than a triage run, which is to say longer than nginx will sensibly hold
 a connection open.
+
+## Prometheus and the dashboard
+
+`/metrics` is a loopback scrape, alongside the other three:
+
+```yaml
+  - job_name: security-triage
+    static_configs:
+      - targets: ["127.0.0.1:7300"]
+```
+
+```bash
+curl -X POST http://localhost:9090/-/reload    # or SIGHUP without --web.enable-lifecycle
+```
+
+Then import [`observability/grafana/dashboards/security-triage.json`](observability/grafana/dashboards/security-triage.json)
+— eleven panels, `${DS_PROMETHEUS}` picked on import so it carries no datasource uid from
+whichever Grafana exported it.
+
+Eight of the panels are the obvious ones: runs by outcome and repo, findings through the pipeline,
+judgments by priority, verdicts by repo, run duration p50/p95, tokens per hour, refusals by control,
+risk score p50/p95. Three are worth explaining, and two of those are **deliberately uncoloured** —
+the same choice the agent's dashboard makes for approval rate, where a low number is the guardrails
+working rather than a failure.
+
+**needs_human rate — uncoloured.** A high number here is not automatically bad, and the first live
+run is why. `_format_finding` sends rule_id, title, target, line and scanner severity, but **not the
+scanner's context lines** — so for `bandit:B105` the model is shown "possible hardcoded password at
+settings.py:3, LOW" and cannot see `password = 'hunter2'`. Declining that is the correct answer to
+the question actually asked. Read this panel as *how much of the corpus is unjudgeable as currently
+prompted*; the fix is the prompt, not the model. See the note in **Not built yet** below.
+
+**Gate fail rate — uncoloured.** A high rate can be a gate doing its job on a repo that needs work;
+a zero rate can be a threshold set too high to ever fire. Neither is good or bad without knowing the
+repo, which is exactly why `risk_threshold` is per-request.
+
+**Findings dropped by the model — coloured, red above zero.** `deduped` minus `triaged`. There is no
+benign reading: `triage.py` refuses fingerprints that were never sent, so a model answering about
+four of the five findings it was given loses one silently and the run still reports success. This is
+the one number on the dashboard where any value but zero is a bug.
+
+`tests/test_dashboard.py` checks every panel's expression against `metrics.py` — every metric name,
+every selector label, every `by (...)` clause. The failure it exists for is silent: a panel naming a
+label the metric does not carry renders an empty graph, which is indistinguishable from a quiet
+service. A `by (repo)` on a metric with no `repo` label is worse, because it collapses every series
+into one and looks like it works.
 
 ### The backend is a laptop, and that is not a bug
 
@@ -1122,7 +1186,7 @@ nobody was watching.
 cd services/security-triage
 python -m pytest -v   # 26 scanners + 17 provider + 13 triage + 21 fixes + 14 risk
                       #   + 14 app + 11 comment + 5 runtime + 10 bench
-                      #   + 7 metrics + 17 eval = 155, if green
+                      #   + 7 metrics + 17 eval + 29 dashboard = 184, if green
 ```
 
 `test_scanners.py` (26, Days 22, 24 and 26): each scanner's real shape, a missing-scanner-key envelope, CVE
@@ -1197,6 +1261,14 @@ every priority, `needs_human` failing a `min` case and passing a `max` one, a fi
 answered about failing rather than being absent, `needs_human` staying off the severity scale, and a
 check that every committed case actually asserts something.
 
+`test_dashboard.py` (29, Day 28): every panel expression in the committed Grafana JSON checked
+against `metrics.py` — metric names, selector labels, `by (...)` clauses, the datasource placeholder,
+and that every panel carries a description. Derived from the metric *objects* rather than from
+`REGISTRY.collect()`, because a labelled counter with no observations emits no samples at all and
+collect() would report every metric here as missing. The failure it exists for is silent: an empty
+graph reads as a quiet service, and a `by (repo)` on a metric with no `repo` label collapses every
+series into one and looks like it works.
+
 `test_runtime.py` (5, Day 26): the collector — one event per line, a torn last line being *counted*
 rather than swallowed (the API server appends to this file live, so a log captured mid-write
 routinely ends in half an event, and a file of nothing but torn lines is a different problem that a
@@ -1221,10 +1293,18 @@ curl -s localhost:7300/health | jq       # `healthy`, or `degraded` with the rea
 
 ## Not built yet
 
-- **A Grafana dashboard.** `/metrics` is live and scrapeable; the panels are not built. The three
-  worth having are the per-repo verdict rate, the `needs_human` trend, and `st_run_duration_seconds`'
-  tail against `ST_LLM_TIMEOUT` — but a dashboard drawn before there is a week of data on it is a
-  screenshot, not an instrument.
+- **Context lines in the triage prompt.** `scanners.py` captures `context` from all three scanners
+  and `fixes.py` is the only module that reads it — `_format_finding` never sends it to the model.
+  The first live run made that visible: `bandit:B105` on `password = 'hunter2'` came back
+  `needs_human`, correctly, because all the model saw was "possible hardcoded password at
+  settings.py:3, LOW". It is indistinguishable from the `/var/run/secrets/.../token` false positive
+  that is case 8 of the eval set.
+
+  Not a free fix. Day 27 measured prompt at `368 + 70.5n` tokens, and ten context lines per finding
+  roughly triples the per-finding prompt cost. Wall clock is output-bound so latency moves less than
+  tokens do, but prompt eval on CPU is not nothing. It also changes what the eval means: the three
+  noise cases carry only a `max`, so a decline *passes* them, and 12/12 today cannot distinguish
+  "correctly triaged as noise" from "could not see it".
 - **Aggregating repeated same-rule findings** — a known ceiling, deliberately not built. Day 27 fixed
   the B101 flood by not scanning test files, which is the right fix for that case but not a general
   one: 7 `bandit:B104` and 6 `checkov:CKV2_GHA_1` findings survive, and for a human
