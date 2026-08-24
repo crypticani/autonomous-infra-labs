@@ -175,6 +175,16 @@ jobs:
             || gh pr comment "$PR" -R "$REPO" --body-file "$RUNNER_TEMP/comment.md"
 
       - name: Apply the gate
+        # always(), because this step is the product and the comment step above is
+        # delivery. Without it, a failed comment skips the gate entirely -- which is what
+        # happened on the first live run: score 100 was computed and rendered, then the
+        # job died on `gh` and never evaluated the verdict. Worse in the passing case,
+        # where a transient GitHub API error would fail a build the scan had cleared.
+        #
+        # The comment step is deliberately still allowed to fail the job. A verdict
+        # nobody can read is not a delivered verdict, and this service's whole argument
+        # is that a failure has to be visible rather than swallowed.
+        if: always()
         run: |
           python3 - <<'PY'
           import json, os, sys

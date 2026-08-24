@@ -1370,10 +1370,21 @@ threshold of 60 — a `fail`.
 this Readme to pass it. One is fixed (`CKV_K8S_38`), one is a documented refusal (`:latest`). Details
 above.
 
-**The workflow had a bug that only a live endpoint could surface.** `gh pr comment` needs
-`-R "$GITHUB_REPOSITORY"`, because the `report` job deliberately never checks the caller out and so
-has no git remote to infer the repo from. It failed with `fatal: not a git repository` *after*
-rendering the comment perfectly. Day 25 wrote that step and it had never once run.
+**The workflow had two bugs that only a live endpoint could surface**, and the second was hiding
+behind the first.
+
+`gh pr comment` needs `-R "$GITHUB_REPOSITORY"`: the `report` job deliberately never checks the
+caller out, so `gh` has no git remote to infer the repo from and dies with `fatal: not a git
+repository`. It failed *after* rendering the comment perfectly. Day 25 wrote that step and it had
+never once run.
+
+Which then revealed that **`Apply the gate` was the last step in the job**, after the comment. So the
+verdict was computed, rendered, and never evaluated — the run went red for the `gh` failure while the
+step that turns score-versus-threshold into an exit code never executed. The failing case is
+harmless by luck (red either way), but the passing one is not: a transient GitHub API error on the
+comment step would fail a build the scan had cleared. `Apply the gate` now carries `if: always()`,
+so the verdict is computed regardless. The comment step is still allowed to fail the job, because a
+verdict nobody can read is not a delivered verdict.
 
 **Priority calibration is the open problem, and it moved rather than resolved.** Day 27 found
 `priority` anti-correlated with its own inputs and fixed it by reordering the schema so the ratings
