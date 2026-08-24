@@ -1344,6 +1344,14 @@ curl -s localhost:7300/health | jq       # `healthy`, or `degraded` with the rea
 
 ## Not built yet
 
+- **A `RequestValidationError` handler that drops `input`.** Found while testing the body cap
+  through nginx: FastAPI's 422 includes the offending body in `detail[].input`, so a malformed
+  1.5 MB envelope came back as a 1.5 MB error. At `ST_MAX_BODY_BYTES=16777216` that is a 16 MiB
+  response to a caller who already has the data, landing in their Actions log. Not a security hole
+  -- the caller sent it -- but it is bandwidth amplification on the one endpoint whose callers are
+  other people's CI runners. One `@app.exception_handler(RequestValidationError)` that rewrites
+  each error to `{type, loc, msg}` fixes it.
+
 - **Context lines in the triage prompt.** `scanners.py` captures `context` from all three scanners
   and `fixes.py` is the only module that reads it — `_format_finding` never sends it to the model.
   The first live run made that visible: `bandit:B105` on `password = 'hunter2'` came back
