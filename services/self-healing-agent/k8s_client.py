@@ -1,10 +1,4 @@
-"""Building the two API clients this service needs, in one place.
-
-Every tool in tools/ takes `(core, apps)` as its first argument rather than importing
-this module itself -- the same shape store.py plays for the copilot. That is what makes
-every tool testable with a fake client and no cluster, and it is why this module is a
-leaf: nothing else in the service constructs an ApiClient.
-"""
+"""Building the two API clients this service needs, in one place."""
 
 import os
 from functools import lru_cache

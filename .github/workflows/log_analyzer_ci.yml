@@ -52,10 +52,8 @@ jobs:
 
   build-and-push:
     needs: [lint-and-test, validate-manifests]
-    # Load-bearing since the `pull_request` indentation was fixed on day 14. It was
-    # added a day earlier, while that trigger still never fired, precisely so the fix
-    # could not on its own start publishing :latest from unmerged pull-request code.
-    # Removing this re-opens that hole.
+    # Load-bearing: without it the `pull_request` trigger publishes :latest from
+    # unmerged code.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

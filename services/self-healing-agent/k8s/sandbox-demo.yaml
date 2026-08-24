@@ -1,5 +1,5 @@
-# The capstone's failure target: a deployment with nothing else depending on it, so
-# scaling it to 0 and back is a real, observable, and completely harmless failure.
+# The capstone's failure target: nothing depends on it, so scaling it to 0 and back is a
+# real but harmless failure.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

@@ -1,22 +1,16 @@
-"""Golden-set eval for the diagnosis loop -- Day 28.
+"""Golden-set eval for the diagnosis loop.
 
 What is graded is **the proposed action, including when it should be none.** Not the
-summary text, not the evidence list, not confidence -- those are prose, and grading prose
-needs either a human or a second model, neither of which belongs in a command that has to
-run in one line. The proposed action is the only output of this service that a human can
-click to make something happen in a cluster, so it is the only one worth a regression gate.
+summary or the evidence -- grading prose needs a human or a second model. The proposed
+action is the only output a human can click to make something happen in a cluster.
 
-Two of the four cases expect `null`, and that is the design rather than a gap in the
-fixtures. `proposed_action: null` is this service's `needs_human`: an OOMKill wants a
-higher memory limit and nothing in the write toolset can set one, so the honest answer is
-to say so. An agent that always proposes something scores 2/4 here, and so does one that
-never proposes anything -- the pass mark requires telling the two situations apart.
+Two of the four cases expect `null`, which is the design: an OOMKill wants a higher
+memory limit and no write tool can set one. An agent that always proposes something
+scores 2/4, and so does one that never does -- passing means telling them apart.
 
-The cluster is stubbed. `agent._dispatch` is replaced with a lookup into each case's
-`tool_outputs`, so the model makes real calls and takes real decisions while the tools
-answer from a fixture. The alternative -- a live kind cluster wedged into four specific
-broken states -- is not something anybody runs before a commit, and an eval nobody runs is
-not a gate. What is stubbed is the cluster; what is measured is the model.
+The cluster is stubbed and the model is not. `agent._dispatch` becomes a lookup into
+each case's `tool_outputs`. A live kind cluster wedged into four broken states is not
+something anybody runs before a commit, and an eval nobody runs is not a gate.
 
     python eval/run_eval.py                # exits non-zero if any case fails
 """
@@ -41,12 +35,7 @@ console = Console()
 
 
 def stub_dispatch(tool_outputs: dict):
-    """`agent._dispatch`'s contract, served from a fixture.
-
-    A tool with no canned output returns `{"error": ...}` rather than an empty success,
-    because that is what the real dispatch does when a tool raises -- and an agent that
-    cannot cope with a tool failing is one that will not survive its first real cluster.
-    """
+    """`agent._dispatch`'s contract, served from a fixture."""
 
     def _dispatch(name: str, args: dict) -> dict:
         canned = tool_outputs.get(name)

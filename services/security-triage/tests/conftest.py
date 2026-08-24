@@ -25,16 +25,7 @@ from prometheus_client import REGISTRY  # noqa: E402
 
 
 def metric(name: str, **labels) -> float:
-    """One counter's current value, read the way Prometheus reads it.
-
-    Through the registry rather than `counter._value`, because the private attribute
-    would still answer for a metric whose labels are wrong -- and a mislabelled counter
-    is exactly the failure that survives review and then shows up as an empty graph.
-    Same helper as self-healing-agent/tests/conftest.py.
-
-    Counters accumulate for the life of the process, so every caller measures a delta
-    across the thing under test rather than an absolute.
-    """
+    """One counter's current value, read the way Prometheus reads it."""
     return REGISTRY.get_sample_value(name, labels) or 0.0
 
 

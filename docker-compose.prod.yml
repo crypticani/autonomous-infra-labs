@@ -1,13 +1,12 @@
-# Production compose: runs the published GHCR images instead of building from source.
+# Runs the published GHCR images instead of building from source.
 #
 #   docker compose -f docker-compose.prod.yml pull
 #   docker compose -f docker-compose.prod.yml up -d
 #
-# Standalone rather than an override. Compose can add to a service but cannot remove a
-# key, so layering this over docker-compose.yml would leave `build:` in place and `up`
-# would rebuild from the working tree instead of running the image you just pulled.
+# Standalone rather than an override: compose can add a key but cannot remove one, so
+# layering this over docker-compose.yml would leave `build:` in place and rebuild.
 #
-# A fresh host still needs the copilot's index populated once, before first start:
+# A fresh host needs the copilot's index populated once, before first start:
 #   docker compose -f docker-compose.prod.yml run --rm knowledge-copilot python ingest.py
 #
 # All four services read the same root .env. See .env.example for every key.
@@ -15,8 +14,7 @@
 services:
   log-analyzer:
     image: ghcr.io/crypticani/autonomous-infra-labs/log-analyzer:${LOG_ANALYZER_TAG:-latest}
-    # A moving tag does not re-pull just because it moved: if an image with the same tag
-    # is already local, `up` reuses it and the host quietly keeps serving the old build.
+    # A moving tag is not re-pulled just because it moved.
     pull_policy: always
     container_name: log-analyzer
     env_file:
@@ -40,27 +38,19 @@ services:
     container_name: knowledge-copilot
     env_file:
       - .env
-    # Single worker on purpose -- two would run two alert-sync loops racing on the same
-    # writes. uvicorn defaults to one, so no flag is needed to get it.
+    # Single worker: two would race two alert-sync loops on the same writes.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${COPILOT_PORT:-7100}"]
     ports:
-      # Loopback only: nginx terminates TLS on the same host and proxies to it, and
-      # nothing else needs the port. Docker publishes via nat/PREROUTING, ahead of any
-      # filter/INPUT rule a host firewall adds, so the bind address is the control that
-      # actually holds here. A cloud NSG still filters before the NIC; this is the layer
-      # underneath it.
+      # Loopback only; nginx terminates TLS on this host and proxies to it. Docker
+      # publishes via nat/PREROUTING, ahead of any filter/INPUT rule, so the bind address
+      # is the control that actually holds.
       - "127.0.0.1:${COPILOT_PORT:-7100}:${COPILOT_PORT:-7100}"
-    # A bind mount keeps the HOST directory's uid rather than inheriting the image's,
-    # and the image runs as appuser (uid 100) -- so the container user is overridden to
-    # the host owner of chroma_data, which also lets the CLI and the container share one
-    # index. Override in .env if `id -u` is not 1000 on this host.
+    # Bind mounts keep the host uid. Override in .env if `id -u` is not 1000.
     user: "${KC_UID:-1000}:${KC_GID:-1000}"
     volumes:
-      # Both bind mounts, so a runbook edit or a re-ingest needs no new image.
       - ./services/knowledge-copilot/corpus:/app/corpus:ro
       - ./services/knowledge-copilot/chroma_data:/app/chroma_data
     extra_hosts:
-      # Ollama, Alertmanager and Prometheus run on the host, not in this project.
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
@@ -76,27 +66,18 @@ services:
     container_name: self-healing-agent
     env_file:
       - .env
-    # --workers 1 for a different reason than the copilot's: approvals._proposals is
-    # in-process memory, so a second worker means Slack's click can land on the worker
-    # that does not hold the proposal, and a valid Approve returns "expired or unknown".
+    # --workers 1: approvals._proposals is in-process, so a second worker would answer
+    # "expired or unknown" to a valid Slack Approve.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${SHA_PORT:-7200}", "--workers", "1"]
     ports:
-      # Loopback only, same reasoning as the copilot: nginx terminates TLS on this host
-      # and proxies to it. Slack reaches /slack/interactive through nginx, never here.
       - "127.0.0.1:${SHA_PORT:-7200}:${SHA_PORT:-7200}"
     user: "${SHA_UID:-1000}:${SHA_GID:-1000}"
     environment:
-      # k8s_client.py's config.load_kube_config() reads this when set, in-container path
-      # for the file the volume below mounts. Scoped to this service only -- the other
-      # two containers don't touch kubernetes and don't need it in their environment.
       - KUBECONFIG=/home/appuser/.kube/config
     volumes:
       # The audit log is a safety control and has to outlive the container.
       - ./services/self-healing-agent/audit:/app/audit
-      # Day 21's sandbox kind cluster, reached over Tailscale (see k8s/ in the service
-      # dir). A ServiceAccount token scoped to the sandbox namespace, not an admin
-      # kubeconfig -- least privilege even though this container already runs the RBAC
-      # that scopes the API calls themselves.
+      # A ServiceAccount token scoped to the sandbox namespace, not an admin kubeconfig.
       - ./services/self-healing-agent/.secrets/kubeconfig:/home/appuser/.kube/config:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -114,24 +95,14 @@ services:
     container_name: security-triage
     env_file:
       - .env
-    # --workers 1 for three reasons at once here, not one: `_runs` holds every run's
-    # verdict in process memory, `_starts` holds the per-token rate-limit buckets, and
-    # prometheus_client's registry is per-process. A second worker would 404 on runs it
-    # never saw, allow double the rate limit, and export half the metrics per scrape.
+    # --workers 1 for three reasons here: _runs holds verdicts, _starts holds rate-limit
+    # buckets, and the Prometheus registry is per-process.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${ST_PORT:-7300}", "--workers", "1"]
     ports:
-      # Loopback only, same reasoning as the other two: nginx terminates TLS on this host
-      # and proxies to it. This is the one service here whose callers are other repos'
-      # GitHub Actions runners, so the public path genuinely matters -- and it is nginx,
-      # not this bind.
       - "127.0.0.1:${ST_PORT:-7300}:${ST_PORT:-7300}"
-    # No `user:` override and no volumes, unlike the other two: nothing is bind-mounted,
-    # so there is no host uid to match. The image's own numeric uid 10001 stands.
+    # No user override and no volumes: nothing is bind-mounted, so the image's own uid
+    # 10001 stands.
     extra_hosts:
-      # Ollama runs on the laptop over Tailscale rather than on this host, so
-      # OLLAMA_BASE_URL in .env is a tailnet address and this mapping is not what
-      # resolves it. It stays for consistency with the sibling services and because a
-      # host-local Ollama is the obvious fallback if the laptop stops being the backend.
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
@@ -139,7 +110,4 @@ services:
       interval: 60s
       timeout: 30s
       retries: 3
-      # The same 10s as the others despite this service's requests taking minutes: what
-      # starts slowly here is /triage, not the process. /health touches nothing but the
-      # provider factory.
       start_period: 10s

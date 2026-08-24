@@ -346,11 +346,7 @@ SEARCH = {"question": "why do my pods get OOMKilled after a deploy"}
 
 
 def test_search_runbooks_returns_chunks_and_never_calls_the_model(wire):
-    """The assertion the whole endpoint exists for: retrieval, no generation.
-
-    Counting the spy's calls is the only way to prove a model was skipped -- the same
-    check that keeps the refusal path honest.
-    """
+    """The assertion the whole endpoint exists for: retrieval, no generation."""
     spy = wire(HITS)
     response = client.post("/search-runbooks", json=SEARCH)
 

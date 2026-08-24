@@ -35,10 +35,8 @@ COPY --from=builder /opt/venv /opt/venv
 
 COPY . .
 
-# chroma_data is created here so the image also works with no mount at all -- the
-# directory has to exist and be writable before Chroma opens a PersistentClient.
-# Compose bind-mounts the host's chroma_data over it and overrides `user:` to the
-# host owner, because a bind mount keeps the host uid rather than the image's.
+# Must exist and be writable before Chroma opens a PersistentClient, so the image works
+# with no mount at all. Compose bind-mounts over it.
 RUN mkdir -p /app/chroma_data && chown -R appuser:appgroup /app
 
 USER appuser

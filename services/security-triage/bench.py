@@ -1,28 +1,16 @@
-"""Cost and latency per batch size -- Day 27.
+"""Cost and latency per batch size.
 
-Sets ST_BATCH_SIZE from a measurement instead of Day 23's guess of 5.
+**Per-call cost across batch sizes, not a matched race between them.** Each config
+triages `batch_size * calls` findings off the head of the corpus, so the wall clocks are
+not "time to triage the corpus". What decides the default is the per-call token split:
+the system prompt is charged once per call whatever rides along, so prompt tokens per
+finding falls as the batch grows.
 
-**This measures per-call cost across batch sizes, not a matched race between them.** Each
-config triages `batch_size * calls` findings off the head of the corpus, so batch 1 and
-batch 10 are not judging the same findings, and the wall clocks are not directly
-comparable as "time to triage the corpus". That is deliberate, not a shortcut around a
-better design: the Ollama budget is 15 minutes for this service and a matched comparison
-at batch 1 over ten findings is ten CPU calls, ~20 minutes on its own. What is comparable,
-and what actually decides the default, is the per-call token split -- the system prompt is
-charged once per call whatever rides along with it, so prompt tokens per finding falls as
-the batch grows and the whole-corpus figure follows from that arithmetic rather than from
-sitting through it. Wall clock is here to check that model against reality, not to be it.
-
-The quality columns are the reason this is not a throughput benchmark. Day 23 established
-that this pipeline can satisfy every guard and still be worthless -- five byte-identical
-explanations, needs_human on everything, all counts green. Batch size has the same failure
-surface: if 10 findings per call means the model starts dropping fingerprints or declining
-more of them, that is the reason not to raise the default, and findings-per-minute alone
-would have said the opposite. Cheapest batch and best batch are different questions.
+The quality columns are why this is not a throughput benchmark: the pipeline can satisfy
+every guard and still be worthless.
 
     python bench.py                          # 1,3,5,10 against ST_LLM_PROVIDER
     python bench.py --batches 5 --calls 2    # a second sample at one size
-    python bench.py --batches 5 --calls 112  # the full-corpus run (Gemini only)
 """
 
 import argparse
@@ -34,32 +22,21 @@ from provider import BaseTriageProvider, get_triage_provider
 from scanners import dedupe, parse_envelope
 from triage import EXPLANATION_MAX, TriageResult, triage_batch
 
-# Cost is reported in tokens and calls per 1,000 findings, not dollars, and that is the
-# honest unit rather than a missing feature. Both backends here are free at the margin:
-# Ollama is local, and Gemini runs on the free tier. What is actually scarce is different
-# for each -- laptop CPU-minutes for Ollama, and for Gemini the free tier's per-minute and
-# per-day *request* ceilings, which charge per call regardless of how many findings rode
-# along in it. Requests per 1,000 findings is therefore the Gemini cost model, and it is
-# exactly what batch size buys down. A dollar column would read $0.00 for every row here
-# and teach nothing; anyone moving this to a paid tier can multiply the token columns by
-# their own rate, which will not be the rate that was current today anyway.
+# Tokens and calls per 1,000 findings, not dollars: both backends are free at the margin,
+# and what is scarce differs -- CPU-minutes for Ollama, request ceilings for Gemini's free
+# tier, which charge per call however many findings rode along. A dollar column would read
+# $0.00 for every row. Multiply the token columns by your own rate on a paid tier.
 
 
 def _contradictions(results: list[TriageResult]) -> int:
     """Results whose explanation asserts a severity the same result rated low.
 
-    The Day 26 bug, counted: explanations announcing "the impact is high" on findings the
-    model itself had just rated impact low. A model can contradict its own structured
-    fields and every guard still passes, because each field is individually valid.
+    A model can contradict its own structured fields with every guard passing, because
+    each field is individually valid. Negation is handled: without it, all 4 reported
+    contradictions were "not easily exploitable" on an `exploitability: low` finding.
 
-    Negation is handled, because not handling it was worse than the paraphrases this
-    misses. The full-corpus run reported 4 contradictions and all 4 were the phrase "not
-    easily exploitable" on an `exploitability: low` finding -- which *agrees* with the
-    rating. A checker that invents violations is worse than one that misses them: it sends
-    you looking for a bug in the model when the bug is in the checker.
-
-    ponytail: still a keyword match, so paraphrases slip through. Upgrade to an LLM-judge
-    in eval_triage.py if the count sits at zero while the output still reads wrong.
+    ponytail: a keyword match, so paraphrases slip through. Upgrade to an LLM judge if the
+    count sits at zero while the output still reads wrong.
     """
     count = 0
     for result in results:
@@ -81,20 +58,12 @@ _RANK = {"low": 1, "medium": 2, "high": 3}
 def _priority_mismatches(results: list[TriageResult]) -> int:
     """Results whose `priority` does not follow from their own exploitability and impact.
 
-    The Day 27 bug, and the reason it needs a counter rather than an eyeball: `priority`
-    used to be the first field in TriageResult, so it was generated before either rating
-    existed and came out anti-correlated with them -- `expl=medium imp=high` scoring
-    `low`, `expl=low imp=medium` scoring `high`. Reordering the schema is the fix; this is
-    how we tell whether it worked.
+    `priority` used to be declared first, so it was generated before either rating existed
+    and came out anti-correlated with them. Reordering the schema is the fix.
+    `needs_human` is exempt -- a refusal is not a severity.
 
-    `needs_human` is exempt. It is a refusal, not a severity, so it is not required to
-    follow from ratings the model has just said it cannot confidently apply.
-
-    ponytail: a coarse band check, deliberately. It flags only the unarguable cases -- a
-    combined rating of 5+ called low, or 3 or less called high/critical -- and says nothing
-    about the many defensible middle calls. A tighter rule would need a severity matrix
-    somebody has to agree with, and this is enough to catch a field that is not reading
-    its own inputs.
+    ponytail: a coarse band check. It flags only the unarguable cases and says nothing about
+    defensible middle calls; a tighter rule needs a severity matrix somebody agrees with.
     """
     count = 0
     for result in results:
@@ -113,8 +82,8 @@ def run_config(
 ) -> dict:
     """One config: `calls` model calls of `batch_size` findings each."""
     sent = findings[: batch_size * calls]
-    # Snapshot, run, subtract. The provider's counters are cumulative and shared across
-    # configs in this same process, so a delta is the only correct read.
+    # The provider's counters are cumulative and shared across configs in this process,
+    # so a delta is the only correct read.
     prompt_before, output_before = provider.prompt_tokens, provider.output_tokens
 
     results: list[TriageResult] = []
@@ -134,30 +103,26 @@ def run_config(
         "wall_s": elapsed,
         "prompt_tokens": prompt_tokens,
         "output_tokens": output_tokens,
-        # The number the batching argument rests on: the system prompt is charged once
-        # per call, so this should fall as the batch grows. If it does not, batching is
-        # buying nothing and the default should stay small.
+        # What the batching argument rests on: the system prompt is charged once per
+        # call, so this should fall as the batch grows. If it does not, batching buys
+        # nothing.
         "prompt_per_finding": prompt_tokens / len(sent) if sent else 0,
         "findings_per_min": len(results) / elapsed * 60 if elapsed else 0,
-        # Cost per 1,000 findings, in the two units that are actually scarce. Tokens
-        # extrapolate the whole-corpus figure; calls is what a free-tier request quota
-        # charges, and it is 1000/batch_size, so it halves every time the batch doubles.
+        # The two scarce units. Tokens extrapolate the whole-corpus figure; calls is
+        # 1000/batch_size, so it halves every time the batch doubles.
         "tokens_per_1k": (
             (prompt_tokens + output_tokens) / len(sent) * 1000 if sent else 0
         ),
         "calls_per_1k": 1000 / batch_size,
         "needs_human": sum(1 for r in results if r.priority == "needs_human"),
         "expl_max": max(explanations, default=0),
-        # Explanations sitting exactly on the cap, which means the grammar closed the
-        # string rather than the model finishing its sentence. The full-corpus run ended
-        # three of them mid-clause, trailing comma included -- visible truncation in what
-        # goes into a PR comment, so it needs counting and not just a max.
+        # Explanations exactly on the cap: the grammar closed the string rather than the
+        # model finishing its sentence, which is visible truncation in a PR comment.
         "truncated": sum(1 for n in explanations if n >= EXPLANATION_MAX),
         "contradictions": _contradictions(results),
         "priority_mismatches": _priority_mismatches(results),
-        # The judgments themselves, for --show. Counting them proves the pipeline ran;
-        # only reading them tells a real triage apart from five valid-shaped refusals,
-        # which is the distinction every count in this dict is blind to.
+        # For --show. Counting proves the pipeline ran; only reading tells a real triage
+        # from five valid-shaped refusals.
         "results": results,
     }
 
@@ -237,19 +202,14 @@ def main() -> None:
         try:
             row = run_config(provider, findings, batch_size, args.calls)
         except TriageProviderError as e:
-            # A batch size too large to answer inside LLM_TIMEOUT is a *result*, not a
-            # crashed benchmark -- it is the measurement that says this size is not
-            # available on this hardware. Measured 2026-08-22: batch 10 timed out at 300s
-            # while batch 5 finished in 158.7s, because wall clock here is essentially
-            # output-bound (~78 output tokens per finding at ~2.5-3 tok/s on CPU) and 10
-            # findings' worth of generation does not fit. Letting the traceback through
-            # threw away three good rows and the summary below along with them.
+            # A batch too large to answer inside LLM_TIMEOUT is a *result*: this size is
+            # not available on this hardware. Letting the traceback through threw away
+            # three good rows and the summary along with them.
             print(f"{batch_size:>5}  -- {e} (status {e.status})")
             continue
         rows.append(row)
-        # Printed as each config lands, not collected and printed at the end: a CPU sweep
-        # runs for over ten minutes and a run that dies on the last config should still
-        # have left its earlier numbers on screen.
+        # Printed as each config lands: a sweep runs for over ten minutes, and a run
+        # that dies on the last config should still leave its earlier numbers on screen.
         print(_fmt(row))
         if args.show:
             for result in row["results"]:

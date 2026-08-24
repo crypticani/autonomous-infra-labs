@@ -1,31 +1,17 @@
-"""Golden-priority regression eval -- Day 28.
+"""Golden-priority regression eval.
 
-The thing this catches is narrow and worth catching: a prompt or schema change that
-silently *downgrades* a finding that matters. Day 27 moved `priority` below
-`exploitability` and `impact` in the schema and the judgments inverted, which was only
-visible because a full corpus happened to get read that afternoon. Nothing would have
-failed. This is that afternoon, in one command.
+Catches one narrow thing worth catching: a prompt or schema change that silently
+*downgrades* a finding that matters. Moving `priority` below `exploitability` and
+`impact` inverted the judgments once, and nothing failed.
 
-**Bands, not exact priorities**, and that is the central design decision. Local Ollama is
-not reproducible even at `temperature: 0` -- Day 27 changed two things off eval movements
-that turned out to be pure batch-dependent variance -- so an eval asserting
-`priority == "high"` would flap, get ignored, and then get deleted. Each case instead
-declares a floor (`min`), a ceiling (`max`), or both, and asserts only what is actually
-defensible about that finding. A CVE with remote code execution may be `high` or
-`critical` and both are correct answers; what is never correct is `low`.
+**Bands, not exact priorities.** Local Ollama is not reproducible even at
+`temperature: 0`, so asserting `priority == "high"` would flap and get deleted. Each case
+declares a floor, a ceiling, or both: an RCE CVE may be `high` or `critical`, never `low`.
 
-**`needs_human` is graded by which bound the case carries**, and this follows from what
-declining means rather than from where it would sit on a scale:
-
-- A case with a `min` is one this repo says is definitely serious. Declining it is a
-  miss -- the model had the context and did not use it.
-- A case with only a `max` is noise. Declining it is conservative, not wrong: the finding
-  reaches a human via `review_required` instead of being scored, which is the outcome the
-  finding deserved anyway.
-
-So a run where the model declines everything scores well on the noise cases and fails
-every serious one, which is the right shape -- Day 23's 1.5b model, which declined all
-five findings it was shown while satisfying every guard, would fail this eval outright.
+**`needs_human` is graded by which bound the case carries.** A case with a `min` is one
+this repo says is definitely serious, so declining it is a miss. A case with only a `max`
+is noise, and declining it is conservative rather than wrong. So a model that declines
+everything fails every serious case, which is the point.
 
     python eval_triage.py                    # the committed fixture, default batch size
     python eval_triage.py --batch-size 1     # one finding per call, no batch interaction
@@ -47,8 +33,8 @@ from triage import BATCH_SIZE, triage_findings
 EVAL_SET = Path(__file__).parent / "eval_set.json"
 FIXTURE = Path(__file__).parent / "fixtures" / "this-repo.json"
 
-# needs_human is deliberately absent: it is a declined judgment, not a fifth severity, and
-# giving it a rank here would let it satisfy a `max` bound by accident.
+# needs_human is absent: it is a declined judgment, not a fifth severity, and ranking it
+# would let it satisfy a `max` bound by accident.
 ORDER = ["low", "medium", "high", "critical"]
 
 console = Console()
@@ -57,10 +43,9 @@ console = Console()
 def load_cases(path: Path, findings_by_fingerprint: dict) -> list[dict]:
     """The eval set, checked against the corpus it claims to describe.
 
-    A fingerprint is `(scanner, rule_id, target, line)` hashed, so regenerating the
-    fixture against a moved line or a renamed file changes it. Without this check that
-    turns into a case that silently stops being evaluated -- the eval keeps passing while
-    testing less than it says it does, which is worse than failing.
+    A fingerprint is `(scanner, rule_id, target, line)` hashed, so a moved line or a renamed
+    file changes it. Unchecked, that case silently stops being evaluated and the eval keeps
+    passing while testing less than it claims.
     """
     cases = json.loads(path.read_text(encoding="utf-8"))
 
@@ -84,9 +69,8 @@ def load_cases(path: Path, findings_by_fingerprint: dict) -> list[dict]:
 def grade(case: dict, priority: str | None) -> tuple[bool, str]:
     """(passed, why). `priority` is None when the model returned no result for it."""
     if priority is None:
-        # triage.py drops fingerprints that were never sent, so a gap here means the
-        # model answered about fewer findings than it was given -- Day 23's failure mode,
-        # and one that a count of results alone reports as a clean run.
+        # triage.py drops unsent fingerprints, so a gap means the model answered about
+        # fewer findings than it was given -- which a count alone calls a clean run.
         return False, "no result returned"
 
     if priority == "needs_human":
@@ -142,9 +126,8 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
         f"{prompt_tokens} prompt + {output_tokens} output tokens"
     )
     if prompt_tokens == 0:
-        # Same loud line log-analyzer's harness carries: a provider reporting no usage
-        # makes the cost figure above a fiction, and a fiction that looks like a number
-        # is the kind that gets copied into a Readme.
+        # A provider reporting no usage makes the cost figure a fiction, and a fiction
+        # that looks like a number gets copied into a Readme.
         console.print(
             "[yellow]No token counts reported -- the cost figure above is not real.[/yellow]"
         )

@@ -6,15 +6,10 @@ metadata:
   labels:
     app: security-triage
 spec:
-  # One replica, and this is a constraint rather than a starting point. Run records
-  # (`_runs`), rate-limit buckets (`_starts`) and the Prometheus registry are all
-  # process-local, so a second replica would 404 on runs it never saw, allow double the
-  # per-token rate limit, and export half the metrics on each scrape. Same reason the
-  # Dockerfile pins --workers 1. Horizontal scale needs shared state first.
+  # One replica is a constraint, not a starting point: run records, rate-limit buckets
+  # and the Prometheus registry are all process-local. Recreate, because RollingUpdate
+  # would briefly run two.
   replicas: 1
-  # Recreate, not RollingUpdate: the default would briefly run the old and new pods
-  # together, which is the two-replica problem above arriving during every deploy. The
-  # cost is a few seconds of downtime on a service whose callers already poll and retry.
   strategy:
     type: Recreate
   selector:
@@ -31,9 +26,8 @@ spec:
     spec:
       securityContext:
         runAsNonRoot: true
-        # Matches the numeric USER in the Dockerfile by construction -- see the comment
-        # there. A name would leave the kubelet unable to verify non-root and the pod
-        # would never start.
+        # Matches the numeric USER in the Dockerfile; a name would leave the kubelet
+        # unable to verify non-root and the pod would never start.
         runAsUser: 10001
         runAsGroup: 10001
         seccompProfile:
@@ -48,10 +42,8 @@ spec:
             - configMapRef:
                 name: security-triage-config
           env:
-            # Not optional, unlike log-analyzer's key: without tokens this endpoint
-            # serves CPU-minutes of somebody else's inference to anyone who finds it.
-            # /health reports `auth: disabled` when it is empty, but a missing Secret
-            # should fail the pod, not degrade it quietly.
+            # Not optional: without tokens this endpoint serves inference to anyone who
+            # finds it, so a missing Secret should fail the pod rather than degrade it.
             - name: ST_API_TOKENS
               valueFrom:
                 secretKeyRef:
@@ -77,11 +69,8 @@ spec:
               memory: "512Mi"
               cpu: "500m"
           volumeMounts:
-            # readOnlyRootFilesystem above with nowhere writable is how a Python service
-            # dies on its first tempfile. Nothing here writes deliberately -- run records
-            # are in memory and PYTHONDONTWRITEBYTECODE is set in the image -- but the
-            # library floor under `requests` and `uvicorn` is not something to find out
-            # about from a CrashLoopBackOff.
+            # readOnlyRootFilesystem with nowhere writable is how a Python service dies
+            # on its first tempfile.
             - name: tmp
               mountPath: /tmp
           livenessProbe:
@@ -93,11 +82,9 @@ spec:
             timeoutSeconds: 5
             failureThreshold: 3
           readinessProbe:
-            # /health answers 200 even when it reports `degraded`, and that is deliberate
-            # rather than an oversight here: an unreachable model backend is a normal
-            # state for this deploy (the laptop hosting Ollama is not always awake) and
-            # it surfaces as a recorded `failed` run, not as a pod that should be pulled
-            # out of service. The probe checks that the process is serving, nothing more.
+            # /health answers 200 even when degraded, deliberately: an unreachable model
+            # backend is a normal state here and surfaces as a failed run, not a pod to
+            # pull out of service.
             httpGet:
               path: /health
               port: http

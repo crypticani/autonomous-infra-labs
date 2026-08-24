@@ -1,26 +1,19 @@
 # The build context is ./services/security-triage, so the repo-root .dockerignore does
-# not apply here -- same reason knowledge-copilot carries its own.
+# not apply here.
 
-# 2.4 MB of scan envelope. It is the eval and benchmark corpus, and neither of those runs
-# inside the container; the service's input arrives in a request body.
+# 2.4 MB of corpus, plus the tools that read it. Neither runs in the container.
 fixtures/
 eval_set.json
 eval_triage.py
 bench.py
 
-# Deployment artefacts describing the image, not shipped inside it.
 k8s/
 kind/
 Readme.md
-
-# Tests stay a local venv activity, matching the copilot's image.
 tests/
 
 __pycache__/
 **/__pycache__/
 *.pyc
 .pytest_cache/
-
-# Belt and braces: there is no .env in this directory today, and the day one appears is
-# the day it would otherwise be baked into a published multi-arch image.
 .env

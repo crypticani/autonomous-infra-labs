@@ -1,8 +1,7 @@
-"""Day 13: thread history for the Slack interface.
+"""Thread history for the Slack interface.
 
-A Slack thread is a session. Nothing here does I/O and nothing here reads a clock --
-`now` is a parameter, so TTL eviction tests against a fixed timeline instead of sleeping
-for an hour.
+A Slack thread is a session. Nothing here does I/O and nothing reads a clock -- `now` is
+a parameter, so TTL eviction tests against a fixed timeline instead of sleeping.
 """
 
 import os
@@ -15,9 +14,9 @@ load_dotenv()
 SESSION_TTL = int(os.getenv("SESSION_TTL", "3600"))
 SESSION_MAX_TURNS = int(os.getenv("SESSION_MAX_TURNS", "4"))
 
-# Two depths, on purpose. The retrieval query is the fragile one: every extra word
-# shifts BM25's term weighting and drags the dense vector toward the corpus centroid,
-# so it gets exactly one prior question. The answer prompt tolerates more.
+# Two depths. The retrieval query is the fragile one -- every extra word shifts BM25 and
+# drags the dense vector toward the corpus centroid -- so it gets exactly one prior
+# question. The answer prompt tolerates more.
 HISTORY_TURNS_IN_QUERY = 1
 HISTORY_TURNS_IN_PROMPT = 2
 
@@ -28,9 +27,8 @@ class Turn:
     answer: str
 
 
-# thread_ts -> (last_used_at, turns). Module-level and therefore per-process: a restart
-# forgets every thread, which is the documented tradeoff. Persistence for a single-node
-# demo bot is machinery for nobody.
+# Per-process, so a restart forgets every thread. Persistence for a single-node demo bot
+# is machinery for nobody.
 _sessions: dict[str, tuple[float, list[Turn]]] = {}
 
 
@@ -59,10 +57,8 @@ def append(thread_ts: str, turn: Turn, now: float) -> None:
 
 
 def retrieval_query(turns: list[Turn], question: str) -> str:
-    """What to actually search for.
-
-    Only prior *questions* are carried, never prior answers: an answer is 400 words of
-    prose that would swamp the six words that matter.
+    """What to actually search for. Only prior *questions*, never prior answers: an answer is
+    400 words of prose that would swamp the six words that matter.
     """
     prior = [turn.question for turn in turns[-HISTORY_TURNS_IN_QUERY:]]
     return " ".join([*prior, question])

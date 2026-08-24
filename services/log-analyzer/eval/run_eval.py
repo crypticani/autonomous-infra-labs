@@ -36,16 +36,7 @@ def load_cases(filepath: str) -> List[Dict[str, Any]]:
 
 
 def run_case(provider: BaseLLMProvider, case: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Executes a single test case.
-    Returns the parsed actual severity, pass/fail status, and raw analysis.
-
-    Day 27 additions: wall clock and token counts per case. This harness already sends
-    five genuinely different logs -- a two-line retry, a multi-error cascade -- and the
-    spread of cost across them *is* this service's cost model, since prompt eval scales
-    with log length. Measuring it here rather than in a separate benchmark keeps one
-    runner, and makes the eval answer "what does this cost" as well as "is it still right".
-    """
+    """One test case: the parsed severity, pass/fail, and the raw analysis."""
     expected = case.get("expected_severity")
     raw_log = case.get("raw_log")
 
@@ -137,9 +128,8 @@ def print_report(results: List[Dict[str, Any]]) -> bool:
 
     console.print(table)
 
-    # The cost line. Totals plus the per-call spread, because a mean over five logs of
-    # very different sizes hides the thing worth knowing -- what a big log costs versus a
-    # small one is the scaling behaviour, and one average reports neither end of it.
+    # Totals plus the per-call spread: a mean over five logs of very different sizes
+    # reports neither end of the scaling behaviour.
     seconds = [r["result"]["elapsed"] for r in results]
     prompt_tokens = sum(r["result"]["prompt_tokens"] for r in results)
     output_tokens = sum(r["result"]["output_tokens"] for r in results)
@@ -150,8 +140,8 @@ def print_report(results: List[Dict[str, Any]]) -> bool:
         f"({(prompt_tokens + output_tokens) / total:.0f} tokens/call avg)"
     )
     if prompt_tokens == 0:
-        # Loud rather than a quiet row of zeros: this provider reported no usage at all,
-        # so the cost columns above are meaningless and should not be copied anywhere.
+        # Loud rather than a row of zeros: this provider reported no usage, so the cost
+        # columns are meaningless and should not be copied anywhere.
         console.print(
             "[yellow]No token counts reported -- the cost figures above are not real.[/yellow]"
         )
@@ -194,8 +184,8 @@ if __name__ == "__main__":
 
     all_passed = print_report(results)
 
-    # Day 28: the one machine-readable line eval_all.py at the repo root reads, so the
-    # cross-service table does not have to parse four different report formats.
+    # The one machine-readable line eval_all.py reads, so the cross-service table does
+    # not have to parse four report formats.
     print(
         "EVAL_RESULT "
         + json.dumps(

@@ -52,9 +52,8 @@ jobs:
 
   build-and-push:
     needs: [lint-and-test, validate-manifests]
-    # Same guard as the other two workflows: without it, fixing the `pull_request`
-    # trigger would start publishing :latest from unmerged pull-request code. This
-    # service can delete pods, so the hole is worse here than it was on day 13.
+    # Load-bearing: without it the `pull_request` trigger publishes :latest from
+    # unmerged code, and this service can delete pods.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

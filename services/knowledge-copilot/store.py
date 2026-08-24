@@ -1,11 +1,9 @@
 """Opening a Chroma collection, in one place.
 
-retrieval.py used to import CHROMA_PATH and get_collection from ingest.py: the query
-path depending on the write path, purely because that is where the plumbing was written
-first. Both modules also built their own PersistentClient with the same settings. This
-module is the seam. It is a leaf -- it imports chunking and embeddings and nothing else
-from this service -- so neither direction of that old dependency can grow back without
-a circular import making it obvious.
+retrieval.py used to import CHROMA_PATH from ingest.py -- the query path depending on the
+write path because that is where the plumbing was written first. This module is the seam,
+and it is a leaf, so neither direction of that dependency can grow back without a
+circular import making it obvious.
 """
 
 import os
@@ -25,11 +23,8 @@ CHROMA_PATH = os.getenv("CHROMA_PATH", str(Path(__file__).parent / "chroma_data"
 
 
 def default_client() -> chromadb.ClientAPI:
-    """The persistent client for CHROMA_PATH.
-
-    Named `default_` because ingest() and sync_alerts() accept an injected client --
-    that is how the tests point them at a tmp_path -- and a bare `client` here would
-    shadow that parameter inside get_collection.
+    """The persistent client for CHROMA_PATH. Named `default_` because ingest() and
+    sync_alerts() accept an injected client, and a bare `client` would shadow it.
     """
     return chromadb.PersistentClient(
         path=CHROMA_PATH, settings=Settings(anonymized_telemetry=False)

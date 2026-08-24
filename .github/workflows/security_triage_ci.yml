@@ -36,15 +36,12 @@ jobs:
         run: python -m pytest tests/ -q
 
       - name: Check scan.sh
-        # The one piece of this service that runs on somebody else's runner, so a syntax
-        # error in it breaks every onboarded repo's CI rather than this one's.
+        # Runs on every onboarded repo's runner, so a syntax error breaks their CI.
         run: bash -n services/security-triage/scan.sh
 
       - name: Check the cross-service eval runner
-        # eval_all.py lives at the repo root and is not covered by any service's tests.
-        # --selftest checks its EVAL_RESULT parsing and that every command it names still
-        # exists -- the failure it catches is a renamed eval script, which would otherwise
-        # surface as a permanently empty column in the capstone table.
+        # No service's tests cover the repo-root runner. Catches a renamed eval script,
+        # which would otherwise be a permanently empty column in the table.
         run: python eval_all.py --selftest
 
   validate-manifests:
@@ -63,11 +60,8 @@ jobs:
 
   build-and-push:
     needs: [lint-and-test, validate-manifests]
-    # Same guard as the other three workflows: without it, the `pull_request` trigger
-    # above would publish :latest from unmerged pull-request code. It matters here for a
-    # specific reason -- this image holds the API tokens of every onboarded repo at
-    # runtime, so anyone who could get a branch built could get a build that exfiltrates
-    # them.
+    # Load-bearing: without it the `pull_request` trigger publishes :latest from
+    # unmerged code, and this image holds every onboarded repo's API token at runtime.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:

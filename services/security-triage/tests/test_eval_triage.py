@@ -1,10 +1,6 @@
 """Day 28. The eval's own grading logic, which is the part that can be wrong in a way
 nobody notices -- an eval that passes everything is indistinguishable from a healthy
 model until the day it matters.
-
-Day 27 has a worked example of exactly this: two prompt changes were made off eval
-movements that turned out to be the checker's bug and batch nondeterminism, not the
-model. So the checker gets tests before it gets trusted.
 """
 
 import json

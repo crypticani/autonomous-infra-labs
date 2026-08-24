@@ -1,52 +1,30 @@
-"""Fixes proposed, never applied -- Day 24.
+"""Fixes proposed, never applied.
 
-A security finding gets a diff and a human, not an auto-commit. Two reasons, and the
-second is the one that shaped this module:
+A security finding gets a diff and a human, not an auto-commit:
 
-- The service has no checkout. It never sees the repo, only the scanner JSON that was
-  POSTed to it, so it cannot read the file it is proposing to change, cannot run the
-  tests afterwards, and has no branch to push to. A diff is the only honest artifact --
-  text the caller's CI attaches to a PR for a human to read.
+- The service has no checkout. It sees only the scanner JSON that was POSTed, so it
+  cannot read the file, run the tests, or push a branch.
 - A security fix is a behaviour change. `runAsUser: 10001` breaks an image whose files
-  are owned by another uid; `readOnlyRootFilesystem: true` breaks a container that writes
-  to its own filesystem. Whether those are acceptable is a judgment about the workload,
-  which is exactly the thing neither a scanner nor a model has.
+  are owned by another uid, and whether that is acceptable is a judgment about the
+  workload.
 
-**No model call here.** The diff is built by deterministic Python from the finding's own
-context lines, and anything that cannot be built that way returns the scanner's own
-remediation sentence as prose instead. That split is deliberate: a diff either applies or
-it doesn't, and `git apply --check` is a real oracle, so this is the one part of the
-pipeline where a wrong answer is cheaply detectable and therefore worth writing
-deterministically. A 7b model that miscounts one column of YAML indentation produces a
-patch that fails to apply, and Day 23 already measured this model emitting five
-valid-shaped, factually worthless judgments -- a plausible diff is the same failure with
-a `+` in front of it. Prose advice needs no model either: every Trivy misconfiguration
-already ships a `Resolution` written by the people who wrote the check.
+**No model call here.** The diff is deterministic Python over the finding's own context
+lines; anything not constructible that way returns the scanner's own remediation
+sentence as prose. A diff has a real oracle in `git apply --check`, so it is the one
+place a wrong answer is cheaply detectable and therefore worth code instead of tokens.
 
-**What survives contact with a real corpus.** Of the three fix classes the week's plan
-called mechanical, one is constructible from context lines alone:
+Of the three fix classes the plan called mechanical, one survives: adding a
+securityContext key, whose value is a constant and whose insertion point is derivable
+from the `- name: <container>` line. Pinning a digest needs a registry this cannot
+reach, and bumping a dependency needs a FixedVersion this corpus does not have.
 
-- *add a securityContext key* -- yes. The value is a constant (`readOnlyRootFilesystem:
-  true`), and both the insertion point and its indentation are derivable from the
-  `- name: <container>` line Trivy returns.
-- *pin a base image to a digest* -- no. The digest is not in the finding and the service
-  cannot reach a registry to look it up. A diff with an invented digest is exactly the
-  patch that looks authoritative and doesn't apply.
-- *bump a pinned dependency* -- no, not on this corpus. Its one real CVE has no
-  `FixedVersion`, so there is nothing to bump to. The advice path names the upgrade when
-  a fixed version does exist.
+The bug this design avoids: ten KSV rules fire on the same container block, so ten
+independent diffs would each insert their own `securityContext:` and the second applied
+would produce duplicate YAML keys. Candidates are grouped by insertion point.
 
-The interesting bug this design avoids: ten of Trivy's KSV rules fire on the *same*
-container block, so ten independent diffs would each insert their own
-`securityContext:` key and the second one applied would produce duplicate YAML keys. So
-candidates are grouped by insertion point and emitted as one hunk carrying the union of
-the keys -- the same collapse Day 22 does for cost, done here for correctness.
-
-# ponytail: two hunks in one file whose context runs overlap are dropped to advice rather
-# than merged. Ceiling: a pod whose containers Trivy reports against one shared StartLine
-# gets a diff for the first container and prose for the rest. Upgrade path: merge
-# overlapping runs into a single hunk, worth doing the first time a real caller's
-# manifests trip it.
+# ponytail: two hunks in one file whose context runs overlap are dropped to advice
+# rather than merged. Ceiling: a pod whose containers share one StartLine gets a diff
+# for the first and prose for the rest. Upgrade path is merging overlapping runs.
 """
 
 import logging
@@ -60,13 +38,10 @@ from scanners import Finding
 
 logger = logging.getLogger(__name__)
 
-# rule_id -> (securityContext key, the lines that set it). Membership in this table is
-# the whole definition of "mechanical": a rule is only in here if the correct value is a
-# constant that holds for any workload. Rules whose right answer is a number somebody has
-# to choose -- a memory limit, an image digest, a uid that matches the image -- are not,
-# however tempting the template looks. runAsUser/runAsGroup sit on the line: the *value*
-# is arbitrary (any uid > 10000 satisfies the check) but the *effect* is not, which is
-# what the review caveat in the note is for.
+# rule_id -> (securityContext key, the lines that set it). Membership is the whole
+# definition of "mechanical": a rule is here only if the correct value is a constant that
+# holds for any workload. A memory limit or an image digest is not, however tempting the
+# template looks.
 _SECURITY_CONTEXT: dict[str, tuple[str, tuple[str, ...]]] = {
     "KSV-0012": ("runAsNonRoot", ("runAsNonRoot: true",)),
     "KSV-0001": ("allowPrivilegeEscalation", ("allowPrivilegeEscalation: false",)),
@@ -80,19 +55,17 @@ _SECURITY_CONTEXT: dict[str, tuple[str, tuple[str, ...]]] = {
     "KSV-0106": ("capabilities", ("capabilities:", "  drop:", "    - ALL")),
 }
 
-# Emission order for a merged block, derived from the table above so there is no second
-# constant to drift out of sync with it. Two rules mapping to one key (KSV-0030 and
-# KSV-0104 both want seccompProfile) collapse here.
+# Emission order, derived from the table above so there is no second constant to drift.
+# Two rules mapping to one key collapse here.
 _KEY_ORDER = list(dict.fromkeys(key for key, _ in _SECURITY_CONTEXT.values()))
 
-# Trivy names the container in the finding's message and nowhere else. Both quote styles
-# are load bearing: KSV-0012 says Container 'x', KSV-0104 says container "x", and the
-# rules that say neither ("container should drop all") are the ones that get advice.
+# Trivy names the container in the message and nowhere else. Both quote styles are load
+# bearing: KSV-0012 says Container 'x', KSV-0104 says container "x". Rules that name
+# none get advice.
 _CONTAINER_IN_MESSAGE = re.compile(r"[Cc]ontainer [\"']([^\"']+)[\"']")
 
-# The container's own `- name:` key. Matching the value against the message is what keeps
-# this off `- name: http` inside a `ports:` list and `- name: LOG_LEVEL` inside `env:` --
-# both of which appear in the same context block, indented deeper.
+# Matching the value against the message is what keeps this off `- name: http` in a
+# `ports:` list and `- name: LOG_LEVEL` in `env:`, both of which share the context block.
 _NAME_KEY = re.compile(r"^(\s*)-(\s+)name:\s*(\S+)\s*$")
 
 
@@ -106,14 +79,7 @@ class Fix(BaseModel):
 
 
 def _diff_path(target: str) -> str | None:
-    """One path shape for `git apply`, or None if this target isn't a repo file at all.
-
-    The three scanners disagree on spelling: Trivy says `services/x/y.yaml`, Bandit
-    `./services/x/y.py`, Checkov `/services/x/y.yaml`. A patch header needs one form, and
-    `target` arrives inside a public request body and ends up in that header -- so
-    anything that climbs out of the repo, or that is a container image reference rather
-    than a file (`alpine:3.19 (alpine 3.19.1)`), gets refused rather than normalised.
-    """
+    """One path shape for `git apply`, or None if this is not a repo file."""
     path = os.path.normpath(target).lstrip("/")
     if path in ("", ".") or path.startswith("..") or ":" in path:
         return None
@@ -121,12 +87,7 @@ def _diff_path(target: str) -> str | None:
 
 
 def _contiguous(context: list[tuple[int, str]]) -> list[tuple[int, str]]:
-    """The run of consecutive lines from the start of the context.
-
-    A hunk header claims a start line and a line count, so a gap anywhere inside the
-    quoted lines makes the whole hunk a lie about the file even if every individual line
-    is right.
-    """
+    """The run of consecutive lines from the start of the context."""
     run: list[tuple[int, str]] = []
     for number, content in context:
         if run and number != run[-1][0] + 1:
@@ -138,17 +99,15 @@ def _contiguous(context: list[tuple[int, str]]) -> list[tuple[int, str]]:
 def _anchor(
     finding: Finding, run: list[tuple[int, str]]
 ) -> tuple[tuple[int, str] | None, str]:
-    """Where the securityContext goes: the index of the container's `- name:` line within
-    `run`, and the indent its sibling keys sit at. Returns (None, reason) when that can't
-    be established from what the scanner sent, which is most of the interesting cases.
+    """Where the securityContext goes: the index of the container's `- name:` line in
+    `run`, and its siblings' indent. (None, reason) when the scanner did not send enough.
     """
     container = _CONTAINER_IN_MESSAGE.search(finding.message or "")
     if not container:
         return None, "the finding's message does not name a container"
     if any("securityContext" in content for _, content in run):
-        # There is already one somewhere in the block, and the visible lines are only the
-        # first ten -- merging into a mapping we can only partly see risks emitting a
-        # second securityContext: key, which applies cleanly and then fails to parse.
+        # One already exists somewhere in the block and only ten lines are visible, so
+        # merging risks a second securityContext: key -- applies cleanly, fails to parse.
         return None, "a securityContext is already present in the visible lines"
 
     wanted = container.group(1)
@@ -183,8 +142,8 @@ def _hunk(
 
 
 def _advice(finding: Finding, why: str) -> Fix:
-    """Prose, from the scanner's own words wherever it has any. `why` is empty for a rule
-    that was never a diff candidate -- no point telling a reader that B101 has no fixer.
+    """Prose, from the scanner's own words. `why` is empty for a rule that was never a
+    diff candidate.
     """
     remediation = finding.resolution or (
         f"upgrade {finding.package} {finding.installed_version} -> {finding.fixed_version}"
@@ -201,17 +160,8 @@ def _advice(finding: Finding, why: str) -> Fix:
 
 
 def propose_fixes(findings: list[Finding]) -> list[Fix]:
-    """A Fix for every finding: a unified diff where one can be built with certainty,
-    prose advice everywhere else. Diffs first, sorted by file and line, so stdout is a
-    patch file; advice after.
-
-    Pass the **pre-dedup** findings. Day 22 identifies a misconfiguration by
-    (target, line), so the securityContext rules that all report one container block's
-    StartLine share a fingerprint and `dedupe` keeps one of them -- fine for triage, but
-    it would silently reduce a five-key hunk to a one-key hunk. The grouping below is the
-    same collapse done where it costs nothing: those five findings produce one diff, and
-    because their fingerprints are identical the returned list carries the single
-    fingerprint a triage result will be keyed by anyway.
+    """A Fix for every finding: a diff where one can be built with certainty, prose
+    advice everywhere else. Diffs first, sorted by file and line, so stdout is a patch.
     """
     groups: dict[tuple[str, int], dict] = {}
     advice: list[Fix] = []
@@ -263,9 +213,8 @@ def propose_fixes(findings: list[Finding]) -> list[Fix]:
     for (path, anchor_line), group in sorted(groups.items()):
         run = group["run"]
         first, last = run[0][0], run[-1][0]
-        # Overlapping hunks make `git apply` reject the whole patch, not just the second
-        # hunk -- so one bad pair would cost every other fix in the file. Adjacent runs
-        # are fine and stay two hunks; only genuinely shared lines are a problem.
+        # An overlap makes `git apply` reject the whole patch, not just the second
+        # hunk. Adjacent runs are fine; only genuinely shared lines are a problem.
         if any(
             first <= other_last and other_first <= last
             for other_first, other_last in emitted.get(path, [])
@@ -301,20 +250,17 @@ def propose_fixes(findings: list[Finding]) -> list[Fix]:
 
 
 if __name__ == "__main__":
-    # The Day 24 verify step: a patch on stdout, the accounting on stderr, so the round
-    # trip the plan asks for is one pipe --
+    # A patch on stdout, the accounting on stderr, so the round trip is one pipe:
     #
     #   python fixes.py fixtures/this-repo.json > /tmp/proposed.patch
     #   git apply --check -v /tmp/proposed.patch     # from the repo root
     #
-    # `git apply --check` is the only oracle that matters here: a proposed diff that does
-    # not apply is worse than no diff at all, because a reviewer trusts the shape.
+    # `git apply --check` is the only oracle that matters: a diff that does not apply is
+    # worse than no diff, because a reviewer trusts the shape.
     #
-    # Each Fix carries its own `--- a/ +++ b/` header, because a caller posts one fix into
-    # one PR comment. Concatenating two of them for the same file is still a valid patch,
-    # but the second one's line numbers were computed against the unpatched file, so
-    # `git apply` matches it by context and says "applied with offset N" -- expected here,
-    # not a failure.
+    # Each Fix carries its own header, since a caller posts one fix per comment.
+    # Concatenating two for one file is still valid, but the second's line numbers were
+    # computed against the unpatched file, so git reports "applied with offset N".
     import json
     import sys
     from collections import Counter
@@ -340,8 +286,8 @@ if __name__ == "__main__":
     )
     for fix in diffs:
         print(f"  diff  {fix.target}  {' '.join(fix.rule_ids)}", file=sys.stderr)
-    # Why the others got prose. A refusal reason with a high count is either a real
-    # ceiling or a bug in the anchoring, and the two look identical from a total.
+    # Why the others got prose. A high count is either a real ceiling or an anchoring
+    # bug, and the two look identical from a total.
     refusals = Counter(
         fix.note.split(".")[0].removeprefix("no diff -- ")
         for fix in fixes

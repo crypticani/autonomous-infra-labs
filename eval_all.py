@@ -1,32 +1,19 @@
-"""Every service's eval, one command, one table -- Day 28.
+"""Every service's eval, one command, one table.
 
-The claim this repo makes at the end of thirty days is that four AI services are
-production-ready. "Production-ready" for an AI system means something specific and
-uncomfortable: the tests can be green while the model has quietly got worse, because
-nothing in a unit test ever calls a model. So each service carries an eval that does, and
-this runs all four:
+The tests can be green while the model has quietly got worse, because no unit test here
+ever calls one. Each service carries an eval that does; this runs all four.
 
     python eval_all.py                          # everything
     python eval_all.py security-triage          # one service
     python eval_all.py --list
 
-Each eval is a subprocess in its own directory, not an import. They have different
-dependencies, different providers and different module names that would collide in one
-process (`app`, `provider` and `errors` exist three times over in this repo), and a
-subprocess is the only boundary that makes "run this service's eval" mean the same thing
-here as it does when you run it by hand.
+Subprocesses, not imports: `app`, `provider` and `errors` each exist three times over in
+this repo and would collide in one process. The contract is one line -- each eval prints
+`EVAL_RESULT {"passed": n, "total": n}` last, and its exit status is the verdict. An eval
+that prints no such line still gets its row and a `-`.
 
-The contract between them is one line. Each eval prints `EVAL_RESULT {"passed": n,
-"total": n}` as its last act, and its exit status is the verdict. Both are reported here,
-because they answer different questions: the counts say how much is right, the exit
-status says whether the service considers that a pass. An eval that prints no
-EVAL_RESULT line still shows up with its exit status and a `-` -- degrading, rather than
-crashing the runner over a format change in one service.
-
-**This needs the backends up.** Three of the four evals call a real model, and the fourth
-needs a populated Chroma index. That is the point rather than a defect -- an eval you can
-run without the thing it evaluates is testing something else -- but it does mean a run
-here is minutes, not seconds, and that the Ollama host has to be awake.
+**This needs the backends up.** Three of the four call a real model and the fourth needs
+a populated Chroma index, so a run is minutes, not seconds.
 """
 
 import argparse
@@ -55,10 +42,8 @@ class Eval:
     backend: str
 
 
-# One row per service, and the `measures` column is not decoration: the four evals grade
-# genuinely different things, and a table that showed only pass counts would imply they
-# are comparable. They are not -- 12/12 on triage bands and 10/12 on retrieval hit@1 are
-# not the same kind of number.
+# The `measures` column is not decoration: the four evals grade different things, and bare
+# pass counts would imply they are comparable.
 EVALS = [
     Eval(
         service="log-analyzer",
@@ -69,7 +54,6 @@ EVALS = [
     Eval(
         service="knowledge-copilot",
         # No --floor: this one reports rather than gates until a baseline is on record.
-        # See report_shipped_config() in eval_retrieval.py for why that is deliberate.
         command=[sys.executable, "eval_retrieval.py"],
         measures="soft hit@1, shipped config",
         backend="ollama (embeddings) + chroma",
@@ -92,10 +76,8 @@ EVALS = [
 def run(spec: Eval, verbose: bool) -> dict:
     """One eval, in its own service directory.
 
-    Output is captured rather than streamed by default, because four rich tables
-    interleaved with a fifth is unreadable -- but a failing eval prints its whole output
-    below the table, since "3/4 passed" without the failing case is not a result anybody
-    can act on.
+    Output is captured rather than streamed, because four rich tables interleaved is
+    unreadable -- but a failing eval prints its whole output below the table.
     """
     workdir = ROOT / "services" / spec.service
     started = time.monotonic()
@@ -110,15 +92,14 @@ def run(spec: Eval, verbose: bool) -> dict:
         output = completed.stdout + completed.stderr
         code = completed.returncode
     except subprocess.TimeoutExpired:
-        # An hour is generous even for a full Ollama triage run; past it something is
-        # wedged rather than slow, and a runner that waits forever is one nobody runs.
+        # An hour is generous even for a full Ollama run; past it something is wedged
+        # rather than slow.
         output, code = "timed out after 3600s", 124
     except FileNotFoundError as e:
         output, code = f"{e}", 127
 
     elapsed = time.monotonic() - started
-    # The last line wins, not the first: an eval that retried, or one whose report
-    # includes an earlier partial, must be scored on what it finished with.
+    # The last line wins: an eval that retried must be scored on what it finished with.
     found = RESULT_LINE.findall(output)
     counts = json.loads(found[-1]) if found else None
 
@@ -178,21 +159,19 @@ def report(results: list[dict]) -> bool:
 
 
 def selftest() -> int:
-    """The parser, checked without needing a model backend up.
+    """The parser, checked without a backend.
 
-    RESULT_LINE is the whole contract between this file and four others, and it is the
-    kind of thing that breaks quietly: a service that stops emitting the line still
-    exits 0, and the table would read `-` forever without anything failing. Runnable in
-    milliseconds, so there is no excuse for not running it.
+    RESULT_LINE is the whole contract between this file and four others, and it breaks
+    quietly: a service that stops emitting the line still exits 0 and the table reads `-`
+    forever. Runs in milliseconds.
     """
     assert json.loads(
         RESULT_LINE.search('noise\nEVAL_RESULT {"passed": 3, "total": 4}\n').group(1)
     ) == {"passed": 3, "total": 4}
-    # A rich table can print a line that merely mentions the token; only a line that
-    # *starts* with it counts, which is what the ^ anchor plus MULTILINE buys.
+    # Only a line that *starts* with the token counts, which is what the ^ anchor buys.
     assert RESULT_LINE.search("see EVAL_RESULT {} below") is None
     assert RESULT_LINE.search("no result line here at all") is None
-    # The last word: an eval that retried and printed twice must report the final run.
+    # An eval that retried and printed twice must report the final run.
     output = (
         'EVAL_RESULT {"passed": 1, "total": 4}\nEVAL_RESULT {"passed": 4, "total": 4}'
     )
@@ -230,8 +209,7 @@ def main() -> int:
 
     if args.list:
         for spec in EVALS:
-            # command[1], not the whole command: command[0] is sys.executable, which is
-            # an absolute venv path and wraps the line on any normal terminal.
+            # command[1] only: command[0] is an absolute venv path and wraps the line.
             console.print(
                 f"{spec.service:20} {spec.command[1]:20} "
                 f"[dim]{spec.measures} via {spec.backend}[/dim]"

@@ -1,10 +1,6 @@
 """Day 28. What these assert is that the counters move *and carry the right labels* --
 a metric incremented under the wrong label name is not a smaller bug than one that never
 fires, it is a bigger one, because the graph exists and reads zero.
-
-Everything here goes through the endpoint rather than calling metrics.* directly. A test
-that increments a counter and then reads it back tests prometheus_client; the question
-worth asking is whether app.py's own paths reach it.
 """
 
 import pytest

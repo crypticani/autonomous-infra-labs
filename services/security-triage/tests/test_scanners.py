@@ -406,13 +406,7 @@ def test_real_fixture_dedupes_without_dropping_everything():
 
 
 def _audit_event(**overrides):
-    """One `audit.k8s.io/v1` Event, shaped like the real thing.
-
-    A `kubectl exec` at Metadata level, which is what the committed audit policy
-    produces -- the exec's command is in `requestURI`'s query string, and there is no
-    request or response body at all, on purpose (see the policy's comment about a Secret
-    read at RequestResponse level being a second copy of the secret).
-    """
+    """One `audit.k8s.io/v1` Event, shaped like the real thing."""
     event = {
         "kind": "Event",
         "apiVersion": "audit.k8s.io/v1",

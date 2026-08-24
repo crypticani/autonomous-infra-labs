@@ -21,14 +21,7 @@ class _FakeResponse:
 
 
 def test_ollama_sends_temperature_inside_options(monkeypatch):
-    """The bug that made the golden-set eval non-deterministic.
-
-    Ollama ignores a top-level `temperature` and reads `options.temperature`, so this
-    service ran every call at the default 0.8 while the eval harness passed 0.0 and
-    believed it. Identical logs came back with different severities on consecutive runs,
-    which made every score a coin flip. Every other test here mocks `generate` outright,
-    so nothing looked at the payload -- which is exactly how it survived.
-    """
+    """The bug that made the golden-set eval non-deterministic."""
     sent = {}
 
     def capture(url, json=None, timeout=None):
@@ -49,12 +42,7 @@ def test_ollama_sends_temperature_inside_options(monkeypatch):
 
 
 def test_severity_is_generated_after_the_reasoning_fields():
-    """Field order is a behavioural contract here, not formatting.
-
-    Ollama grammar-constrains generation to the declared order, so a `severity` declared
-    first is chosen before any reasoning exists. Day 27 moved it after `likely_cause` and
-    `suggested_fix`; this fails if someone reorders the model back.
-    """
+    """Field order is a behavioural contract here, not formatting."""
     fields = list(LogAnalysis.model_json_schema()["properties"])
     assert fields.index("severity") > fields.index("likely_cause")
     assert fields.index("severity") > fields.index("suggested_fix")

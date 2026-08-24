@@ -1,19 +1,15 @@
-"""Batched, structured triage over deduped findings -- Day 23.
+"""Batched, structured triage over deduped findings.
 
-One model call per ST_BATCH_SIZE findings, not one call per finding: 559 deduped
-findings at batch size 5 is ~112 calls instead of 559, and on a CPU-only backend that
-difference is the gap between testable and not.
+One model call per ST_BATCH_SIZE findings, which on a CPU backend is the difference
+between testable and not.
 
-Two guards, both learned from earlier weeks:
+Two guards:
 
-- Every returned `fingerprint` must be one that was actually sent. A model naming a
-  fingerprint nobody sent is the same failure mode as Day 10's invented citations
-  ([1] pointing at a chunk that was never retrieved) -- the fix is the same shape,
-  drop what wasn't in the input rather than trust it.
-- `needs_human` is a legal `priority`, not an error path. A model forced to choose
-  between four real severities on a finding it can't actually judge doesn't refuse --
-  it guesses, confidently, and the guess looks identical to a real triage. Giving it a
-  legal way to decline is what makes the other four priorities trustworthy.
+- Every returned `fingerprint` must be one that was sent -- the invented-citation
+  failure wearing a different field name. Drop what was not in the input.
+- `needs_human` is a legal `priority`, not an error path. A model forced to pick among
+  four real severities on a finding it cannot judge guesses confidently, and the guess
+  is indistinguishable from a real triage.
 """
 
 import logging
@@ -30,8 +26,8 @@ logger = logging.getLogger(__name__)
 
 BATCH_SIZE = int(os.getenv("ST_BATCH_SIZE", "5"))
 
-# One number, used twice: as the schema's hard cap and as the figure the prompt quotes.
-# They have to agree, and on Day 26 they did not -- see the Field comment below.
+# Used twice: the schema's hard cap and the figure the prompt quotes. They have to
+# agree; test_triage.py asserts it.
 EXPLANATION_MAX = 160
 
 SYSTEM_PROMPT = f"""You are a security triage assistant. You are given findings already \
@@ -64,36 +60,19 @@ sentence and the ratings disagree, change one of them before answering.
 
 
 class TriageResult(BaseModel):
-    # Field order is load-bearing. Ollama grammar-constrains generation to this schema in
-    # declared order, so a field is decided before every field below it exists. Until
-    # Day 27 `priority` came first, which made the prompt's "your overall call, weighing
-    # both of the above" impossible to follow -- there was nothing above it yet. The model
-    # guessed a verdict, then filled in the ratings, and the full-corpus run shows the
-    # result: priority came out *anti-correlated* with its own inputs, `expl=medium
-    # imp=high` landing on `low` while `expl=low imp=medium` landed on `high`.
-    #
-    # The order below is the dependency order the prompt always described: the two
-    # component judgments, then the call that weighs them, then the sentence explaining a
-    # verdict that already exists, then certainty about it. Same fix as
-    # log-analyzer/log_analyzer.py's LogAnalysis the same day -- reasoning before
-    # conclusion, expressed through the schema rather than asked for in the prompt.
+    # Field order is behaviour, not formatting. Ollama grammar-constrains generation in
+    # declared order, so a field is decided before anything below it exists. `priority`
+    # used to come first, which made "weighing both of the above" impossible to obey --
+    # it came out anti-correlated with its own inputs. This is dependency order:
+    # reasoning before conclusion, expressed through the schema rather than the prompt.
     fingerprint: str
     exploitability: Literal["low", "medium", "high"]
     impact: Literal["low", "medium", "high"]
     priority: Literal["critical", "high", "medium", "low", "needs_human"]
-    # max_length is in the JSON schema Ollama grammar-constrains against, not just a
-    # post-hoc check: found live on 2026-08-19, qwen2.5-coder:1.5b fell into a repeating
-    # conditional ("if it can be exploited... if it cannot...") dozens of times over on
-    # an unbounded `str`. A hard cap stops the loop during decoding; repeat_penalty
-    # alone (below) wasn't enough to stop it from starting.
-    #
-    # 160, down from Day 23's 280, because 280 was doing two jobs badly. Day 26's output
-    # ran ~270 characters against a prompt asking for one short sentence, and the reason
-    # is that only one of those two bounds is real to the model: the grammar constraint
-    # is enforced token by token during decoding, "one short sentence" is a suggestion.
-    # Given a 280-character budget it wrote 280 characters. The fix is to make the hard
-    # bound mean what the soft one asked for, and to quote the same number in the prompt
-    # so they cannot drift apart again -- test_triage.py asserts they still match.
+    # max_length is part of the grammar Ollama constrains against, not a post-hoc check,
+    # so it stops a repeating loop during decoding. 160 and not 280 because only the hard
+    # bound is real to the model: given 280 characters it wrote 280, against a prompt
+    # asking for one short sentence.
     explanation: str = Field(max_length=EXPLANATION_MAX)
     confidence: float = Field(ge=0.0, le=1.0)
 
@@ -146,18 +125,18 @@ def _drop_unsent_fingerprints(
 def triage_batch(
     provider: BaseTriageProvider, findings: list[Finding]
 ) -> list[TriageResult]:
-    """One model call for up to BATCH_SIZE findings. Never returns a fingerprint that
-    wasn't in `findings` -- a triage result for a finding nobody sent isn't a missing
-    answer, it's a wrong one, and wrong risk data is worse than incomplete risk data.
+    """One model call for up to BATCH_SIZE findings.
+
+    Never returns a fingerprint that was not sent: a result for a finding nobody sent is not
+    a missing answer, it is a wrong one.
     """
     sent = {f.fingerprint for f in findings}
     raw = provider.generate(SYSTEM_PROMPT, build_prompt(findings), schema=TriageBatch)
     try:
         parsed = TriageBatch.model_validate_json(raw)
     except ValidationError as e:
-        # Pydantic's own error truncates the offending JSON; the full text is what
-        # actually tells a rambling model apart from one that's merely too terse for
-        # MAX_TOKENS -- worth the full line since ST_MAX_TOKENS already bounds its size.
+        # Pydantic truncates the offending JSON, and the full text is what tells a
+        # rambling model from a truncated one. ST_MAX_TOKENS already bounds its size.
         logger.warning(f"invalid triage JSON from {provider.name}: {raw}")
         raise TriageProviderError(
             f"the model returned invalid triage JSON: {e}", 502, provider=provider.name

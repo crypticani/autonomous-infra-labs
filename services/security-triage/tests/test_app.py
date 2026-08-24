@@ -46,12 +46,7 @@ def client(monkeypatch):
 
 
 def _fake_triage(priority="critical"):
-    """Judges every finding it is handed, at whatever priority the test needs.
-
-    TestClient runs background tasks before returning from the POST, so without this the
-    happy-path test would make real Ollama calls -- minutes each, and a 502 on any
-    machine without a backend running.
-    """
+    """Judges every finding it is handed, at whatever priority the test needs."""
 
     def triage_findings(findings, provider=None, batch_size=None):
         return [

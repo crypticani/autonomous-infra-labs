@@ -35,18 +35,14 @@ COPY --from=builder /opt/venv /opt/venv
 
 COPY . .
 
-# The audit log is a safety control, not a cache: it has to survive the container that
-# wrote it. This directory exists so the image also works with no mount at all, but a
-# real deploy bind-mounts over it -- an append-only record that dies with the container
-# cannot answer "who approved that restart" a week later.
+# The audit log is a safety control and has to outlive the container; a real deploy
+# bind-mounts over this. Here so the image also works with no mount at all.
 RUN mkdir -p /app/audit && chown -R appuser:appgroup /app
 
 USER appuser
 
 EXPOSE 7200
 
-# --workers 1 is load-bearing here, for a different reason than the copilot's.
-# approvals._proposals is in-process memory: with two workers, Slack's click can land
-# on the worker that does not hold the proposal, and a valid Approve would come back
-# "expired or unknown". Day 18's state machine is single-process by construction.
+# --workers 1: approvals._proposals is in-process, so a second worker would answer
+# "expired or unknown" to a valid Slack Approve.
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7200", "--workers", "1"]

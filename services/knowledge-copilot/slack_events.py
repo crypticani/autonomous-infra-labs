@@ -1,4 +1,4 @@
-"""Day 13: the inbound half of the Slack interface.
+"""The inbound half of the Slack interface.
 
 Every function here is pure. Signature verification, mention cleaning and retry dedupe
 are the parts that break in production and the parts a fabricated request can exercise
@@ -22,25 +22,21 @@ SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_ENABLED = os.getenv("SLACK_ENABLED", "true").lower() == "true"
 
-# Slack rejects its own requests older than this and so do we: the HMAC never expires
-# on its own, so without an age check a captured request stays replayable forever.
+# Slack rejects its own requests older than this and so do we: the HMAC never expires,
+# so without an age check a captured request stays replayable forever.
 MAX_SIGNATURE_AGE = 300
 
-# The shortest question worth embedding. AskRequest enforces min_length=10 for HTTP
-# callers; a mention needs its own check because "@copilot disk?" is six characters
-# once the mention is stripped, and a 422 has nowhere to go inside a Slack thread.
+# The shortest question worth embedding. HTTP callers get min_length=10; a mention needs
+# its own check, because a 422 has nowhere to go inside a Slack thread.
 MIN_QUESTION_LENGTH = 10
 
-# Permissive on purpose: user ids start U or W, and the legacy form carries a label,
-# as in <@U08ABC123|aniket>.
+# Permissive: ids start U or W, and the legacy form carries a label.
 MENTION_RE = re.compile(r"<@[^>]+>")
 
-# The only three characters Slack escapes. Ampersand is undone last, or "&amp;lt;"
-# would decode twice and turn into "<".
+# The only three Slack escapes. Ampersand is undone last, or "&amp;lt;" decodes twice.
 SLACK_ESCAPES = (("&lt;", "<"), ("&gt;", ">"), ("&amp;", "&"))
 
-# event_id -> first seen. Only useful for about a minute, since Slack retries within
-# seconds, so the set is swept rather than grown forever.
+# event_id -> first seen. Only useful for about a minute, so it is swept, not grown.
 DEDUPE_TTL = 300
 _seen_events: dict[str, float] = {}
 
@@ -53,11 +49,8 @@ class Mention:
 
 
 def slack_active() -> bool:
-    """The flag *and* both secrets.
-
-    SLACK_ENABLED defaults to true, mirroring ALERT_SYNC_ENABLED. But the offline test
-    suite and a local `python app.py` have no credentials, so missing secrets disable
-    the route rather than failing startup.
+    """The flag *and* both secrets. The offline suite and a local `python app.py` have no
+    credentials, so missing secrets disable the route rather than failing startup.
     """
     return bool(SLACK_ENABLED and SLACK_SIGNING_SECRET and SLACK_BOT_TOKEN)
 
@@ -71,11 +64,9 @@ def verify_signature(
 ) -> bool:
     """Slack's v0 request signature.
 
-    `body` must be the raw bytes off the wire. Parsing to a model and re-serialising
-    changes whitespace and key order, and the HMAC then never matches.
-
-    The secret is read from the module global when not passed, rather than defaulting
-    to it: a default argument binds once at import and could not be patched in tests.
+    `body` must be the raw bytes off the wire -- re-serialising changes whitespace and key
+    order. The secret is read from the module global rather than defaulted, because a
+    default argument binds at import and cannot be patched.
     """
     secret = SLACK_SIGNING_SECRET if secret is None else secret
     if not (timestamp and signature and secret):
@@ -93,11 +84,9 @@ def verify_signature(
 
 
 def clean_text(text: str) -> str:
-    """Strip the @mention tokens and undo Slack's escaping.
-
-    Only the three entities Slack actually produces are undone. html.unescape would
-    also decode things like &copy;, which Slack never sent and a runbook question
-    could legitimately contain.
+    """Strip the @mention tokens and undo Slack's escaping. Only the three entities Slack
+    produces: html.unescape would also decode &copy;, which a runbook question could
+    legitimately contain.
     """
     cleaned = MENTION_RE.sub("", text)
     for entity, char in SLACK_ESCAPES:
@@ -107,11 +96,8 @@ def clean_text(text: str) -> str:
 
 
 def parse_mention(event: dict) -> Mention | None:
-    """The question, channel and thread from an app_mention event.
-
-    None means "not ours to answer". Threading uses thread_ts when the mention is
-    already inside a thread and ts when it starts one, so the reply lands in a thread
-    either way.
+    """The question, channel and thread from an app_mention event. None means "not ours to
+    answer". Threading uses thread_ts inside a thread and ts when starting one.
     """
     if event.get("bot_id") or event.get("subtype"):
         return None
@@ -127,11 +113,9 @@ def parse_mention(event: dict) -> Mention | None:
 
 
 def is_duplicate(event_id: str, now: float) -> bool:
-    """True if this event has already been accepted.
-
-    Slack resends on a non-200 or a response slower than three seconds, up to three
-    times. Every answer here takes ~195 seconds, so an undeduped retry does not just
-    duplicate work -- it triples contention on a CPU that can serve one.
+    """True if this event has already been accepted. Slack resends on a non-200 or a response
+    slower than three seconds, and at ~195 seconds an undeduped retry triples contention on
+    a CPU that can serve one.
     """
     for stale in [eid for eid, seen in _seen_events.items() if now - seen > DEDUPE_TTL]:
         del _seen_events[stale]

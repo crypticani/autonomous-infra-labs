@@ -1,13 +1,11 @@
-"""The pull-request comment -- Day 25.
+"""The pull-request comment.
 
-This is the only part of the whole pipeline a human actually reads, and it started life
-as a sixty-line heredoc inside the reusable workflow. It lives here instead for two
-reasons: YAML is a bad place to keep logic that has branches, and code that only ever
-runs on someone else's runner during a real pull request has no way to be wrong cheaply.
+The only part of the pipeline a human reads. A module rather than a heredoc in the
+workflow, because YAML is a bad place for branching logic and code that runs only on
+someone else's runner has no way to be wrong cheaply.
 
-Stdlib only, and it takes the run as a plain dict rather than importing `Run` or
-`RiskAssessment`. The workflow curls this file onto a runner that has no checkout of this
-repo and no `pip install` step -- the same way it already fetches `scan.sh`.
+Stdlib only, and it takes the run as a plain dict: the workflow curls this file onto a
+runner with no checkout and no pip install.
 
     python comment.py run.json [comment.md]
 """
@@ -29,12 +27,9 @@ def _rows(top: list[dict]) -> list[str]:
 def render(run: dict) -> str:
     """Markdown for one run, finished or failed.
 
-    A `pending` run is refused rather than rendered. The workflow's poll loop only exits
-    once the status leaves `pending`, so reaching here with one is a caller mistake --
-    and the two honest responses to that are an error or a comment claiming a verdict
-    that does not exist yet. Found by running this by hand against a run that had not
-    finished, where the old code reached straight for `risk["counts"]` and died on a
-    `TypeError` that said nothing about the actual problem.
+    A `pending` run is refused rather than rendered: the poll loop only exits once the status
+    leaves `pending`, so reaching here with one is a caller mistake, and the alternative is a
+    comment claiming a verdict that does not exist yet.
     """
     if run["status"] == "pending":
         raise ValueError(
@@ -43,9 +38,8 @@ def render(run: dict) -> str:
         )
 
     if run["status"] == "failed":
-        # Deliberately not silence, and deliberately not something that reads like a
-        # pass. An absence of a verdict and a clean verdict look identical to anyone
-        # reading only the check mark, which is the failure this whole day corrects.
+        # Not silence, and not anything that reads like a pass: a missing verdict and a
+        # clean one look identical to anyone reading only the check mark.
         body = [
             "## Security triage could not finish",
             "",
@@ -78,8 +72,8 @@ def render(run: dict) -> str:
         if run["top"]:
             body += ["", *_rows(run["top"])]
 
-        # Diffs only. The advice entries are the other several hundred fixes, and they
-        # belong on the run record rather than in something a human has to scroll past.
+        # Diffs only; the advice entries belong on the run record, not in something a
+        # human scrolls past.
         diffs = [fix for fix in run["fixes"] if fix["kind"] == "diff"]
         if diffs:
             body += [
@@ -92,9 +86,8 @@ def render(run: dict) -> str:
                 body += ["```diff", fix["diff"].rstrip(), "```", ""]
             body += ["</details>"]
 
-    # The commit is omitted rather than rendered empty: Day 26's runtime caller has no
-    # commit to send and never will, and `commit ``` in the footer of a real PR comment
-    # reads like a bug in the tool rather than a property of the thing being triaged.
+    # Omitted rather than rendered empty: the runtime caller has no commit and never
+    # will, and an empty one reads like a bug in the tool.
     footer = f"run `{run['id']}`"
     if run["commit"]:
         footer += f" · commit `{run['commit'][:8]}`"
@@ -112,14 +105,10 @@ if __name__ == "__main__":
         with open(sys.argv[2], "w") as f:
             f.write(markdown)
 
-    # The file above is always plain markdown -- GitHub renders it, and an ANSI escape in
-    # a PR comment shows up as a literal `[1;31m` in the middle of a table row. Rendering
-    # is therefore only ever for a human looking at a terminal, and gated on both:
-    #
-    #   - a tty, so `python comment.py run.json > out.md` still writes markdown rather
-    #     than box-drawing characters,
-    #   - rich being importable, because the workflow curls this file onto a runner with
-    #     no pip install and it must keep working there.
+    # The file itself is always plain markdown -- an ANSI escape in a PR comment renders
+    # as a literal `[1;31m`. The pretty version is for a terminal only, so it is gated on
+    # a tty (redirection still writes markdown) and on rich being importable (the runner
+    # has no pip install).
     if sys.stdout.isatty():
         try:
             from rich.console import Console

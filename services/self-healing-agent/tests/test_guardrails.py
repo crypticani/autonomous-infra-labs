@@ -1,9 +1,5 @@
 """Day 19: the refusals. Every test here asks one question -- would this action have been
 allowed, and does the record say which rule stopped it.
-
-The stateful guards read audit.jsonl, so their fixtures write real audit lines rather than
-patching a counter. That is the point of deriving the counts from the log: a test can set
-up "three executions already failed" by writing what a failing hour actually looks like.
 """
 
 import json
@@ -26,12 +22,7 @@ SCALE = {"namespace": "sandbox", "deployment": "checkout-api", "replicas": 4}
 
 
 def apis_with_replicas(count: int):
-    """A fake `(core, apps)` pair whose scale subresource reports `count`.
-
-    Only read_namespaced_deployment_scale exists on it: anything else guardrails.py tried
-    to call would fail this test loudly, which is the assertion that the guard reads one
-    number and nothing more.
-    """
+    """A fake `(core, apps)` pair whose scale subresource reports `count`."""
     scale = SimpleNamespace(spec=SimpleNamespace(replicas=count))
     apps = SimpleNamespace(
         read_namespaced_deployment_scale=lambda name, namespace: scale
@@ -41,8 +32,8 @@ def apis_with_replicas(count: int):
 
 def outcomes(*events: str) -> None:
     """Writes a history: `outcomes("failed", "failed")` is what two failed executions left
-    behind. Uses audit.record itself, so a change to the log's shape breaks this rather
-    than being papered over by a hand-built line."""
+    behind. Uses audit.record, so a change to the log's shape breaks this.
+    """
     for event in events:
         audit.record(event, id="prior", tool="restart_pod")
 
@@ -73,9 +64,9 @@ def test_the_allowed_namespace_passes_every_config_guard(audit_log):
 
 @pytest.mark.parametrize("replicas", [0, -1, None, "two"])
 def test_scaling_below_the_floor_is_refused_and_not_clamped(replicas, audit_log):
-    """tools/k8s.py clamps a model-chosen count. This does not: the number is already in
-    front of a human as a button, and quietly turning 0 into 1 executes something nobody
-    approved."""
+    """tools/k8s.py clamps a model-chosen count. This does not: the number is already a button,
+    and turning 0 into 1 executes something nobody approved.
+    """
     with pytest.raises(GuardrailViolation) as raised:
         guardrails.check("scale_deployment", {**SCALE, "replicas": replicas})
 
@@ -92,9 +83,9 @@ def test_the_replica_floor_does_not_apply_to_other_tools(audit_log):
 
 
 def test_a_scale_down_against_the_live_count_is_refused_at_execute_time(audit_log):
-    """The scenario the spec's "re-run at execute time" exists for: the proposal was an
-    increase from 2 when it was made, a human scaled to 8 during the incident, and the
-    click twenty minutes later would now be a scale *down*."""
+    """Why guards run twice: the proposal was an increase from 2 when made, a human scaled to 8
+    during the incident, and the click twenty minutes later is now a scale *down*.
+    """
     with pytest.raises(GuardrailViolation) as raised:
         guardrails.check("scale_deployment", SCALE, apis=apis_with_replicas(8))
 
@@ -155,9 +146,9 @@ def test_a_failed_execution_still_spends_the_budget(audit_log, monkeypatch):
 
 
 def test_proposals_that_never_ran_do_not_spend_the_budget(audit_log, monkeypatch):
-    """Why the count reads `executed`/`failed` and not `approved`: if a blocked or
-    rejected proposal filled the hour's budget, one bad proposal would poison the window
-    and the guards would compound each other."""
+    """Why the count reads `executed`/`failed` and not `approved`: a blocked proposal filling
+    the hour's budget would let one bad proposal poison the window.
+    """
     monkeypatch.setattr(guardrails, "MAX_ACTIONS_PER_HOUR", 1)
     for event in ("proposed", "approved", "rejected", "blocked", "expired"):
         audit.record(event, id="prior", tool="restart_pod")
@@ -185,14 +176,8 @@ def test_the_breaker_opens_after_consecutive_failures(audit_log, monkeypatch):
 
 
 def test_the_breaker_is_reachable_at_the_shipped_defaults(audit_log):
-    """No monkeypatching, deliberately -- this is the one breaker test that runs at the
-    real config, and it exists because every other one hid a bug behind
-    MAX_ACTIONS_PER_HOUR=99 "to isolate the breaker".
-
-    N consecutive failures is also N attempts. With both thresholds at 3 and the rate
-    limit checked first, the breaker answered never: the more specific guard was
-    unreachable at its own default, and the only symptom was a slightly less useful
-    sentence in Slack. Swap the two calls in check() back and this fails.
+    """No monkeypatching: the one breaker test at the real config, and it exists because every
+    other one hid a bug behind MAX_ACTIONS_PER_HOUR=99 "to isolate the breaker".
     """
     assert guardrails.BREAKER_THRESHOLD >= guardrails.MAX_ACTIONS_PER_HOUR, (
         "this test is only interesting while the breaker's threshold is the harder one "
@@ -217,9 +202,9 @@ def test_a_success_in_between_keeps_the_breaker_closed(audit_log, monkeypatch):
 
 
 def test_the_breaker_half_opens_once_the_failures_age_out(audit_log, monkeypatch):
-    """The reason the breaker shares the rate limit's window. Without a time bound it
-    blocks the only event that could close it -- a successful execution -- and stays open
-    until someone restarts the process, which is the opposite of a safety control."""
+    """Why the breaker shares the rate limit's window: without a time bound it blocks the only
+    event that could close it and stays open until someone restarts the process.
+    """
     monkeypatch.setattr(guardrails, "MAX_ACTIONS_PER_HOUR", 99)
     monkeypatch.setattr(guardrails, "BREAKER_THRESHOLD", 3)
     outcomes("failed", "failed", "failed")
@@ -237,9 +222,9 @@ def test_a_missing_audit_log_is_an_empty_history(tmp_path, monkeypatch):
 
 
 def test_an_unreadable_audit_log_refuses_everything(tmp_path, monkeypatch):
-    """Deliberate, and the same direction as audit.record's missing try/except: a history
-    this cannot read is a history it cannot check, and a guard that cannot check must not
-    shrug and allow."""
+    """Deliberate: a history this cannot read is a history it cannot check, and a guard that
+    cannot check must not shrug and allow.
+    """
     path = tmp_path / "audit.jsonl"
     path.write_text("{this is not json}\n")
     monkeypatch.setattr(audit, "AUDIT_PATH", str(path))
@@ -273,9 +258,9 @@ def test_the_llm_budget_refills_as_the_window_rolls(monkeypatch):
 
 
 def test_the_loop_stops_when_the_budget_is_gone(fake_provider, monkeypatch):
-    """The cap that matters from Day 20 on. It raises rather than returning an incomplete
-    diagnosis, because "spent" is a different answer from "could not work it out" and a
-    caller that cannot tell them apart will retry the wrong one."""
+    """It raises rather than returning an incomplete diagnosis: "spent" is a different answer
+    from "could not work it out", and a caller that cannot tell will retry the wrong one.
+    """
     from agent import diagnose
 
     monkeypatch.setattr(guardrails, "MAX_LLM_CALLS", 0)
@@ -324,9 +309,8 @@ def test_a_blocked_action_never_becomes_a_button(audit_log):
 def test_a_guard_that_refuses_at_click_time_leaves_approved_then_blocked(
     audit_log, monkeypatch
 ):
-    """The whole point of Day 19, in one test. The proposal was legal when it was made and
-    illegal by the time it was approved, and the audit log says so in that order: a human
-    did click yes, and the machine refused anyway.
+    """The whole point, in one test: the proposal was legal when made and illegal by the time it
+    was approved, and the audit log says so in that order.
     """
     executed: list[dict] = []
 
@@ -374,18 +358,17 @@ def test_a_blocked_proposal_cannot_be_clicked_again(audit_log):
 
 
 def test_the_event_names_this_reads_are_the_ones_approvals_writes():
-    """guardrails.py hardcodes two audit event names rather than importing them from
-    approvals, which imports this module. This is the check that keeps the two literals
-    honest -- rename a state without it and every count silently reads zero, which looks
-    exactly like a quiet hour."""
+    """guardrails.py hardcodes two audit event names rather than importing them. Rename a state
+    without this check and every count silently reads zero, which looks like a quiet hour.
+    """
     assert guardrails.EXECUTED == approvals.EXECUTED
     assert guardrails.FAILED == approvals.FAILED
 
 
 def test_the_namespace_allowlist_matches_the_role_it_sits_above():
-    """SHA_NAMESPACES and k8s/rbac.yaml's namespace are two files saying the same thing.
-    An allowlist naming a namespace the Role cannot reach is a guard that permits what
-    RBAC then 403s -- a confusing failure at the worst moment."""
+    """Two files saying the same thing. An allowlist naming a namespace the Role cannot reach
+    is a guard that permits what RBAC then 403s.
+    """
     import yaml
 
     rbac = Path(__file__).resolve().parents[1] / "k8s" / "rbac.yaml"
@@ -396,9 +379,9 @@ def test_the_namespace_allowlist_matches_the_role_it_sits_above():
 
 
 def test_a_refusal_is_counted_under_the_guard_that_refused(audit_log):
-    # The label carries the whole signal. `sha_guardrail_blocks_total` on its own says
-    # only that the agent said no; `guard="breaker"` says something is broken and
-    # `guard="namespace"` says the model aimed at the wrong cluster. Different pages.
+    # The label carries the signal: the bare counter says only that the agent said no,
+    # `guard="breaker"` says something is broken and `guard="namespace"` says the model
+    # aimed at the wrong cluster. Different pages.
     from conftest import metric
 
     before = metric("sha_guardrail_blocks_total", guard="namespace")
@@ -410,8 +393,8 @@ def test_a_refusal_is_counted_under_the_guard_that_refused(audit_log):
 
 
 def test_the_llm_budget_refusal_is_counted_too(audit_log, monkeypatch):
-    # It is the only guard that never goes through check(), so it is the one a single
-    # instrumentation point in the wrong place would silently miss.
+    # The only guard that never goes through check(), so it is the one a single
+    # instrumentation point in the wrong place would miss.
     from conftest import metric
 
     monkeypatch.setattr(guardrails, "MAX_LLM_CALLS", 1)

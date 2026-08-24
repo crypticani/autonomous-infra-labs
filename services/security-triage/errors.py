@@ -1,11 +1,4 @@
-"""One error type for anything the model backend gets wrong.
-
-Same shape as knowledge-copilot's UpstreamError and self-healing-agent's
-AgentProviderError -- a status the caller should return, and which provider to go look
-at. Covers both transport failures (timeout, unreachable, rejected request) and a model
-that answered but produced something triage.py can't use (malformed JSON, a schema
-violation): either way, the caller could not get a usable triage out of this call.
-"""
+"""One error type for anything the model backend gets wrong."""
 
 
 class TriageProviderError(RuntimeError):

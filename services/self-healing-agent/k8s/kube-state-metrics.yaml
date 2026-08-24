@@ -1,7 +1,5 @@
-# Minimal kube-state-metrics: only what Day 21's capstone alert rule reads
-# (kube_deployment_status_replicas_available, kube_deployment_spec_replicas). The
-# upstream project ships a much larger bundle (autoscaling, PodSecurityPolicy, several
-# more resource collectors); this trims to the one thing appsrv's Prometheus needs.
+# Trimmed from the upstream bundle to the deployment collector alone -- the only thing
+# the capstone alert rule reads.
 apiVersion: v1
 kind: ServiceAccount
 metadata:

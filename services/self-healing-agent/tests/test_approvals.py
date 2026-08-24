@@ -1,9 +1,5 @@
 """Day 18: the gate. Every test here asks one of two questions -- did the cluster get
 touched, and does the audit log say so honestly.
-
-No test reaches Slack or a cluster. `spy_tool` swaps a ToolSpec's `fn` for a counter,
-which is the only substitution needed: the registry is data, so a fake write tool is a
-`dataclasses.replace` rather than a mock framework.
 """
 
 import time
@@ -37,11 +33,6 @@ def isolated_proposals(monkeypatch):
     """_proposals is module-level state. Without this, a test could pass because of a
     proposal another test left behind, and the double-click test could pass for the
     wrong reason.
-
-    get_apis is stubbed for the same reason test_agent.py stubs it: restart_pod's spec
-    declares `needs`, so _execute fetches a client before calling the tool, and without
-    a kubeconfig that raises before the fake tool is ever reached -- which would make
-    these tests pass or fail on kubeconfig loading rather than on the gate.
     """
     approvals._proposals.clear()
     monkeypatch.setattr(approvals, "slack_enabled", lambda: False)
@@ -136,12 +127,7 @@ def test_an_unknown_id_is_refused_rather_than_raising(spy_tool, audit_log):
 
 
 def test_the_decision_is_on_disk_before_the_action_that_failed(monkeypatch, audit_log):
-    """The reason audit.py fsyncs.
-
-    A tool that raises must still leave `approved` behind. Were the record written
-    after the call instead, a crash mid-write and a call that never happened would be
-    indistinguishable afterwards -- and this is the test that would go green anyway.
-    """
+    """The reason audit.py fsyncs."""
 
     def explode(apis, **args):
         raise K8sError("pod 'checkout-api-7d9f-x2k' not found", status=404)
@@ -172,14 +158,7 @@ def test_a_failed_execution_is_not_retryable_by_clicking_again(spy_tool, audit_l
 def test_the_shape_submit_diagnosis_asks_for_is_the_shape_propose_accepts(
     audit_log, spy_tool
 ):
-    """The two ends of the contract, checked against each other.
-
-    approvals._validate() and submit_diagnosis's schema were written a day apart, and
-    for that day they disagreed: the schema said `proposed_action` was a bare object, so
-    the model answered in prose, and every proposal was refused before it could become a
-    button. Nothing failed loudly -- the gate simply never opened. This is the test that
-    would have caught it.
-    """
+    """The two ends of the contract, checked against each other."""
     schema = REGISTRY["submit_diagnosis"].schema["properties"]["proposed_action"]
     tool = schema["properties"]["tool"]["enum"][0]
 
@@ -192,12 +171,7 @@ def test_the_shape_submit_diagnosis_asks_for_is_the_shape_propose_accepts(
 
 
 def test_every_tool_the_schema_offers_is_a_write_tool_that_actually_exists():
-    """Drift guard, the same shape as test_rbac.py's.
-
-    The enum is derived from the registry today. If it is ever hand-edited back to a
-    literal -- or a tool is renamed -- this fails here rather than as a proposal that
-    is silently refused in production.
-    """
+    """Drift guard, the same shape as test_rbac.py's."""
     schema = REGISTRY["submit_diagnosis"].schema["properties"]["proposed_action"]
     offered = schema["properties"]["tool"]["enum"]
 

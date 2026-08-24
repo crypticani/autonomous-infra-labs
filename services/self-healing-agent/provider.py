@@ -1,22 +1,18 @@
 """The model backend, behind one interface -- including the shape of the transcript.
 
-log-analyzer and knowledge-copilot both put `generate(system, user) -> str` behind a provider
-ABC, and that is not enough here. An agent turn is not a string: it is prose, or a request to
-call functions, or both. And the transcript itself is provider-shaped -- Gemini requires the
-model's own turn to be echoed back into `contents` verbatim, so it cannot be rebuilt from a
-list of ToolCalls without losing part ordering and thought signatures.
+`generate(system, user) -> str` is not enough here. An agent turn is prose, or a request
+to call functions, or both, and the transcript itself is provider-shaped: Gemini requires
+the model's own turn echoed back verbatim, so it cannot be rebuilt from a list of
+ToolCalls without losing part ordering and thought signatures.
 
-So this interface owns three things instead of one: how to phrase a user message, how to take
-a turn, and how to phrase a tool result. agent.py never constructs a message. That is what
-lets the loop be genuinely provider-agnostic, rather than Gemini-shaped with an adapter
-bolted on for everything else.
+So this interface owns three things: how to phrase a user message, how to take a turn,
+and how to phrase a tool result. agent.py never constructs a message, which is what makes
+the loop provider-agnostic rather than Gemini-shaped with an adapter bolted on.
 
-Automatic function calling is disabled on every request, and tools are declared as schemas
-rather than as callables. With AFC enabled -- which is the SDK's default -- google-genai
-executes tool functions itself, up to ten per request. For this service that means calling
-restart_pod with no human anywhere in the path. Day 18's approval gate is worth nothing if
-the SDK can route around it, so there are two defences: the flag, and the fact that no
-callable is ever handed over for it to invoke.
+**Automatic function calling is disabled on every request**, and tools are declared as
+schemas rather than callables. With AFC on -- the SDK's default -- google-genai executes
+tool functions itself, which here means calling restart_pod with no human in the path.
+Two defences: the flag, and never handing over a callable to invoke.
 """
 
 import logging
@@ -39,40 +35,24 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Retried in place, because a diagnosis is not one model call -- it is six to ten, and the
-# transcript is only in memory. Losing the ninth to a 503 discards the eight that worked and
-# the tool results they cost. Day 20 is when that stops being survivable: Alertmanager calls
-# this with nobody watching, so a discarded diagnosis is an alert that silently gets none.
-#
-# Only failures where the same request could plausibly succeed unchanged. A 400 means this
-# code built a bad request; sending it twice more is three identical failures instead of one.
-# 404 is a wrong model name. Neither improves by waiting.
+# A diagnosis is six to ten chained calls held only in memory, so losing the ninth to a
+# 503 discards the eight that worked. Only failures that could succeed unchanged are
+# retried: a 400 is a request this code built wrong, a 404 is a wrong model name.
 RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 MAX_RETRIES = int(os.getenv("SHA_MODEL_RETRIES", "3"))
-# Doubles per attempt: 1s, 2s. Constant backoff against a rate limit is just three requests
-# into the same closed door. Total added latency is bounded at 3s, which is nothing next to
-# a diagnosis that already runs for minutes.
+# Doubles per attempt: 1s, 2s. Bounded at 3s added latency.
 RETRY_BACKOFF = float(os.getenv("SHA_MODEL_RETRY_BACKOFF", "1.0"))
 
-# The retry above cannot ride this one out. Discovered live on 2026-08-16: a 429 whose body
-# named the exact quota -- "GenerateRequestsPerMinutePerProjectPerModel-FreeTier", value 5
-# -- and asked for a 51s retry. Gemini's free tier caps requests per *minute*, independent
-# of MAX_LLM_CALLS' hourly one, and none of this loop's tool calls are slow enough to space
-# turns out on their own: seven iterations fired in eight seconds against a cap of five.
-# Pacing stays under the limit instead of recovering from a violation of it -- proactive,
-# not reactive, because 1s/2s of backoff is nothing against a stated 51s wait.
+# The retry above cannot ride this out: a live 429 named the quota (value 5 per minute)
+# and asked for a 51s wait, and seven iterations fire in eight seconds. Pacing stays under
+# the limit rather than recovering from a violation of it.
 RATE_LIMIT = int(os.getenv("SHA_MODEL_RATE_LIMIT", "5"))
 RATE_LIMIT_WINDOW = 60.0
 
 
 @dataclass(frozen=True)
 class ToolCall:
-    """One function the model asked for. It has not run.
-
-    `id` is Gemini's optional correlation id. Nothing dispatches on it -- the loop keys on
-    `name` -- but it is passed back untouched when present, because the API may start
-    requiring it for parallel calls.
-    """
+    """One function the model asked for. It has not run."""
 
     name: str
     args: dict[str, Any]
@@ -81,16 +61,7 @@ class ToolCall:
 
 @dataclass(frozen=True)
 class AgentTurn:
-    """What the model did with one turn.
-
-    `text` and `tool_calls` are not exclusive: a model may narrate and then call. Either may
-    be empty. Both empty means the model said nothing at all, which the loop has to treat as
-    a dead end rather than as an empty diagnosis.
-
-    `raw` is this provider's own object for the turn, kept so the loop can append it to the
-    transcript verbatim -- see the module docstring for why rebuilding it is not an option.
-    The loop must never read inside it.
-    """
+    """What the model did with one turn."""
 
     text: str
     tool_calls: tuple[ToolCall, ...]
@@ -101,11 +72,9 @@ class BaseAgentProvider(ABC):
     name: str
     model_name: str
 
-    # Cumulative tokens across every chat() turn this provider has served. Cumulative is
-    # the only useful shape here: agent.py runs four to six chained turns inside one
-    # diagnosis and never surfaces the individual ones, so "what did that diagnosis
-    # cost" is a delta around the whole loop, not a per-call reading. Plain ints so `+=`
-    # rebinds per instance rather than sharing a mutable class default.
+    # Cumulative across every chat() turn: a diagnosis is four to six chained turns, so
+    # "what did that cost" is a delta around the whole loop. Plain ints so `+=` rebinds
+    # per instance rather than sharing a mutable class default.
     prompt_tokens = 0
     output_tokens = 0
 
@@ -127,10 +96,9 @@ class BaseAgentProvider(ABC):
     ) -> AgentTurn:
         """One turn. `tools` is a list of `{name, description, schema}` dicts.
 
-        `allowed` is a hint, not a control. It narrows what the model is *asked* to choose
-        from, where the backend supports that; Ollama's /api/chat has no equivalent
-        parameter. agent.py checks every returned name against its own allowlist regardless,
-        which is the check that actually holds.
+        `allowed` is a hint, not a control -- it narrows what the model is *asked* to pick from
+        where the backend supports it. agent.py checks every returned name against its own
+        allowlist regardless, which is the check that holds.
         """
 
 
@@ -140,23 +108,19 @@ class GeminiProvider(BaseAgentProvider):
     def __init__(self) -> None:
         if not os.getenv("GEMINI_API_KEY"):
             logger.error("GEMINI_API_KEY is not set in the environment")
-        # Its own key rather than the copilot's GEMINI_MODEL: this service may want a
-        # heavier model for reasoning about a cluster than the copilot wants for reading
-        # four chunks of markdown, and one shared key makes that a coupled decision.
+        # Its own key: a distinct model name is also a distinct free-tier quota bucket.
         self.model_name = os.getenv("SHA_GEMINI_MODEL", "gemini-3.6-flash")
         self.client = genai.Client()
-        # Real request timestamps, kept for the life of this provider -- which is the life
-        # of the process, since get_agent_provider() is a singleton. Pacing has to see calls
-        # from earlier diagnoses too: Gemini's per-minute cap doesn't reset between them.
+        # Kept for the life of the process: the per-minute cap does not reset between
+        # diagnoses, so pacing has to see the earlier ones.
         self._call_times: list[float] = []
         logger.info(f"GeminiProvider using {self.model_name}")
 
     def _pace(self) -> None:
-        """Waits, if needed, to keep this provider under RATE_LIMIT requests per
-        RATE_LIMIT_WINDOW. Every attempt counts, not only ones that made it back to
-        agent.py -- a retried attempt is still a real request against the same quota,
-        and undercounting here is exactly how a diagnosis retrying through transient
-        errors would end up back at the 429 the retry above cannot outlast.
+        """Waits, if needed, to stay under RATE_LIMIT per RATE_LIMIT_WINDOW.
+
+        Every attempt counts, including retried ones -- a retry is a real request against the
+        same quota, and undercounting is how a diagnosis lands back on a 429.
         """
         now = time.monotonic()
         self._call_times = [t for t in self._call_times if now - t < RATE_LIMIT_WINDOW]
@@ -175,10 +139,8 @@ class GeminiProvider(BaseAgentProvider):
         return types.Content(role="user", parts=[types.Part(text=text)])
 
     def tool_result(self, call: ToolCall, result: dict) -> types.Content:
-        # role="user", not "tool": this API has no tool role, and role="user" is what the
-        # SDK's own automatic-calling loop uses for function responses. The convention for
-        # the dict is {"output": ...} on success and {"error": ...} on failure -- tools/
-        # owns which, not this module.
+        # role="user", not "tool": this API has no tool role, and "user" is what the SDK's
+        # own automatic-calling loop uses for function responses.
         return types.Content(
             role="user",
             parts=[types.Part.from_function_response(name=call.name, response=result)],
@@ -193,8 +155,7 @@ class GeminiProvider(BaseAgentProvider):
     ) -> AgentTurn:
         config: dict[str, Any] = {
             "system_instruction": system,
-            # Diagnosis is not a creative task, and a reproducible transcript is worth more
-            # than variety when the eval harness lands on day 21.
+            # Diagnosis is not a creative task; a reproducible transcript is worth more than variety.
             "temperature": 0.0,
             "tools": [
                 types.Tool(
@@ -202,9 +163,8 @@ class GeminiProvider(BaseAgentProvider):
                         types.FunctionDeclaration(
                             name=tool["name"],
                             description=tool["description"],
-                            # parameters_json_schema, not parameters: the two are mutually
-                            # exclusive, and the JSON Schema form is what tools/ writes
-                            # anyway for its own argument validation.
+                            # Not `parameters`: the two are mutually exclusive, and
+                            # tools/ already writes the JSON Schema form.
                             parameters_json_schema=tool["schema"],
                         )
                         for tool in tools
@@ -217,18 +177,16 @@ class GeminiProvider(BaseAgentProvider):
             ),
         }
         if allowed:
-            # VALIDATED, not ANY. ANY forces a function call on every turn, so the model
-            # could never reply in prose -- including never being able to say it is stuck,
-            # which is the one thing a diagnosis loop must be able to report.
+            # VALIDATED, not ANY: ANY forces a call every turn, so the model could never say it
+            # is stuck -- the one thing this loop must be able to report.
             config["tool_config"] = types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
                     mode="VALIDATED", allowed_function_names=list(allowed)
                 )
             )
 
-        # Retries are deliberately invisible to guardrails.check_llm_call(), which counts
-        # turns the model actually took. A 503 was never served, so charging it to the
-        # budget would let an outage spend the day's calls without producing a diagnosis.
+        # Invisible to guardrails.check_llm_call(): a 503 was never served, so charging it
+        # would let an outage spend the day's budget producing no diagnosis.
         for attempt in range(1, MAX_RETRIES + 1):
             self._pace()
             try:
@@ -249,21 +207,18 @@ class GeminiProvider(BaseAgentProvider):
                 )
                 time.sleep(delay)
 
-        # Only the attempt that came back is counted. A retried 503 was never served, so
-        # it was never billed either -- same reasoning that keeps retries out of
-        # guardrails.check_llm_call().
+        # Only the attempt that came back: a retried 503 was never billed either.
         if usage := response.usage_metadata:
             prompt_tokens = usage.prompt_token_count or 0
-            # Thinking tokens bill as output, and this service is the one that would feel
-            # it most: a tool-selection turn writes almost no prose, so nearly all of its
-            # output cost is reasoning that candidates_token_count does not see.
+            # Thinking tokens bill as output, and a tool-selection turn writes almost no prose --
+            # nearly all of its cost is reasoning candidates_token_count misses.
             output_tokens = (usage.candidates_token_count or 0) + (
                 usage.thoughts_token_count or 0
             )
             self.prompt_tokens += prompt_tokens
             self.output_tokens += output_tokens
-            # Both sinks on purpose: the attributes are for a caller measuring one
-            # diagnosis by delta, the counter is for Grafana across all of them.
+            # Attributes for a caller measuring one diagnosis by delta, the counter for Grafana
+            # across all of them.
             metrics.MODEL_TOKENS.labels(direction="prompt").inc(prompt_tokens)
             metrics.MODEL_TOKENS.labels(direction="output").inc(output_tokens)
 
@@ -272,19 +227,15 @@ class GeminiProvider(BaseAgentProvider):
             for call in (response.function_calls or [])
         )
 
-        # candidates is empty when a safety filter blocked the response, so this is a real
-        # branch and not defensive noise.
+        # Empty when a safety filter blocked the response -- a real branch.
         raw = response.candidates[0].content if response.candidates else None
         if raw is None:
             raise AgentProviderError(
                 "the model returned no content", 502, provider=self.name
             )
 
-        # Not response.text. That accessor logs a warning whenever a response contains
-        # non-text parts -- which for this service is every turn that calls a tool -- and it
-        # is the normal case here, not something to warn about. Reading the parts directly
-        # says what we mean and stays quiet. `thought` parts are the model's reasoning, not
-        # its answer.
+        # Not response.text: it warns on non-text parts, which here is every turn that calls
+        # a tool. `thought` parts are reasoning, not the answer.
         parts = raw.parts or []
         text = "".join(part.text for part in parts if part.text and not part.thought)
 
@@ -293,9 +244,8 @@ class GeminiProvider(BaseAgentProvider):
 
 @lru_cache(maxsize=1)
 def get_agent_provider() -> BaseAgentProvider:
-    # Defaults to gemini, unlike the other two services, which default to ollama. One
-    # diagnosis is four to six chained turns, and generation against a CPU-only Ollama
-    # measured 165-204s per turn in week 2 -- twenty minutes for one answer.
+    # Gemini by default, unlike the others: four to six chained turns at 165-204s each on
+    # CPU Ollama is twenty minutes for one answer.
     provider_type = os.getenv("SHA_LLM_PROVIDER", "gemini").lower()
     if provider_type == "gemini":
         return GeminiProvider()

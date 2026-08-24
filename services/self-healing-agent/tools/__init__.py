@@ -1,10 +1,6 @@
-"""The tool registry: one `ToolSpec` per tool, filtered two ways rather than built as
-two systems. Day 17's loop passes `READ_ONLY`; Day 18 passes `ALL`. Neither day changes
-a signature here -- see docs/superpowers/specs/2026-08-11-week3-agent-design.md, decision 2.
-
-`needs` exists only so a test can compare it against k8s/rbac.yaml's actual verbs --
-written a week apart, a Role and a tool list drift, and the drift should fail a test
-before it fails a 403 in front of a human on Day 21.
+"""The tool registry: one `ToolSpec` per tool, filtered two ways rather than built as two
+systems. The loop passes `READ_ONLY`, the approval gate passes `ALL`, and no signature
+here changes between them.
 """
 
 from collections.abc import Callable
@@ -123,9 +119,8 @@ _SPECS = [
         },
         fn=scale_deployment,
         write=True,
-        # `get` belongs to this tool even though scale_deployment never calls it: it is
-        # what guardrails.py reads before letting this tool run, and test_rbac.py compares
-        # this tuple against the Role for exact equality.
+        # `get` belongs here even though scale_deployment never calls it: guardrails.py reads it
+        # before letting the tool run, and test_rbac.py compares this tuple against the Role.
         needs=("apps/deployments/scale:get", "apps/deployments/scale:patch"),
     ),
     ToolSpec(
@@ -145,10 +140,9 @@ _SPECS = [
     ),
 ]
 
-# Derived, never written twice. submit_diagnosis's schema constrains `proposed_action.tool`
-# to these by enum, so Day 19 adding a write tool cannot leave the model still being offered
-# Day 18's list -- the failure that would cause is silent, because an unknown tool name is
-# refused by approvals._validate() and simply never becomes a button.
+# Derived, never written twice: submit_diagnosis constrains `proposed_action.tool` to
+# these by enum, so adding a write tool cannot leave the model offered the old list. That
+# failure would be silent -- an unknown name is refused and simply never becomes a button.
 WRITE: tuple[str, ...] = tuple(spec.name for spec in _SPECS if spec.write)
 
 _SPECS.append(
@@ -161,12 +155,10 @@ _SPECS.append(
             "properties": {
                 "summary": {"type": "string"},
                 "evidence": {"type": "array", "items": {"type": "string"}},
-                # The shape is stated in both the schema and its description on purpose.
-                # The enum is the real constraint where the provider honours it; the prose
-                # is what survives a provider that treats nested schemas loosely. Before
-                # this existed the field was a bare {"object", "null"} and the model was
-                # never told the gate's vocabulary -- it answered "raise the memory limit",
-                # which is not a tool, so the proposal was refused and no button appeared.
+                # Stated in both the schema and its description: the enum is the real
+                # constraint where the provider honours it, the prose survives one that
+                # treats nested schemas loosely. Without it the model answered "raise the
+                # memory limit", which is not a tool, so no button appeared.
                 "proposed_action": {
                     "type": ["object", "null"],
                     "description": (
@@ -203,9 +195,9 @@ ALL: tuple[str, ...] = tuple(REGISTRY)
 
 
 def as_model_tools(names: tuple[str, ...] = ALL) -> list[dict[str, Any]]:
-    """`{name, description, schema}` dicts -- the shape provider.chat()'s `tools`
-    parameter expects, with `fn`, `write` and `needs` left out because none of those
-    are the model's business."""
+    """`{name, description, schema}` dicts -- what provider.chat()'s `tools` parameter expects.
+    `fn`, `write` and `needs` are left out because none is the model's business.
+    """
     return [
         {
             "name": REGISTRY[name].name,

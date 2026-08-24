@@ -1,14 +1,12 @@
-"""The approval gate -- Day 18. A write tool runs from exactly one place: decide().
+"""The approval gate. A write tool runs from exactly one place: decide().
 
-agent.py still passes READ_ONLY and cannot reach a write. This module deliberately
-does not import agent._dispatch either, so there is no import edge at all from the
-reasoning loop to a cluster mutation -- the three lines it costs to re-dispatch here
-are cheaper than an edge someone has to reason about later.
+agent.py passes READ_ONLY and cannot reach a write. This module does not import
+agent._dispatch either, so there is no import edge at all from the reasoning loop to a
+cluster mutation -- three lines of re-dispatch is cheaper than an edge to reason about.
 
-Proposals live in memory and die with the process. That is not a gap. A proposal
-reasoned about a cluster state, and one that survived a restart is consent for a
-cluster that may no longer exist; audit.jsonl keeps the record, _proposals keeps only
-what is still actionable.
+Proposals live in memory and die with the process. Not a gap: a proposal reasoned about
+a cluster state, and one that survived a restart is consent for a cluster that may no
+longer exist. audit.jsonl keeps the record, _proposals keeps what is still actionable.
 """
 
 import logging
@@ -37,8 +35,8 @@ EXECUTED = "executed"
 REJECTED = "rejected"
 EXPIRED = "expired"
 FAILED = "failed"
-# Day 19. Not FAILED: nothing broke, the agent refused. Terminal like the other two, so a
-# blocked proposal cannot be clicked into a second attempt.
+# Not FAILED: nothing broke, the agent refused. Terminal, so a blocked proposal cannot
+# be clicked into a second attempt.
 BLOCKED = "blocked"
 
 
@@ -55,9 +53,9 @@ class Proposal:
 
 @dataclass(frozen=True)
 class Decision:
-    """What to tell Slack. `ok` is whether a transition actually happened -- a
-    double-click and a real approval both return a Decision, and only one of them ran
-    anything."""
+    """What to tell Slack. `ok` is whether a transition actually happened -- a double-click
+    and a real approval both return a Decision, and only one of them ran anything.
+    """
 
     ok: bool
     message: str
@@ -75,10 +73,9 @@ def slack_enabled() -> bool:
 def _validate(action) -> tuple[str, dict] | None:
     """The model's proposed_action is free-form: its schema is {"object", "null"}.
 
-    Anything that is not a real write tool with a dict of arguments dies here rather
-    than becoming a button a human can click. A read-only tool is refused too -- there
-    is nothing to approve about reading a log, and offering it would train the on-call
-    to click Approve without reading.
+    Anything that is not a real write tool with a dict of arguments dies here rather than
+    becoming a button. A read-only tool is refused too -- offering one would train the
+    on-call to click Approve without reading.
     """
     if not isinstance(action, dict):
         return None
@@ -87,9 +84,8 @@ def _validate(action) -> tuple[str, dict] | None:
     spec = REGISTRY.get(tool) if isinstance(tool, str) else None
     if spec is None or not spec.write or not isinstance(args, dict):
         return None
-    # The tool's own schema says what it needs. Without this a proposal missing an
-    # argument still becomes a button, and the click reaches _execute() and dies on a
-    # TypeError -- audited as FAILED, indistinguishable from a cluster that refused.
+    # Without this, a proposal missing an argument still becomes a button and the click dies
+    # on a TypeError -- audited as FAILED, indistinguishable from a cluster that refused.
     if any(field not in args for field in spec.schema.get("required", [])):
         return None
     return tool, args
@@ -108,9 +104,8 @@ def propose(diagnosis, alert: dict, now: float | None = None) -> Proposal | None
         return None
 
     tool, args = validated
-    # Before the proposal exists, so a refused action never becomes a button at all. The
-    # cluster is not read here (no `apis`): the model has just finished reading it, and the
-    # check that needs live state is the one decide() runs at click time.
+    # Before the proposal exists, so a refused action never becomes a button. The cluster is
+    # not read here -- the check that needs live state is the one decide() runs at click time.
     try:
         guardrails.check(tool, args)
     except GuardrailViolation as e:
@@ -157,17 +152,18 @@ def _sweep(now: float) -> None:
 
 
 def _apis_for(proposal: Proposal):
-    """Fetched once and handed to both the guardrail and the tool. get_apis is lru_cached
-    so this is not about cost -- it is that the check and the write have to be looking at
-    the same cluster."""
+    """Fetched once and handed to both the guardrail and the tool. Not about cost -- the check
+    and the write have to be looking at the same cluster.
+    """
     spec = REGISTRY[proposal.tool]
     return k8s_client.get_apis() if spec.needs else (None, None)
 
 
 def _execute(proposal: Proposal, apis) -> dict:
-    """Deliberately not agent._dispatch. That function wraps every failure into a dict
-    for the model to read; here a failure has to reach decide() as an exception, so the
-    audit line says FAILED instead of recording a success with an error inside it."""
+    """Deliberately not agent._dispatch: that wraps every failure into a dict for the model to
+    read, and here a failure has to reach decide() as an exception so the audit line says
+    FAILED rather than recording a success with an error inside it.
+    """
     return REGISTRY[proposal.tool].fn(apis, **proposal.args)
 
 
@@ -176,11 +172,10 @@ def decide(
 ) -> Decision:
     """The one place a write tool can run.
 
-    The order is not rearrangeable: unknown, then expired, then already-decided, then
-    act. Expiry is checked before state so a stale proposal cannot be approved, and the
-    state flips to APPROVED *before* execution, so a second click arriving while the
-    first is still talking to the API server sees a non-proposed state and refuses.
-    That check-and-set is the whole defence against one alert restarting a pod twice.
+    The order is not rearrangeable: unknown, expired, already-decided, then act. Expiry
+    before state so a stale proposal cannot be approved, and the state flips to APPROVED
+    *before* execution, so a second click arriving mid-write sees a non-proposed state and
+    refuses. That check-and-set is the whole defence against restarting a pod twice.
     """
     now = time.time() if now is None else now
     _sweep(now)
@@ -204,13 +199,10 @@ def decide(
     )
     metrics.PROPOSALS.labels(state=APPROVED).inc()
 
-    # Day 19: the second checkpoint, and the one that matters. It sits after the state
-    # flip so the double-click defence is untouched, and after the `approved` line so the
-    # log reads approved -> blocked -- a human did click yes, and the machine refused
-    # anyway. A guard evaluated only at propose time would have said nothing here.
-    # One try for both, so that loading a client, refusing, and failing all end up
-    # somewhere deliberate. GuardrailViolation is caught first and separately: it is the
-    # only one of the three where nothing was attempted.
+    # The second checkpoint, after the state flip so the double-click defence is untouched
+    # and after the `approved` line so the log reads approved -> blocked: a human did click
+    # yes and the machine refused anyway. One try for all three outcomes; GuardrailViolation
+    # is caught separately because it is the only one where nothing was attempted.
     try:
         apis = _apis_for(proposal)
         guardrails.check(proposal.tool, proposal.args, apis=apis)

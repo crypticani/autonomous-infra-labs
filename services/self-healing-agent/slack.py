@@ -1,13 +1,12 @@
-"""The Slack surface for approvals -- Day 18.
+"""The Slack surface for approvals.
 
-verify_signature is a deliberate copy of knowledge-copilot's slack_events.py rather
-than an import: these are two services in two containers, and the alternative to
-copying thirty lines is a shared package that couples their deploys. The copy is the
-cheaper of the two.
+verify_signature is a deliberate copy of knowledge-copilot's rather than an import: two
+services in two containers, and the alternative to copying thirty lines is a shared
+package that couples their deploys.
 
-What is genuinely new is the payload shape. /slack/events posts JSON; interactive
-components post form-encoded, with the whole interaction JSON-encoded under a single
-`payload` key. The HMAC is still computed over the raw bytes either way.
+What is new is the payload shape. /slack/events posts JSON; interactive components post
+form-encoded with the interaction JSON-encoded under a `payload` key. The HMAC is over
+the raw bytes either way.
 """
 
 import hashlib
@@ -31,8 +30,8 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
 SLACK_ENABLED = os.getenv("SLACK_ENABLED", "true").lower() == "true"
 POST_TIMEOUT = int(os.getenv("SLACK_TIMEOUT", "10"))
 
-# Slack rejects its own requests older than this and so do we: the HMAC never expires
-# on its own, so without an age check a captured request stays replayable forever.
+# Slack rejects its own requests older than this and so do we: the HMAC never expires,
+# so without an age check a captured request stays replayable forever.
 MAX_SIGNATURE_AGE = 300
 
 
@@ -49,9 +48,9 @@ class Interaction:
 
 
 def slack_active() -> bool:
-    """The flag and both secrets, same rule as the copilot: the offline test suite and
-    a local `python app.py` have no credentials, so missing secrets disable the post
-    rather than failing startup."""
+    """The flag and both secrets. The offline suite and a local `python app.py` have no
+    credentials, so missing secrets disable the post rather than failing startup.
+    """
     return bool(SLACK_ENABLED and SLACK_SIGNING_SECRET and SLACK_BOT_TOKEN)
 
 
@@ -64,12 +63,9 @@ def verify_signature(
 ) -> bool:
     """Slack's v0 request signature, over the raw bytes off the wire.
 
-    Parsing the form and re-encoding it changes escaping and key order, and the HMAC
-    then never matches -- which is why app.py reads request.body() before it reads
-    anything else.
-
-    The secret is read from the module global when not passed, rather than defaulting
-    to it: a default argument binds once at import and could not be patched in tests.
+    Parsing the form and re-encoding it changes escaping and key order, so app.py reads
+    request.body() before anything else. The secret is read from the module global rather
+    than defaulted, because a default argument binds at import and cannot be patched.
     """
     secret = SLACK_SIGNING_SECRET if secret is None else secret
     if not (timestamp and signature and secret):
@@ -87,13 +83,7 @@ def verify_signature(
 
 
 def parse_interaction(body: bytes) -> Interaction | None:
-    """`payload=<url-encoded JSON>` -- the one thing that differs from Day 13.
-
-    None means "not an approval button", which covers Slack's other interactive
-    payloads as well as anything malformed. The caller answers 200 either way: a
-    non-200 makes Slack retry, and retrying a button click is the last thing wanted on
-    a path that ends in a cluster write.
-    """
+    """`payload=<url-encoded JSON>`, the one thing that differs from the events route."""
     try:
         fields = urllib.parse.parse_qs(body.decode("utf-8"))
         payload = json.loads(fields["payload"][0])
@@ -116,13 +106,7 @@ def parse_interaction(body: bytes) -> Interaction | None:
 
 
 def blocks_for(proposal) -> list[dict]:
-    """The action verbatim, then the buttons.
-
-    The arguments are rendered as JSON rather than prose because the human is being
-    asked to approve exactly what will be executed, and a summary of it is not that.
-    The confirm dialog on Approve is there because the button sits in a channel where
-    a mis-tap is one pixel away from deleting a pod.
-    """
+    """The action verbatim, then the buttons."""
     confidence = (
         "unknown" if proposal.confidence is None else f"{proposal.confidence:.2f}"
     )
@@ -211,13 +195,7 @@ def post_blocks(
 
 
 def replace_message(response_url: str, text: str) -> None:
-    """Replaces the whole message, buttons included, once a decision is recorded.
-
-    Best-effort by design, and the one place in this module that swallows: by the time
-    this runs the decision is made, audited and executed, so raising would turn a
-    cosmetic failure into a 500 on a request whose real work succeeded. Stale buttons
-    are the lesser problem, and decide() refuses them anyway.
-    """
+    """Replaces the whole message, buttons included, once a decision is recorded."""
     if not response_url:
         return
     try:

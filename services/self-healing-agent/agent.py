@@ -1,12 +1,10 @@
-"""The diagnosis loop -- Day 17. Runs read-only today; Day 18 widens `allowed` to ALL
-and puts the approval gate between a proposed write and its execution, not inside this
-loop. This module is not where safety lives regardless -- the allowlist check below is.
+"""The diagnosis loop.
 
-Termination is a tool call, `submit_diagnosis`, intercepted by name before generic
-dispatch. A model narrating in prose instead of calling it is not an answer this loop
-can use, so the transcript grows by one turn and the loop tries again; MAX_ITERATIONS is
-what stops that from running forever, without ever inventing a confidence number to fill
-the gap. See docs/superpowers/specs/2026-08-11-week3-agent-design.md, decisions 3 and 4.
+Safety does not live here -- the allowlist check below is what holds. Termination is a
+tool call, `submit_diagnosis`, intercepted by name before generic dispatch: a model
+narrating in prose instead is not an answer this loop can use, so the transcript grows
+by a turn and it tries again. MAX_ITERATIONS stops that running forever without ever
+inventing a confidence number to fill the gap.
 """
 
 import logging
@@ -23,12 +21,9 @@ from tools import READ_ONLY, REGISTRY, as_model_tools
 
 logger = logging.getLogger(__name__)
 
-# Was 6 -- four read-only tools plus submit_diagnosis, one pass with a single turn spare.
-# Raised on the evidence that comment asked for: a live HighRequestLatency diagnosis on
-# 2026-08-14 spent all six turns on tool calls and never reached submit_diagnosis, so the
-# loop returned incomplete. One spare turn is not slack, it is a rounding error -- a single
-# retry of a failing tool consumes it, and two of the four read-only tools fail whenever no
-# cluster is reachable. 10 leaves room to gather, retry once, and still conclude.
+# Raised from 6: a live diagnosis spent all six turns on tool calls and never reached
+# submit_diagnosis. One spare turn is a rounding error -- a single retry consumes it,
+# and two of the four read-only tools fail whenever no cluster is reachable.
 MAX_ITERATIONS = int(os.getenv("SHA_MAX_ITERATIONS", "10"))
 
 SYSTEM_PROMPT = """You are an on-call SRE agent. You will be shown one alert.
@@ -52,9 +47,10 @@ human at 3am that will not fix their problem."""
 
 @dataclass(frozen=True)
 class Diagnosis:
-    """What the loop produced -- or didn't. `incomplete` is the field a caller must
-    check first: a confidence of 0.0 and a confidence of None both mean "don't trust
-    this," but only one of them means the model actually finished."""
+    """What the loop produced -- or did not. `incomplete` is the field a caller must check
+    first: confidence 0.0 and confidence None both mean "do not trust this", but only one
+    means the model finished.
+    """
 
     summary: str | None
     evidence: tuple[str, ...]
@@ -64,15 +60,9 @@ class Diagnosis:
 
 
 def _dispatch(name: str, args: dict) -> dict:
-    """Runs one tool, uniformly -- `fn(apis, **args)`, whatever the tool actually needs
-    `apis` for. Returns `{"output": ...}` or `{"error": ...}`, the convention
-    provider.tool_result() expects: whatever a tool raises becomes a message the model
-    can read and route around, not an exception that ends the diagnosis.
-
-    `apis` is only fetched for real when `needs` says the tool touches the cluster --
-    get_recent_alerts and search_runbooks ignore the argument entirely, and loading a
-    kubeconfig just to hand them something they throw away would fail every diagnosis
-    on a box with no cluster reachable, for tools that never needed one.
+    """Runs one tool, uniformly. Returns `{"output": ...}` or `{"error": ...}`, so whatever a
+    tool raises becomes a message the model can route around rather than an exception that
+    ends the diagnosis.
     """
     spec = REGISTRY[name]
     try:
@@ -88,16 +78,13 @@ def diagnose(
     provider: BaseAgentProvider,
     allowed: tuple[str, ...] = READ_ONLY,
 ) -> Diagnosis:
-    """The loop, counted and timed. Day 20 split this from _loop so that every way a
-    diagnosis can end is recorded in one place.
+    """The loop, counted and timed, so every way a diagnosis can end is recorded in one place.
 
-    The four outcomes are not interchangeable. `incomplete` is a returned Diagnosis, so a
-    single counter would call it a success and hide the only failure this loop has that
-    raises nothing. `blocked` is the agent deciding not to act and `failed` is something
-    else breaking -- one is a working guardrail, the other is a page.
+    The four outcomes are not interchangeable: `incomplete` is a returned Diagnosis, so one
+    counter would call it a success and hide the only failure here that raises nothing.
+    `blocked` is a working guardrail, `failed` is a page.
 
-    Timing is in `finally` because the failures cost real seconds too, and a histogram
-    that observes only the happy path makes an outage look like a quiet afternoon.
+    Timing is in `finally` because failures cost real seconds too.
     """
     started = time.monotonic()
     try:
@@ -126,17 +113,13 @@ def _loop(
     tools = as_model_tools(allowed)
 
     for iteration in range(1, MAX_ITERATIONS + 1):
-        # Here rather than inside provider.chat(): one call site covers every backend, and
-        # no provider implementation has to remember to ask. MAX_ITERATIONS is the cap
-        # within one diagnosis; this is the cap across all of them, which is the one that
-        # matters once Alertmanager is calling /diagnose with nobody watching.
+        # Here rather than in provider.chat(), so no backend has to remember to ask.
+        # MAX_ITERATIONS caps one diagnosis; this caps all of them.
         guardrails.check_llm_call()
         turn = provider.chat(SYSTEM_PROMPT, contents, tools, allowed=allowed)
         contents.append(turn.raw)
-        # Names, not just a count. When this loop exhausts MAX_ITERATIONS the only useful
-        # question is *what it spent the turns on* -- retrying a dead tool, or asking the
-        # runbooks four different questions -- and a count cannot answer either. Learned
-        # from an incomplete diagnosis whose logs said "1 tool call" six times over.
+        # Names, not a count: when this exhausts MAX_ITERATIONS the only useful question is what
+        # it spent the turns on, and a count cannot answer it.
         logger.info(
             f"iteration {iteration}/{MAX_ITERATIONS}: "
             f"{[c.name for c in turn.tool_calls] or 'no tool calls'}"

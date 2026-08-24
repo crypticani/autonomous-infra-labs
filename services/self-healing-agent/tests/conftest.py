@@ -8,8 +8,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 # Before provider is imported: genai.Client() reads the environment at construction and
-# raises without a key. No test reaches the real backend, but GeminiProvider() is
-# instantiated to test its translation logic, and that runs the constructor.
+# raises without a key. No test reaches the backend, but GeminiProvider() is instantiated
+# to test its translation logic, and that runs the constructor.
 os.environ.setdefault("GEMINI_API_KEY", "test-key-never-sent")
 
 import alerts  # noqa: E402
@@ -20,25 +20,18 @@ from provider import AgentTurn, ToolCall  # noqa: E402
 
 
 def metric(name: str, **labels) -> float:
-    """One counter's current value, read the way Prometheus reads it.
-
-    Through the registry rather than `counter._value`, because the private attribute
-    would still answer for a metric whose labels are wrong -- and a mislabelled counter
-    is exactly the failure that survives review and then shows up as an empty graph.
-
-    Counters accumulate for the life of the process, so every caller measures a delta
-    across the thing under test rather than an absolute.
+    """One counter's current value, read the way Prometheus reads it -- through the registry,
+    because `counter._value` would still answer for a metric whose labels are wrong.
+    Counters accumulate for the process, so every caller measures a delta.
     """
     return REGISTRY.get_sample_value(name, labels) or 0.0
 
 
 @pytest.fixture
 def audit_log(tmp_path, monkeypatch):
-    """Reads back what actually landed on disk, rather than what a mock was told.
-
-    audit.record writes and fsyncs, so by the time a call returns the line is readable
-    here -- which is the property the fail-before-acting test depends on. Shared with
-    test_guardrails.py, whose rate limit and breaker read the same file as evidence.
+    """Reads back what landed on disk rather than what a mock was told. audit.record fsyncs, so
+    the line is readable by the time a call returns -- the property the fail-before-acting
+    test depends on.
     """
     path = tmp_path / "audit.jsonl"
     monkeypatch.setattr(audit, "AUDIT_PATH", str(path))
@@ -53,9 +46,8 @@ def audit_log(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def fresh_llm_budget():
-    """guardrails._llm_calls is module state and diagnose() appends to it every turn.
-    Without this, the thirty-first turn in the whole suite fails a guardrail instead of
-    the loop under test -- test order deciding test outcome, in a file nobody suspects.
+    """guardrails._llm_calls is module state and diagnose() appends every turn. Without this,
+    the thirty-first turn in the suite fails a guardrail instead of the loop under test.
     """
     guardrails._llm_calls.clear()
     yield
@@ -64,8 +56,8 @@ def fresh_llm_budget():
 
 @pytest.fixture(autouse=True)
 def fresh_alert_dedup():
-    """Same hazard as fresh_llm_budget, one module over: alerts._seen is process state,
-    so the second test to send the same fingerprint would be deduplicated by the first.
+    """Same hazard one module over: alerts._seen is process state, so the second test to send
+    a fingerprint would be deduplicated by the first.
     """
     alerts._seen.clear()
     yield
@@ -73,16 +65,7 @@ def fresh_alert_dedup():
 
 
 class FakeAgentProvider:
-    """A scripted model: returns the turns it was handed, in order, and counts its calls.
-
-    This is what lets every later day specify a model's *behaviour* -- "asks for logs, then
-    submits a diagnosis" -- with no network and no key. knowledge-copilot's SpyLLM does the
-    same job for a single generate() call; an agent needs a sequence, and needs to record
-    what it was asked so a test can assert the loop narrowed the allowlist.
-
-    It is also the second implementation of BaseAgentProvider, which is the only real proof
-    that the interface is not Gemini's shape wearing an abstract base class.
-    """
+    """A scripted model: returns the turns it was handed, in order, and counts its calls."""
 
     name = "fake"
     model_name = "fake-model"
@@ -104,9 +87,8 @@ class FakeAgentProvider:
         self.seen_allowed.append(list(allowed) if allowed else None)
         self.seen_contents.append(list(contents))
         if not self.turns:
-            # Louder than returning a default turn: a loop that asked for more turns than
-            # the test scripted is a loop that did not terminate when it should have, and
-            # that is the failure worth seeing by name.
+            # Louder than a default turn: a loop that asked for more turns than the test
+            # scripted did not terminate when it should have.
             raise AssertionError(
                 f"FakeAgentProvider ran out of scripted turns after {self.calls} calls"
             )
@@ -114,11 +96,8 @@ class FakeAgentProvider:
 
 
 def turn(text: str = "", calls: tuple = ()) -> AgentTurn:
-    """An AgentTurn without the ceremony.
-
-    `raw` is a marker dict rather than anything meaningful: the loop's contract is that it
-    only ever echoes raw back, never reads inside it, and a marker is how a test can prove
-    that by being unreadable in any useful way.
+    """An AgentTurn without the ceremony. `raw` is a marker dict: the loop only ever echoes it
+    back and never reads inside, and being unreadable is how a test proves that.
     """
     return AgentTurn(
         text=text,

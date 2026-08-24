@@ -20,12 +20,7 @@ TOOLS = [
 
 
 class RecordingModels:
-    """Stands in for client.models, and keeps the config it was handed.
-
-    `calls` and `fail_first` exist for the retry: a stub that always raises can prove
-    exhaustion but never recovery, and recovery is the behaviour day 20 added. With
-    fail_first=2 the third call succeeds, which is the shape of a real 503.
-    """
+    """Stands in for client.models, and keeps the config it was handed."""
 
     def __init__(self, response=None, error=None, fail_first=None):
         self.response = response
@@ -58,9 +53,8 @@ def a_call(name="get_pod_logs", **args):
 
 
 class FakeClock:
-    """A monotonic clock only time.sleep advances, so a rate limiter's arithmetic is
-    checkable without a test enduring the real wait. `advance` moves time forward with
-    nothing sleeping for it -- e.g. calls far enough apart that pacing shouldn't fire.
+    """A monotonic clock only time.sleep advances, so a rate limiter's arithmetic is checkable
+    without enduring the real wait. `advance` moves time forward with nothing sleeping.
     """
 
     def __init__(self, sleep_log):
@@ -84,8 +78,8 @@ def gemini(monkeypatch):
         provider = GeminiProvider()
         models = RecordingModels(response=response, error=error, fail_first=fail_first)
         monkeypatch.setattr(provider, "client", type("Shim", (), {"models": models})())
-        # Recorded, not endured. Every retry test would otherwise pay the real backoff,
-        # and the delays themselves are worth an assertion.
+        # Recorded, not endured: every retry test would otherwise pay the real backoff, and
+        # the delays are worth an assertion.
         clock = FakeClock(models.slept)
         models.clock = clock
         monkeypatch.setattr(provider_module.time, "sleep", clock.sleep)
@@ -96,9 +90,9 @@ def gemini(monkeypatch):
 
 
 def test_automatic_function_calling_is_always_disabled(gemini):
-    # The single most important assertion in this service. With AFC enabled -- the SDK's
-    # default -- google-genai executes tool functions itself, which would call restart_pod
-    # with no human in the path and make day 18's approval gate decorative.
+    # The single most important assertion here. With AFC enabled -- the SDK default --
+    # google-genai executes tool functions itself, calling restart_pod with no human in
+    # the path and making the approval gate decorative.
     provider, models = gemini(a_response(types.Part(text="hello")))
 
     provider.chat("sys", [provider.user("why is it broken")], TOOLS)
@@ -107,8 +101,7 @@ def test_automatic_function_calling_is_always_disabled(gemini):
 
 
 def test_tools_are_declared_as_schemas_never_as_callables(gemini):
-    # The second defence: even if the flag above regressed, there is no callable for the
-    # SDK to invoke.
+    # The second defence: no callable for the SDK to invoke even if the flag regressed.
     provider, models = gemini(a_response(types.Part(text="hello")))
 
     provider.chat("sys", [], TOOLS)
@@ -116,8 +109,7 @@ def test_tools_are_declared_as_schemas_never_as_callables(gemini):
     declaration = models.last_config["tools"][0].function_declarations[0]
     assert declaration.name == "get_pod_logs"
     assert declaration.parameters_json_schema == TOOLS[0]["schema"]
-    # parameters and parameters_json_schema are mutually exclusive in this API; setting
-    # both is a 400 from the server, not a local error.
+    # Mutually exclusive in this API: setting both is a 400 from the server.
     assert declaration.parameters is None
 
 
@@ -132,7 +124,7 @@ def test_function_calls_become_tool_calls(gemini):
 
 
 def test_raw_is_the_models_own_content_object(gemini):
-    # Not a rebuilt Content. Gemini rejects a reconstructed turn, so the loop has to echo
+    # Not a rebuilt Content: Gemini rejects a reconstructed turn, so the loop echoes
     # this object back byte for byte.
     response = a_response(a_call(namespace="sandbox", pod="api-7f9"))
     provider, _ = gemini(response)
@@ -161,7 +153,7 @@ def test_allowed_constrains_the_model_in_validated_mode(gemini):
     provider.chat("sys", [], TOOLS, allowed=["get_pod_logs"])
 
     config = models.last_config["tool_config"].function_calling_config
-    # VALIDATED, not ANY: ANY would force a call every turn and leave the model no way to
+    # VALIDATED, not ANY: ANY forces a call every turn and leaves the model no way to
     # say it is stuck.
     assert config.mode == types.FunctionCallingConfigMode.VALIDATED
     assert config.allowed_function_names == ["get_pod_logs"]
@@ -176,8 +168,8 @@ def test_no_allowlist_means_no_tool_config(gemini):
 
 
 def test_empty_candidates_is_an_upstream_error(gemini):
-    # A safety filter returns a response with no candidates at all. Reading
-    # candidates[0] would be an IndexError surfacing as a 500.
+    # A safety filter returns no candidates at all; candidates[0] would be an
+    # IndexError surfacing as a 500.
     provider, _ = gemini(types.GenerateContentResponse(candidates=[]))
 
     with pytest.raises(AgentProviderError) as caught:
@@ -199,9 +191,8 @@ def test_api_error_becomes_an_agent_provider_error(gemini):
 
 
 def test_a_transient_error_is_retried_until_it_succeeds(gemini):
-    # The whole point of day 20's retry. Before it, this 503 discarded a diagnosis that
-    # was six model calls deep -- survivable while a human drives, silent data loss once
-    # Alertmanager does.
+    # Before the retry, this 503 discarded a diagnosis six model calls deep -- survivable
+    # while a human drives, silent data loss once Alertmanager does.
     provider, models = gemini(
         a_response(types.Part(text="the pod is OOMKilled")),
         error=genai_errors.APIError(503, {"message": "model overloaded"}),
@@ -215,8 +206,8 @@ def test_a_transient_error_is_retried_until_it_succeeds(gemini):
 
 
 def test_a_permanent_error_is_not_retried(gemini):
-    # A 400 is a request this code got wrong. Retrying it sends the same broken request
-    # three times and turns one fast failure into three slow ones.
+    # A 400 is a request this code got wrong; retrying turns one fast failure into three
+    # slow ones.
     provider, models = gemini(error=genai_errors.APIError(400, {"message": "bad tool"}))
 
     with pytest.raises(AgentProviderError):
@@ -227,7 +218,7 @@ def test_a_permanent_error_is_not_retried(gemini):
 
 
 def test_retries_are_bounded_and_still_raise(gemini):
-    # An outage that outlasts the budget must still surface. A retry that never gives up
+    # An outage that outlasts the budget must still surface: a retry that never gives up
     # is an alert nobody gets.
     provider, models = gemini(error=genai_errors.APIError(503, {"message": "down"}))
 
@@ -240,8 +231,8 @@ def test_retries_are_bounded_and_still_raise(gemini):
 
 
 def test_each_retry_is_counted_under_the_status_that_caused_it(gemini):
-    # A retry counter that never moves is a retry nobody has evidence works, and one
-    # that moves constantly is a provider to reconsider. Neither is visible from logs.
+    # A counter that never moves is a retry nobody has evidence works; one that moves
+    # constantly is a provider to reconsider. Neither is visible from logs.
     from conftest import metric
 
     before = metric("sha_model_retries_total", status="503")
@@ -270,10 +261,8 @@ def test_backoff_grows_between_attempts(gemini):
 
 
 def test_no_pacing_within_the_free_burst(gemini):
-    # The free tier's own per-minute cap, not the daily one -- discovered from a live 429
-    # naming "GenerateRequestsPerMinutePerProjectPerModel-FreeTier". Under the limit,
-    # pacing must stay invisible: a diagnosis that only ever needs a few turns should
-    # never pay a wait it doesn't need.
+    # The per-minute cap, not the daily one. Under the limit, pacing must stay invisible:
+    # a short diagnosis should never pay a wait it does not need.
     provider, models = gemini(a_response(types.Part(text="ok")))
 
     for _ in range(provider_module.RATE_LIMIT):
@@ -283,8 +272,8 @@ def test_no_pacing_within_the_free_burst(gemini):
 
 
 def test_the_call_past_the_burst_is_paced(gemini):
-    # The whole point: the 6th call in under a minute is what actually tripped the real
-    # 429 on 2026-08-16. This waits instead of sending it and being refused.
+    # The 6th call in under a minute is what tripped the real 429. This waits instead of
+    # sending it and being refused.
     provider, models = gemini(a_response(types.Part(text="ok")))
 
     for _ in range(provider_module.RATE_LIMIT):
@@ -295,8 +284,8 @@ def test_the_call_past_the_burst_is_paced(gemini):
 
 
 def test_calls_spaced_past_the_window_need_no_pacing(gemini):
-    # Suppression with an expiry, same shape as alerts.py's dedup: a burst from a much
-    # earlier diagnosis must not still be counted against a new one.
+    # Suppression with an expiry: a burst from a much earlier diagnosis must not still
+    # be counted against a new one.
     provider, models = gemini(a_response(types.Part(text="ok")))
 
     for _ in range(provider_module.RATE_LIMIT):
@@ -310,9 +299,7 @@ def test_calls_spaced_past_the_window_need_no_pacing(gemini):
 
 def test_pacing_counts_every_attempt_not_just_completed_calls(gemini, monkeypatch):
     # A retried attempt is still a real request against the same quota. Counting only
-    # calls that made it back to agent.py would undercount exactly the case that matters
-    # -- a diagnosis already retrying through transient errors -- and let it exceed the
-    # limit pacing exists to respect.
+    # calls that reached agent.py would undercount exactly the case that matters.
     monkeypatch.setattr(provider_module, "RATE_LIMIT", 2)
     provider, models = gemini(
         a_response(types.Part(text="ok")),

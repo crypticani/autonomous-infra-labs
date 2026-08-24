@@ -1,24 +1,4 @@
-"""What a grounded answer costs, and what k costs -- Day 27.
-
-Four calls, one per k, rather than four calls at the same k. A mean of four identical
-questions would be one number with an error bar; a sweep across k is a scaling curve,
-and for this service the curve is the answer. Prompt eval dominates on CPU -- 195s was
-measured in week 2 for one grounded answer over four ~512-char chunks -- and prompt
-length is set almost entirely by how many chunks got retrieved. So cost here is a
-function of k, not of the question, and `k` is a per-request parameter that any caller
-can raise.
-
-Same lesson as security-triage's batch-size sweep, from the other direction: there the
-fixed system prompt is amortised across more findings as the batch grows, so bigger is
-cheaper per unit. Here every extra chunk is pure additional prompt with nothing amortised
-against it, so bigger is straightforwardly more expensive, and the question is what the
-retrieval quality is worth.
-
-    python bench.py                        # k = 1,2,4,8 against one question
-    python bench.py --ks 4 --question "..."
-
-Reads ST-style totals off the provider by delta; see llm.py's BaseLLMProvider.
-"""
+"""What a grounded answer costs, and what k costs -- Day 27."""
 
 import argparse
 import time

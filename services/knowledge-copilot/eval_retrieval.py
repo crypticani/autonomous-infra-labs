@@ -1,7 +1,5 @@
-"""Day 11: retrieval quality sweep.
-
-Retrieval only -- this never calls the generator, so the whole grid runs in
-seconds rather than 195s per answer.
+"""Retrieval quality sweep. Never calls the generator, so the whole grid runs in seconds
+rather than 195s per answer.
 """
 
 import argparse
@@ -30,10 +28,9 @@ console = Console()
 
 
 class CachingProvider:
-    """The sweep asks the same 12 questions of every configuration. Embedding
-    each once turns ~72 network calls into 12, and it takes the embedding hop
-    out of the measured latency -- which is what we want, since that hop is
-    constant across configurations and would mask the ranking differences.
+    """The sweep asks the same 12 questions of every configuration. Embedding each once turns
+    ~72 network calls into 12, and takes a constant hop out of the measured latency where it
+    would otherwise mask the ranking differences.
     """
 
     def __init__(self, inner):
@@ -178,8 +175,8 @@ def summary_table(results: list[tuple[str, list[Outcome]]]) -> Table:
 
 
 def by_kind_table(results: list[tuple[str, list[Outcome]]]) -> Table:
-    """soft_hit@1 split by query kind -- where the prediction actually lives.
-    Hybrid is supposed to win on exact_token and give up nothing on paraphrase.
+    """soft_hit@1 split by query kind -- where the prediction actually lives. Hybrid is
+    supposed to win on exact_token and give up nothing on paraphrase.
     """
     kinds = sorted({o.kind for _, outcomes in results for o in outcomes})
     table = Table(title="soft hit@1 by query kind")
@@ -197,14 +194,7 @@ def by_kind_table(results: list[tuple[str, list[Outcome]]]) -> Table:
 
 
 def best_similarity(question: str, provider, collection) -> float:
-    """The highest cosine any chunk scored for this question.
-
-    floor=0.0 keeps every fused candidate, and k=2*CANDIDATE_POOL is larger than
-    hybrid's two rankings can produce, so kept[:k] truncates nothing. The max over what
-    comes back is therefore exactly the `best` that retrieve() computes internally and
-    logs but does not return. Taking hits[0].score instead would be wrong: that is the
-    first *fused* hit, and RRF order is not cosine order.
-    """
+    """The highest cosine any chunk scored for this question."""
     hits = retrieve(question, provider, collection, k=2 * CANDIDATE_POOL, floor=0.0)
     return max((hit.score for hit in hits), default=0.0)
 
@@ -212,10 +202,8 @@ def best_similarity(question: str, provider, collection) -> float:
 def sweep_counts(
     answerable: list[float], absent: list[float], floor: float
 ) -> tuple[int, int]:
-    """(false rejections, false acceptances) at one candidate floor.
-
-    Pure arithmetic over numbers gathered once, which is what makes sweeping sixteen
-    floors cost one embedding pass instead of sixteen.
+    """(false rejections, false acceptances) at one candidate floor. Pure arithmetic over
+    numbers gathered once, which is what makes sweeping sixteen floors cost one pass.
     """
     false_rejects = sum(1 for best in answerable if best < floor)
     false_accepts = sum(1 for best in absent if best >= floor)
@@ -273,16 +261,14 @@ def main() -> int | None:
     inner, collection = open_collection()
     provider = CachingProvider(inner)
 
-    # Warm every question before timing anything. Otherwise whichever config runs
-    # first pays all 12 embedding cache misses and looks 20x slower than the rest,
-    # which is an artefact of sweep order rather than a property of the config.
+    # Warm every question before timing: otherwise whichever config runs first pays all 12
+    # cache misses and looks 20x slower, which is sweep order rather than a property.
     for case in cases:
         provider.embed_query(case["question"])
 
     if args.floor_sweep:
-        # One retrieval pass per case, then sixteen floors swept over the numbers it
-        # produced. Re-retrieving per floor would be sixteen times the work for
-        # identical results, since the floor only filters what retrieval already scored.
+        # One retrieval pass per case, then sixteen floors swept over the numbers it produced --
+        # the floor only filters what retrieval already scored.
         answerable, absent = [], []
         for case in cases:
             best = best_similarity(case["question"], provider, collection)
@@ -316,24 +302,14 @@ def main() -> int | None:
 
 
 def report_shipped_config(results, floor: int | None) -> int:
-    """Day 28: one machine-readable line, so the repo-root runner can put this service
-    in the same table as the other three.
-
-    This is a **sweep**, not a pass/fail harness -- it exists to compare configurations,
-    and most rows in the table above are controls that are supposed to score worse. So
-    the reported number is the row for the configuration actually shipped
-    (RETRIEVAL_MODE at DEFAULT_LAM), and the metric is soft hit@1: the top result being
-    the primary source or an acceptable one, which is the claim /ask depends on.
-
-    Reports by default and only gates when `--floor` is given, because this repo has no
-    measured baseline to set a bar from yet and inventing one would make the gate
-    decorative. Once a run is on record, put its number behind --floor in eval_all.py.
+    """One machine-readable line, so the repo-root runner can put this service in the same
+    table as the other three.
     """
     shipped = f"{RETRIEVAL_MODE} lam={DEFAULT_LAM}"
     match = next((r for r in results if r[0] == shipped), None)
     if match is None:
-        # Reachable whenever --modes or --lam excluded the shipped configuration. Say so
-        # rather than reporting the first row, which would silently be a control.
+        # Reachable when --modes or --lam excluded the shipped config. Say so rather than
+        # reporting the first row, which would silently be a control.
         console.print(
             f"[yellow]{shipped!r} was not in this sweep -- no EVAL_RESULT emitted.[/]"
         )

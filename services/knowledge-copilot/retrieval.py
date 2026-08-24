@@ -15,35 +15,28 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# Set by eval_retrieval.py --floor-sweep on 2026-08-08 over 11 answerable and 10 absent
-# cases: 0.64 is the unique minimum at 1 total error (0 false rejects, 1 false accept),
-# against 2 at the old 0.65. The backlog wanted ~0.60 on the strength of one real answer
-# scoring 0.659 -- but 0.659 clears 0.64 comfortably, and 0.60 would have admitted 7 of
-# the 10 unanswerable questions instead of 1. Measuring the negatives is what caught it.
+# Set by `eval_retrieval.py --floor-sweep` over 11 answerable and 10 absent cases: 0.64 is
+# the unique minimum at 1 total error, against 2 at 0.65. 0.60 -- which one real answer
+# scoring 0.659 seemed to argue for -- would admit 7 of the 10 unanswerable questions.
 SIMILARITY_FLOOR = float(os.getenv("SIMILARITY_FLOOR", "0.64"))
 DEFAULT_K = 4
 CANDIDATE_POOL = 15
 MODES = ("dense", "lexical", "hybrid")
 
-# Day 11's eval earned hybrid: hit@1 8/12 -> 9/12, MRR 0.79 -> 0.83, for ~2ms.
-# lam stays 1.0 -- MMR is off, because the eval showed it cannot act on this
-# embedding space (see eval_retrieval.py and the Readme findings).
+# The eval earned hybrid: hit@1 8/12 -> 9/12, MRR 0.79 -> 0.83, for ~2ms. lam stays 1.0 --
+# MMR is off, because it cannot act on this embedding space.
 RETRIEVAL_MODE = os.getenv("RETRIEVAL_MODE", "hybrid").lower()
 DEFAULT_LAM = 1.0
 
 if RETRIEVAL_MODE not in MODES:
-    # Checked at import, not per request: a typo in .env would otherwise 500 on
-    # every single call with nothing in the response explaining why. This way
-    # uvicorn refuses to start and says so.
+    # Checked at import: a typo in .env would otherwise 500 on every call with nothing
+    # explaining why. This way uvicorn refuses to start and says so.
     raise ValueError(f"RETRIEVAL_MODE={RETRIEVAL_MODE!r} is not one of {MODES}")
 
 
 class EmptyIndexError(RuntimeError):
-    """The index is unusable: no rows at all, or rows without embeddings.
-
-    Both mean the same thing to a caller — re-run ingest.py — and app.py maps
-    this to a 503. A bare RuntimeError here would reach the client as a 500 with
-    no explanation instead.
+    """The index is unusable: no rows at all, or rows without embeddings. Both mean re-run
+    ingest.py, and app.py maps this to a 503 rather than an unexplained 500.
     """
 
 
@@ -60,9 +53,9 @@ class Hit:
 class LexicalIndex:
     """The whole collection in memory: 68 chunks x 768 dims, roughly 400KB.
 
-    Three consumers at once. BM25 needs corpus-wide document frequencies and
-    average length, MMR needs candidate vectors to measure redundancy between
-    them, and the floor needs an exact cosine for a chunk only BM25 found.
+    Three consumers. BM25 needs corpus-wide document frequencies and average length, MMR
+    needs candidate vectors to measure redundancy, and the floor needs an exact cosine for a
+    chunk only BM25 found.
     """
 
     ids: list[str]
@@ -83,8 +76,8 @@ def load_index(collection) -> LexicalIndex:
         stored = collection.get(include=["documents", "metadatas", "embeddings"])
         embeddings = stored["embeddings"]
         if embeddings is None or len(embeddings) != len(stored["ids"]):
-            # A broken index, not a bad query. Scoring 0 here would blame
-            # retrieval quality for an infrastructure fault.
+            # A broken index, not a bad query. Scoring 0 would blame retrieval quality
+            # for an infrastructure fault.
             raise EmptyIndexError(
                 f"collection {collection.name!r} returned no embeddings: run ingest.py"
             )
@@ -126,9 +119,8 @@ def _dense(collection, query_vector, pool, where) -> dict[str, tuple]:
 
 def _lexical(index: LexicalIndex, question: str, pool: int, where) -> list[str]:
     scores = bm25_scores(question, index.tokens)
-    # score > 0 means the chunk shares at least one query term. Without this the
-    # remaining ~60 chunks would still get rank positions, and RRF would hand
-    # them credit for containing nothing.
+    # score > 0 means the chunk shares a query term. Without it the remaining ~60
+    # chunks get rank positions and RRF credits them for containing nothing.
     ranked = sorted(
         (
             i
@@ -164,12 +156,11 @@ def retrieve(
     except requests.exceptions.Timeout as e:
         raise EmbeddingError("embedding the question took too long", 504) from e
     except Exception as e:
-        # Every provider raises its own SDK error here; the caller only needs to
-        # know the embedding backend failed. `from e` keeps the real traceback.
+        # Every provider raises its own SDK error; the caller only needs to know the
+        # embedding backend failed. `from e` keeps the real traceback.
         raise EmbeddingError(f"the embedding backend failed: {e}", 503) from e
 
-    # Loaded only when something needs it, so dense + lam=1.0 stays exactly the
-    # Day 10 path: one Chroma query and nothing else.
+    # Loaded only when needed, so dense + lam=1.0 stays one Chroma query and nothing else.
     index = load_index(collection) if mode != "dense" or lam < 1.0 else None
 
     rankings, dense = [], {}
@@ -179,8 +170,8 @@ def retrieve(
     if mode in ("lexical", "hybrid"):
         rankings.append(_lexical(index, question, pool, where))
 
-    # RRF over a single ranking is order-preserving, so dense-only and
-    # lexical-only come through untouched and fusion needs no special case.
+    # RRF over a single ranking is order-preserving, so dense-only and lexical-only
+    # come through untouched and fusion needs no special case.
     fused = rrf(*rankings)
     position = {doc_id: i for i, doc_id in enumerate(index.ids)} if index else {}
 
@@ -189,28 +180,24 @@ def retrieve(
         if doc_id in dense:
             text, meta, score = dense[doc_id]
         else:
-            # BM25 found this and dense did not -- the `137` rescue. Score it
-            # from its stored embedding so a keyword match cannot smuggle a
-            # chunk past the floor.
+            # BM25 found this and dense did not -- the `137` rescue. Scored from its
+            # stored embedding, so a keyword match cannot smuggle a chunk past the floor.
             i = position[doc_id]
             text, meta = index.texts[i], index.metadatas[i]
             score = sumprod(query_vector, index.embeddings[i])
-        # Cosine, never the fused score. The floor is Day 10's refusal guard and
-        # has to keep meaning similarity to the question; RRF values sit around
-        # 0.016-0.033 and are scale-free by design.
+        # Cosine, never the fused score: the floor has to keep meaning similarity to the
+        # question, and RRF values sit around 0.016-0.033 and are scale-free by design.
         best = max(best, score)
         if score >= floor:
             kept.append((doc_id, text, meta, score))
 
-    # Observed here because this is the only scope that has `best`. Every production
-    # question therefore becomes a data point for the same curve --floor-sweep drew
-    # offline, which is the part of that measurement that outlives the day it was made.
+    # Here because this is the only scope with `best`, so every production question
+    # becomes a data point for the curve --floor-sweep drew offline.
     TOP_SIMILARITY.observe(best)
 
     if not kept:
-        # The margin matters: 0.64 is a floor that is slightly too high, 0.30 is
-        # a question the corpus genuinely cannot answer. Same empty list, very
-        # different bug.
+        # The margin matters: 0.64 is a floor slightly too high, 0.30 is a question the
+        # corpus genuinely cannot answer. Same empty list, very different bug.
         logger.warning(
             f"nothing cleared floor {floor} for {question!r}; best was {best:.3f}"
         )

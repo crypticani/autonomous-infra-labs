@@ -1,20 +1,16 @@
-"""Day 19. Five refusals, one module.
+"""Five refusals, one module.
 
-RBAC is the layer that cannot be argued with: k8s/rbac.yaml grants four verbs in one
-namespace, and no bug in this file can widen that. These guards are the layer above it --
-they stop actions the Role would happily allow but no on-call would want at 3am, and they
-name which rule refused, in a sentence a human reads in Slack.
+RBAC is the layer that cannot be argued with. These guards sit above it: they stop actions
+the Role would allow but no on-call would want at 3am, and they name which rule refused in
+a sentence a human reads in Slack.
 
-Every guard runs twice: once in propose(), before a button exists, and again in decide(),
-before the write. That is not belt-and-braces. The guards worth having are the ones whose
-answer *changes* between those two moments -- another action ran, an execution failed,
-someone scaled the Deployment by hand while the message sat unread. A guardrail evaluated
-only at propose time protects the cluster as it was, not as it is.
+Every guard runs twice, in propose() and again in decide(). Not belt-and-braces -- the
+guards worth having are the ones whose answer *changes* between those moments, because
+another action ran or someone scaled the Deployment by hand while the message sat unread.
 
-Counts come from audit.jsonl rather than from counters in this process. The log is already
-append-only and fsynced; it survives the restart that would otherwise refill an hourly
-budget and quietly close an open breaker; and "why is the breaker open" is answerable with
-grep instead of a debugger.
+Counts come from audit.jsonl, not process counters: the log is append-only and fsynced, it
+survives the restart that would refill an hourly budget, and "why is the breaker open" is
+answerable with grep.
 """
 
 import json
@@ -30,9 +26,8 @@ from tools.k8s import MIN_REPLICAS, current_replicas
 
 logger = logging.getLogger(__name__)
 
-# The audit event names this module reads. Literals, not an import from approvals: that
-# module imports this one, and a cycle to save two strings is a bad trade.
-# test_guardrails.py asserts they still match approvals' constants.
+# Literals, not an import from approvals: that module imports this one.
+# test_guardrails.py asserts they still match.
 EXECUTED = "executed"
 FAILED = "failed"
 
@@ -48,27 +43,21 @@ MAX_ACTIONS_PER_HOUR = int(os.getenv("SHA_MAX_ACTIONS_PER_HOUR", "3"))
 # Consecutive failed executions before this stops proposing anything at all.
 BREAKER_THRESHOLD = int(os.getenv("SHA_BREAKER_THRESHOLD", "3"))
 
-# Not a per-diagnosis cap -- MAX_ITERATIONS is already that. This is the ceiling across
-# diagnoses, which is what matters from Day 20 on, when Alertmanager drives /diagnose
-# unattended and one flapping alert could spend the whole free tier before breakfast.
+# Across diagnoses, not within one -- MAX_ITERATIONS is already that. The ceiling that
+# matters once Alertmanager drives /diagnose unattended.
 MAX_LLM_CALLS = int(os.getenv("SHA_MAX_LLM_CALLS", "30"))
 
-# Shared by the rate limit, the breaker and the model-call budget. The breaker needs a
-# time bound or it deadlocks: it blocks the only event that could close it, a successful
-# execution. Bounding the window lets it half-open after a quiet hour, which is cheaper
-# than a reset mechanism nobody will remember exists.
+# Shared by all three counts. The breaker needs a time bound or it deadlocks: it blocks
+# the only event that could close it. Bounded, it half-opens after a quiet hour.
 WINDOW = int(os.getenv("SHA_GUARD_WINDOW", "3600"))
 
 
 def _events(since: float) -> list[dict]:
     """Audit lines at or after `since`, oldest first.
 
-    A missing log is an empty history, not an error -- the first action after a fresh
-    deploy has nothing it could have exceeded. A log that exists and does not parse is a
-    different thing entirely, and the JSONDecodeError is deliberately left to propagate:
-    a history this cannot read is a history it cannot check, and a guard that cannot
-    check must not shrug and allow. Same fail-closed direction as audit.record's missing
-    try/except.
+    A missing log is an empty history, not an error. A log that exists and does not parse is
+    different: the JSONDecodeError propagates, because a guard that cannot check must not
+    shrug and allow.
     """
     try:
         with open(audit.AUDIT_PATH, encoding="utf-8") as f:
@@ -84,13 +73,9 @@ def _events(since: float) -> list[dict]:
 def _outcomes(now: float) -> list[str]:
     """Every execution attempt in the window, oldest first: `executed` or `failed`.
 
-    Both stateful guards read this one list, and `failed` counts as an attempt for both.
-    A tool that raised still reached the API server, so it spent the hour's budget -- and
-    three of them in a row is exactly what the breaker exists to notice.
-
-    Deliberately not `approved`. An approval that a guard then blocked, or one whose
-    execution never happened, must not spend the budget: otherwise one bad proposal
-    poisons the window and the guards compound each other.
+    `failed` counts as an attempt for both guards -- a tool that raised still reached the API
+    server. Deliberately not `approved`: an approval a guard then blocked must not spend the
+    budget, or the guards compound each other.
     """
     return [
         e["event"]
@@ -100,11 +85,8 @@ def _outcomes(now: float) -> list[str]:
 
 
 def _refuse(message: str, guard: str, cause: Exception | None = None) -> NoReturn:
-    """Every refusal in this module leaves by this door.
-
-    Not a wrapper for its own sake: sha_guardrail_blocks_total is only trustworthy if it
-    is impossible to add a guard that refuses without counting. Instrumenting check()
-    instead would have missed check_llm_call, which no caller routes through it.
+    """Every refusal in this module leaves by this door, so the blocks counter cannot be
+    bypassed by adding a guard. check() would have missed check_llm_call.
     """
     metrics.GUARDRAIL_BLOCKS.labels(guard=guard).inc()
     raise GuardrailViolation(message, guard=guard) from cause
@@ -122,10 +104,10 @@ def _check_namespace(args: dict) -> None:
 
 
 def _check_replica_floor(args: dict) -> None:
-    """Refused, not clamped. tools/k8s.py clamps a model-chosen count so one bad number
-    does not throw away a whole diagnosis; here the number is already in front of a human
-    as a button, and silently turning "scale to 0" into "scale to 1" would execute
-    something nobody approved."""
+    """Refused, not clamped. tools/k8s.py clamps a model-chosen count; here the number is
+    already a button, and turning "scale to 0" into "scale to 1" executes something nobody
+    approved.
+    """
     replicas = args.get("replicas")
     if not isinstance(replicas, int) or replicas < MIN_REPLICAS:
         _refuse(
@@ -136,16 +118,7 @@ def _check_replica_floor(args: dict) -> None:
 
 
 def _check_live_replicas(args: dict, apis) -> None:
-    """The check that needed execute time to mean anything.
-
-    An approval clicked twenty minutes later was reasoned about a replica count that may
-    have moved since -- possibly by a human responding to the same incident. Scaling
-    *down* to a number that was an increase when it was proposed is the failure this
-    stops.
-
-    A read that fails is a refusal, not a pass: if the current state cannot be
-    established, it cannot be checked against.
-    """
+    """The check that needed execute time to mean anything."""
     try:
         live = current_replicas(
             apis, namespace=args["namespace"], deployment=args["deployment"]
@@ -190,16 +163,7 @@ def _check_breaker(now: float) -> None:
 
 
 def check(tool: str, args: dict, apis=None, now: float | None = None) -> None:
-    """Raises GuardrailViolation, or returns nothing.
-
-    Cheapest first, cluster read last: a proposal the namespace allowlist refuses should
-    not cost an API call to find out.
-
-    `apis` is the whole difference between the two call sites. propose() passes nothing,
-    because the model has just finished reading the cluster; decide() passes the client,
-    which turns on the one check that compares the proposal against the cluster as it is
-    at the moment of the click.
-    """
+    """Raises GuardrailViolation, or returns nothing."""
     now = time.time() if now is None else now
 
     _check_namespace(args)

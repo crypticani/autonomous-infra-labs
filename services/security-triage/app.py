@@ -1,25 +1,11 @@
-"""FastAPI surface -- Day 25.
+"""FastAPI surface.
 
-POST /triage answers 202 and a run id; GET /triage/{id} answers `pending` until the
-work is done. The same ack-now/answer-later split as Day 13's Slack bot and Day 20's
-/alerts, for the same reason and at a worse ratio: a triage run is one model call per
-ST_BATCH_SIZE findings, and the committed fixture alone is 559 deduped findings -- over
-a hundred calls, minutes each on CPU Ollama. A synchronous endpoint would time out on
-every real request, and the caller (a GitHub Actions job) would retry, doubling the
-work it just abandoned.
+POST /triage answers 202 and a run id; GET /triage/{id} answers `pending` until done.
+A run is one model call per ST_BATCH_SIZE findings, minutes each, so a synchronous
+endpoint would time out on every real request and be retried.
 
-Three controls that exist from the first commit rather than at capstone, because this
-is a **public multi-tenant endpoint whose work costs CPU-minutes of somebody else's
-inference**:
-
-- bearer auth, ST_API_TOKENS, several accepted so each onboarded repo carries its own,
-- a body size cap, because the envelope is arbitrary scanner JSON from the internet
-  (this repo's own is 2.7 MB),
-- a per-token rate limit, because the cheapest possible denial of service here is a
-  valid, well-formed request sent in a loop.
-
-Onboarding a repo is still a token and a URL: none of the three needs per-repo
-configuration on this side, and `repo` stays a label rather than a secret.
+Bearer auth, a body cap and a per-token rate limit are here from the first commit
+because this is a public multi-tenant endpoint spending somebody else's CPU-minutes.
 """
 
 import hashlib
@@ -57,22 +43,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Plural, unlike SHA_API_TOKEN and the copilot's single token: this is the first service
-# here with more than one caller by design. One token per onboarded repo means a leaked
-# one is revoked by editing a list, and -- the reason it matters below -- the rate limit
-# has something per-caller to count against.
+# Plural: one token per onboarded repo, so revoking a leaked one is a list edit and the
+# rate limit has something per-caller to count against.
 TOKENS = {t.strip() for t in os.getenv("ST_API_TOKENS", "").split(",") if t.strip()}
 
-# 16 MiB: this repo's own envelope is 2.7 MB and it is a small repo, so the cap is set
-# where a legitimate monorepo still fits and a body meant to exhaust memory does not.
+# 16 MiB: a legitimate monorepo still fits, a body meant to exhaust memory does not.
 MAX_BODY_BYTES = int(os.getenv("ST_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 
 MAX_RUNS_PER_HOUR = int(os.getenv("ST_MAX_RUNS_PER_HOUR", "5"))
 RATE_WINDOW = int(os.getenv("ST_RATE_WINDOW", "3600"))
 
-# Run records are in-process (see the module note on GET /triage/{id}), so the dict
-# needs a ceiling or a long-lived container accumulates every envelope it ever saw.
-# Oldest-first eviction, which is dict insertion order.
+# Run records are in-process, so the dict needs a ceiling. Oldest-first eviction, which
+# is dict insertion order.
 MAX_RUNS = int(os.getenv("ST_MAX_RUNS", "200"))
 
 _runs: dict[str, "Run"] = {}
@@ -80,13 +62,7 @@ _starts: dict[str, list[float]] = {}
 
 
 def require_token(request: Request) -> str:
-    """Authenticate, and return a **non-secret** id for the caller.
-
-    The id is what the rate limit counts against, so it has to survive into logs and
-    into the run record -- hence a hash prefix rather than the token itself. Same
-    Bearer/compare_digest shape as knowledge-copilot's require_token and the agent's;
-    the loop leaks how many tokens are configured through timing, which is not a secret.
-    """
+    """Authenticate, and return a non-secret id for the caller."""
     if not TOKENS:
         return "anonymous"
 
@@ -105,16 +81,11 @@ def require_token(request: Request) -> str:
 
 
 def body_size_error(declared: str | None) -> tuple[int, str] | None:
-    """The cap itself, on Content-Length rather than on the parsed body's length.
+    """On Content-Length, not the parsed body -- by then the memory is already spent.
 
-    By the time Pydantic has a body the memory is already spent, and this is the one
-    check that has to happen before the expensive thing rather than after it. A client
-    that under-declares gains nothing: uvicorn's HTTP parser stops reading at the
-    declared length, so what the app sees can never exceed what was checked here.
-
-    A chunked request declares no length at all, so there is nothing to check and it is
-    refused with 411. Every caller of this endpoint is a `curl --data-binary @file` from
-    a CI job, which always sends Content-Length.
+    Under-declaring gains nothing: uvicorn stops reading at the declared length. A chunked
+    request declares none, so it is refused with 411; every real caller is a
+    `curl --data-binary @file`, which always sends one.
     """
     if declared is None:
         return 411, "Content-Length is required on POST /triage"
@@ -124,13 +95,7 @@ def body_size_error(declared: str | None) -> tuple[int, str] | None:
 
 
 def check_rate(caller: str) -> None:
-    """One bucket per token, refused with 429.
-
-    Not a guardrail against a hostile caller alone -- a repo whose CI retries a failed
-    workflow four times would otherwise queue four full triage runs against a backend
-    that can serve roughly one. The refusal is the honest answer: the work will not
-    happen faster by asking again.
-    """
+    """One bucket per token, refused with 429."""
     now = time.monotonic()
     recent = [t for t in _starts.get(caller, []) if t > now - RATE_WINDOW]
     if len(recent) >= MAX_RUNS_PER_HOUR:
@@ -155,15 +120,11 @@ app = FastAPI(
 
 @app.middleware("http")
 async def cap_body_size(request: Request, call_next):
-    """Middleware and not `Depends`, and the difference is the entire point of the cap.
+    """Middleware, not `Depends`, and that difference is the whole cap.
 
-    FastAPI reads and parses the request body *before* it solves a route's dependencies,
-    so a `Depends(...)` guard would fire only after the megabytes it was meant to refuse
-    were already read and turned into dicts. Middleware runs before the route is even
-    matched, which is the only place the check does what it says.
-
-    It returns a response rather than raising: an HTTPException raised here is outside
-    the exception handlers FastAPI installs, and would surface as a 500.
+    FastAPI parses the body before it solves dependencies, so a `Depends` guard fires only
+    after the megabytes it exists to refuse are already dicts. Returns a response rather
+    than raising: an HTTPException here is outside FastAPI's handlers and 500s.
     """
     if request.method == "POST":
         error = body_size_error(request.headers.get("content-length"))
@@ -176,19 +137,13 @@ async def cap_body_size(request: Request, call_next):
 
 
 class TriageRequest(BaseModel):
-    """`scan.sh`'s envelope, plus one optional policy field.
-
-    `scans` is a bare dict on purpose: scanners.py is the only module that knows what a
-    Trivy or Checkov document looks like, and typing it here would turn every future
-    scanner release into a 422 on a body that was perfectly usable.
-    """
+    """`scan.sh`'s envelope, plus one optional policy field."""
 
     repo: str
     commit: str = ""
     branch: str = ""
     scans: dict[str, Any] = Field(default_factory=dict)
-    # Each repo sets its own bar. A public API and a cron script have genuinely
-    # different thresholds and neither should have to argue with this deploy's default.
+    # Each repo sets its own bar; a public API and a cron script differ.
     risk_threshold: int | None = Field(default=None, ge=0)
 
 
@@ -203,9 +158,8 @@ class Run(BaseModel):
     findings: int
     triaged: int = 0
     risk: RiskAssessment | None = None
-    # The rows a PR comment renders. The full judgment list is deliberately not here:
-    # nothing downstream reads it, and a 559-finding run would make every poll response
-    # megabytes of JSON that gets thrown away.
+    # What a PR comment renders. The full judgment list is deliberately absent: nothing
+    # reads it, and it would make every poll response megabytes of discarded JSON.
     top: list[TopFinding] = Field(default_factory=list)
     fixes: list[Fix] = Field(default_factory=list)
     error: str | None = None
@@ -229,22 +183,16 @@ def _triage_in_background(
 ) -> None:
     """The run itself, with nobody left to return to -- the 202 went out minutes ago.
 
-    Catches everything, deliberately, for the same reason /alerts does: an escaping
-    exception here buys a traceback after the response has already been sent. Worse, it
-    would leave the run `pending` forever and the polling CI job would sit there until
-    its own timeout with no idea why. A failed run has to be a *recorded* failure.
+    Catches everything deliberately: an escaping exception would leave the run `pending`
+    forever and the polling CI job spinning until its own timeout.
 
-    `propose_fixes` gets the pre-dedup list and `triage_findings` the deduped one, and
-    the asymmetry is Day 24's: nine securityContext rules on one container block share a
-    (target, line) fingerprint, which is the right identity for one triage judgment and
-    the wrong one for a hunk that needs all nine keys.
+    `propose_fixes` gets the pre-dedup list and `triage_findings` the deduped one: nine
+    securityContext rules share a (target, line) fingerprint, which is right for one
+    judgment and wrong for a hunk that needs all nine keys.
     """
     run = _runs.get(run_id)
     if run is None:
-        # Only reachable if MAX_RUNS evicted this run between the 202 and the task
-        # starting. Without the guard the KeyError lands in the handler below, which
-        # then fails on an unbound `run` -- a confusing traceback for a situation with
-        # nothing left to record it against anyway.
+        # Only if MAX_RUNS evicted the run between the 202 and the task starting.
         logger.warning(f"run {run_id} was evicted before its triage began")
         return
 
@@ -262,9 +210,8 @@ def _triage_in_background(
         metrics.FINDINGS.labels(repo=label, stage="triaged").inc(run.triaged)
         metrics.VERDICTS.labels(repo=label, verdict=run.risk.verdict).inc()
         metrics.RISK_SCORE.labels(repo=label).observe(run.risk.score)
-        # From `counts` rather than by walking `results` again: risk.assess already
-        # tallied every priority including the zero rows, and counting twice is how the
-        # two numbers eventually disagree.
+        # From `counts`, not by walking `results` again -- counting twice is how the two
+        # numbers eventually disagree.
         for priority, count in run.risk.counts.items():
             metrics.PRIORITIES.labels(priority=priority).inc(count)
 
@@ -283,10 +230,8 @@ def _triage_in_background(
         metrics.RUNS.labels(repo=label, outcome="failed").inc()
         logger.exception(f"run {run_id} abandoned by an unexpected failure")
     finally:
-        # Observed for failures too, and the failures are the ones worth timing: a run
-        # that dies on the ninth of ten batches has already spent twenty minutes of
-        # somebody's CPU, and a histogram over successes alone would report that as a
-        # quiet afternoon. Same reasoning as the agent's DIAGNOSIS_DURATION.
+        # Failures too: a run that dies on the ninth of ten batches already spent twenty
+        # minutes, and a successes-only histogram calls that a quiet afternoon.
         metrics.RUN_DURATION.observe(time.monotonic() - started)
 
 
@@ -296,15 +241,7 @@ def start_triage(
     background: BackgroundTasks,
     caller: str = Depends(require_token),
 ):
-    """202 and a run id. The verdict arrives at GET /triage/{id}.
-
-    Parsing and dedup happen **here**, synchronously, even though they could just as
-    easily go in the background task. Both are pure string arithmetic, they take
-    milliseconds on a 2.7 MB envelope, and doing them now means a malformed `scans`
-    block is a 422 the caller can read rather than a `failed` run it has to poll for.
-    The caller also gets the finding count in the ack, which is the only number it can
-    use to guess how long to poll.
-    """
+    """202 and a run id. The verdict arrives at GET /triage/{id}."""
     check_rate(caller)
 
     raw = parse_envelope(request.model_dump())
@@ -347,12 +284,11 @@ def start_triage(
 def get_run(run_id: str):
     """`pending`, or the verdict.
 
-    The store is a process-local dict, which makes `--workers 1` load-bearing for the
-    third time in this repo (the copilot's cache, the agent's proposals, now this) and
-    means a container restart mid-run strands a polling CI job on an id that will never
-    exist again -- it gets a 404 and fails the job, which is at least the loud version.
-    Acceptable at this scale; the upgrade path is a JSON file per run in a bind mount,
-    the same shape as the agent's audit log.
+    A process-local dict, so `--workers 1` is load-bearing and a restart mid-run strands a
+    polling job on a 404 -- the loud version, and acceptable at this scale.
+
+    ponytail: in-memory store. Upgrade path is a JSON file per run in a bind mount, the same
+    shape as the agent's audit log.
     """
     run = _runs.get(run_id)
     if run is None:
@@ -362,31 +298,14 @@ def get_run(run_id: str):
 
 @app.get("/metrics")
 def metrics_endpoint():
-    """Prometheus scrape target.
-
-    Unauthenticated, like the other two services' and like /health here: Prometheus
-    reaches this over loopback on appsrv, and a bearer token in a scrape config is a
-    secret in a third place buying nothing. It does leak per-repo volume to anyone who
-    can reach the port, which on this deploy is nginx and nothing else -- the compose
-    entry binds 127.0.0.1.
-
-    Nothing is computed at scrape time. Every metric is incremented at the moment the
-    thing happened, so a scrape cannot fail on a wedged background run -- which matters
-    more here than in the other services, because a wedged run is this service's normal
-    kind of outage.
-    """
+    """Prometheus scrape target."""
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/health")
 def health_check():
-    """Unauthenticated, like the other two services': a health check behind a bearer
-    token is one the container's own HEALTHCHECK cannot run.
-
-    The model backend is named here, not probed. Unlike the agent's cluster check, a
-    probe would mean an HTTP call to Ollama every thirty seconds forever, and it would
-    not buy much: a dead backend surfaces as `status: failed` with the provider's own
-    error on the run record, which is where whoever is waiting is already looking.
+    """Unauthenticated: a health check behind a token is one the container's own
+    HEALTHCHECK cannot run.
     """
     issues: list[str] = []
     provider_name = model = "unknown"
@@ -398,8 +317,8 @@ def health_check():
         issues.append(f"triage provider unavailable: {e}")
 
     if not TOKENS:
-        # The point of this branch: a deploy that forgot ST_API_TOKENS is visible here
-        # rather than quietly serving CPU-minutes to the internet.
+        # A deploy that forgot ST_API_TOKENS is visible here rather than quietly
+        # serving CPU-minutes to the internet.
         issues.append("auth disabled: ST_API_TOKENS is unset")
 
     pending = sum(1 for run in _runs.values() if run.status == "pending")
@@ -408,9 +327,8 @@ def health_check():
         "provider": provider_name,
         "model": model,
         "auth": f"{len(TOKENS)} token(s)" if TOKENS else "disabled",
-        # The limits this process actually loaded, not the ones the image ships --
-        # appsrv's .env overrides image defaults, and Day 18 lost an evening to exactly
-        # that with a stale SHA_MAX_ITERATIONS.
+        # What this process loaded, not what the image ships -- .env overrides image
+        # defaults, and a stale one has cost an evening before.
         "policy": {
             "risk_threshold": risk.THRESHOLD,
             "batch_size": triage.BATCH_SIZE,
@@ -418,8 +336,7 @@ def health_check():
             "max_runs_per_hour": MAX_RUNS_PER_HOUR,
             "window": RATE_WINDOW,
         },
-        # A pending count that never drops means background runs are wedged against the
-        # backend; nothing else in this service would show that.
+        # A pending count that never drops means runs are wedged against the backend.
         "runs": {"stored": len(_runs), "pending": pending, "capacity": MAX_RUNS},
         "issues": issues,
     }

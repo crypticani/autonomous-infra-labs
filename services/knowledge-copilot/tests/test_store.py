@@ -4,13 +4,7 @@ import store
 
 
 def test_retrieval_does_not_import_ingest():
-    """The query path must not depend on the write path.
-
-    retrieval.py imported CHROMA_PATH and get_collection from ingest.py only because
-    that is where the plumbing was written first. This asserts the seam rather than the
-    behaviour, because the behaviour was already correct -- the coupling was the defect,
-    and only a source-level assertion can catch it coming back.
-    """
+    """The query path must not depend on the write path."""
     source = (Path(__file__).resolve().parents[1] / "retrieval.py").read_text(
         encoding="utf-8"
     )

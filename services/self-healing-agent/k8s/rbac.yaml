@@ -1,7 +1,5 @@
-# Scoped to the sandbox namespace and to exactly the verbs tools/ needs -- nothing more.
-# A bug in guardrails.py (Day 19) must not be sufficient to reach kube-system, and a
-# leaked token must not be sufficient to delete a Deployment. tests/test_rbac.py checks
-# these rules against tools.REGISTRY's `needs` so the two cannot drift silently.
+# Scoped to the sandbox namespace and to exactly the verbs tools/ needs. test_rbac.py
+# checks these rules against tools.REGISTRY's `needs` so the two cannot drift.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -26,9 +24,8 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets"]
     verbs: ["list"]
-  # scale_deployment -- `get` is for guardrails.py's execute-time check, which compares
-  # an approved replica count against the live one. The scale subresource carries the
-  # replica count and nothing else, so this reads no image, env var or secret.
+  # scale_deployment -- `get` is guardrails.py's execute-time check. The scale
+  # subresource carries the replica count and nothing else.
   - apiGroups: ["apps"]
     resources: ["deployments/scale"]
     verbs: ["get", "patch"]

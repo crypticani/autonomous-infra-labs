@@ -61,13 +61,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# The lookbehind skips subscripts like argv[1] or ${nodes[0]}, but must NOT exclude a
-# preceding "]": models write consecutive citations as [1][2], and dropping the second
-# left an unresolvable marker in the prose while `grounded` still claimed true.
+# The lookbehind skips subscripts like argv[1], but must NOT exclude a preceding "]":
+# models write consecutive citations as [1][2], and dropping the second left an
+# unresolvable marker while `grounded` still claimed true.
 MARKER_RE = re.compile(r"(?<!\w)\[(\d+)\]")
 
-# A fence carrying a language hint, on its own line. Anchored per-line so a stray ``` in
-# prose is left alone, and requiring one or more characters so a closing fence never matches.
+# A fence with a language hint, anchored per-line so a stray ``` in prose is left alone.
+# Requiring one or more characters keeps a closing fence from matching.
 FENCE_LANG_RE = re.compile(r"^```[A-Za-z0-9_+#.-]+[ \t]*$", re.MULTILINE)
 
 NOT_COVERED = "Not covered in the runbooks."
@@ -78,40 +78,35 @@ INDEX_EMPTY = "The runbook index is empty — someone needs to run ingest.py."
 MODEL_DOWN = "The model is unreachable, so I can't answer that right now."
 FAILED = "Something went wrong answering that — check the service logs."
 
-# One answer at a time. CPU Ollama serializes internally anyway and alert_sync_loop is
-# already competing for it every 60 seconds, so two questions in flight means both take
-# 400s instead of one taking 195s. The ack message covers the wait.
+# One at a time: CPU Ollama serializes anyway and alert_sync_loop already competes every
+# 60 seconds, so two questions in flight means both take 400s instead of one taking 195s.
 ANSWER_LOCK = asyncio.Semaphore(1)
 
-# asyncio holds only a weak reference to a task, so a task with no strong reference of
-# its own can be garbage-collected mid-answer. This set is that reference.
+# asyncio holds only a weak reference to a task, so one with no strong reference can be
+# garbage-collected mid-answer. This set is that reference.
 _tasks: set[asyncio.Task] = set()
 
 ALERT_SYNC_INTERVAL = int(os.getenv("ALERT_SYNC_INTERVAL", "60"))
 ALERT_SYNC_ENABLED = os.getenv("ALERT_SYNC_ENABLED", "true").lower() == "true"
 
-# None until the first successful sync. Reported as NaN rather than 0, because zero
-# seconds since last sync is the healthiest possible reading and would say the exact
-# opposite of the truth.
+# None until the first successful sync. NaN rather than 0, because zero seconds since
+# last sync is the healthiest possible reading and would say the opposite of the truth.
 _last_alert_sync: float | None = None
 
-# Defence in depth, not the first line of it: the container binds 127.0.0.1:7100 and
-# nginx proxies `= /slack/events` only, so this endpoint is already unreachable from the
-# internet. The token covers whatever is already on the host or the tailnet.
+# Defence in depth: the container binds 127.0.0.1 and nginx proxies `= /slack/events`
+# only, so this is already unreachable from the internet. The token covers the host.
 KC_API_TOKEN = os.getenv("KC_API_TOKEN", "")
 
 
 def require_token(request: Request) -> None:
-    """Bearer auth for /ask-runbook. No token configured means no check.
-
-    Reads the module global at call time rather than closing over it, which is what lets
-    the tests swap it with monkeypatch.
+    """Bearer auth for /ask-runbook. No token configured means no check. Reads the module
+    global at call time so tests can swap it with monkeypatch.
     """
     if not KC_API_TOKEN:
         return
     scheme, _, presented = request.headers.get("Authorization", "").partition(" ")
-    # compare_digest, not ==: string equality returns as soon as it finds a differing
-    # byte, and how long that took says how much of the prefix was right.
+    # compare_digest, not ==: string equality returns at the first differing byte, and how
+    # long that took says how much of the prefix was right.
     if scheme != "Bearer" or not hmac.compare_digest(presented, KC_API_TOKEN):
         raise HTTPException(
             status_code=401,
@@ -121,12 +116,7 @@ def require_token(request: Request) -> None:
 
 
 def grounded_system_prompt(now: datetime) -> str:
-    """The grounding rules, plus a clock.
-
-    Retrieved alert chunks carry absolute timestamps -- deliberately, because a
-    relative one would churn the content hash on every poll. That makes "is this
-    happening now" unanswerable unless the prompt says what "now" is.
-    """
+    """The grounding rules, plus a clock."""
     return f"""You are an on-call SRE assistant. Answer operational questions using ONLY the runbook excerpts inside <context>.
 
 The current time is {now.isoformat()}.
@@ -156,16 +146,14 @@ class AskResponse(BaseModel):
     answer: str
     sources: list[Source]
     grounded: bool
-    # "we produced an answer" and "that answer is grounded" are separate facts. Without
-    # this field a caller can only tell a refusal from an uncited answer by string-
-    # matching NOT_COVERED, since both carry grounded=false and no sources.
+    # "We produced an answer" and "that answer is grounded" are separate facts. Without this
+    # field a caller can only tell a refusal from an uncited answer by string-matching.
     answer_source: Literal["runbooks", "none"]
 
 
 class SearchRequest(BaseModel):
-    # Not AskRequest's min_length=10: the caller here is an agent naming a symptom
-    # ("OOMKilled after deploy"), not a person typing a sentence. A 422 is a dead end
-    # for a model, which cannot see why the call was rejected.
+    # Not AskRequest's min_length=10: the caller here is an agent naming a symptom, not a
+    # person typing a sentence, and a 422 is a dead end for a model.
     question: str = Field(min_length=3, description="What to look for in the runbooks")
     k: int = Field(default=DEFAULT_K, ge=1, le=10)
 
@@ -237,8 +225,8 @@ def alert_sync_tick() -> None:
     try:
         plan = sync_alerts()
     except AlertmanagerError as e:
-        # Expected and recoverable -- appsrv reboots, the tailnet blips. The write was
-        # skipped, so the index still holds the last state we actually observed.
+        # Expected and recoverable. The write was skipped, so the index still holds the last
+        # state actually observed.
         UPSTREAM_ERRORS.labels(provider="alertmanager").inc()
         logger.warning(f"alert sync skipped: {e}")
         return
@@ -246,15 +234,13 @@ def alert_sync_tick() -> None:
         logger.exception("alert sync failed")
         return
 
-    # Set before the write check, not after: a poll that found nothing to change still
-    # observed live state, and is not a stale sync.
+    # Before the write check: a poll that found nothing to change still observed live state.
     _last_alert_sync = time.time()
 
     if plan.to_upsert or plan.to_delete:
-        # The writer knows when it wrote, which is the whole fix for retrieval's
-        # (name, count) cache key: one alert resolving as another fires leaves the
-        # count identical and the content completely different. The CLI-writes-while-
-        # the-app-runs case keeps its existing "restart after re-ingest" caveat.
+        # The writer knows when it wrote, which is the fix for retrieval's (name, count) cache
+        # key: one alert resolving as another fires leaves the count identical and the content
+        # completely different.
         _index_cache.clear()
         logger.info(
             f"alert sync: +{len(plan.to_add)} ~{len(plan.to_update)} "
@@ -264,9 +250,8 @@ def alert_sync_tick() -> None:
 
 async def alert_sync_loop() -> None:
     while True:
-        # to_thread, not a direct call: sync_alerts blocks on Ollama embeddings for
-        # seconds at a time, and on the event loop that stalls every concurrent
-        # /ask-runbook request behind it.
+        # to_thread: sync_alerts blocks on Ollama embeddings for seconds, and on the event
+        # loop that stalls every concurrent request behind it.
         await asyncio.to_thread(alert_sync_tick)
         await asyncio.sleep(ALERT_SYNC_INTERVAL)
 
@@ -275,9 +260,8 @@ async def alert_sync_loop() -> None:
 async def lifespan(_: FastAPI):
     task = None
     if ALERT_SYNC_ENABLED:
-        # Single worker assumed: two uvicorn workers means two loops racing on the
-        # same writes. Documented in the Readme rather than solved with a lock -- a
-        # distributed lock for a single-node deployment is machinery for nobody.
+        # Single worker assumed: two would race two loops on the same writes. Documented
+        # rather than locked -- a distributed lock for one node is machinery for nobody.
         task = asyncio.create_task(alert_sync_loop())
         logger.info(f"alert sync every {ALERT_SYNC_INTERVAL}s from {ALERTMANAGER_URL}")
     if not slack_active():
@@ -298,12 +282,7 @@ app = FastAPI(
 def answer_question(
     question: str, k: int = DEFAULT_K, turns: Sequence[Turn] = ()
 ) -> AskResponse:
-    """Retrieve, ground, answer. Raises for the caller to map to its own protocol.
-
-    `question` is always the raw new question. History shapes what gets retrieved and
-    what gets prompted at two different depths -- see sessions.py. With no history both
-    reduce to identity, which is why /ask-runbook's behaviour is unchanged.
-    """
+    """Retrieve, ground, answer. Raises for the caller to map to its own protocol."""
     provider, collection = open_collection()
 
     started = time.perf_counter()
@@ -364,17 +343,12 @@ def ask_runbook(request: AskRequest):
 def search_runbooks(request: SearchRequest):
     """Retrieval only. The self-healing agent's `search_runbooks` tool calls this.
 
-    `get_llm_provider` must never appear on this path. The agent has its own model and
-    its own transcript; a second model writing prose here would arrive as an
-    unattributed opinion inside the agent's evidence. Chunks, and let the caller reason.
+    `get_llm_provider` must never appear on this path: the agent has its own model and
+    transcript, and a second model writing prose here would arrive as an unattributed
+    opinion inside its evidence.
 
-    HTTP rather than the agent importing retrieval.py: Chroma's PersistentClient is not
-    safe for multi-process access, and this process writes to that index every 60
-    seconds. A second process holding its own HNSW index would read stale vectors.
-
-    The similarity floor still applies, so a question the corpus cannot answer returns
-    no hits rather than three bad chunks -- the same refusal /ask-runbook makes, minus
-    the sentence.
+    HTTP rather than importing retrieval.py, because Chroma's PersistentClient is not safe
+    for multi-process access and this process writes to that index every 60 seconds.
     """
     logger.info(f"/search-runbooks k={request.k} q={request.question!r}")
     started = time.perf_counter()
@@ -407,13 +381,7 @@ def search_runbooks(request: SearchRequest):
 
 
 def strip_fence_languages(text: str) -> str:
-    """Drop the language hint from code fences.
-
-    Slack's mrkdwn has no language-hinted fences, so ```sh renders as a code block whose
-    first visible line is the word "sh". That showed up in every answer containing a
-    command. Closing fences are bare and stay untouched: the pattern requires at least
-    one character after the backticks.
-    """
+    """Drop the language hint from code fences."""
     return FENCE_LANG_RE.sub("```", text)
 
 
@@ -435,10 +403,8 @@ async def post(mention: Mention, text: str) -> None:
 
 
 async def answer_and_post(mention: Mention) -> None:
-    """The slow half, off the request path.
-
-    Every exit posts something. At 195 seconds a silent bot is indistinguishable from a
-    broken one, and the person waiting has no way to tell which.
+    """The slow half, off the request path. Every exit posts something: at 195 seconds a
+    silent bot is indistinguishable from a broken one.
     """
     if len(mention.question) < MIN_QUESTION_LENGTH:
         await post(mention, TOO_SHORT)
@@ -449,9 +415,8 @@ async def answer_and_post(mention: Mention) -> None:
 
     try:
         async with ANSWER_LOCK:
-            # to_thread, not a direct call: answer_question blocks on Ollama for three
-            # minutes, and on the event loop that stalls the alert sync and every other
-            # request behind it.
+            # to_thread: answer_question blocks on Ollama for three minutes, and on the event
+            # loop that stalls the alert sync and everything behind it.
             result = await asyncio.to_thread(
                 answer_question, mention.question, DEFAULT_K, turns
             )
@@ -469,8 +434,8 @@ async def answer_and_post(mention: Mention) -> None:
         return
 
     if result.answer_source == "runbooks":
-        # A refusal is deliberately not remembered: carrying a question that retrieved
-        # nothing would only dilute the next turn's retrieval query.
+        # A refusal is not remembered: carrying a question that retrieved nothing would
+        # only dilute the next turn's retrieval query.
         sessions.append(
             mention.thread_ts,
             Turn(mention.question, result.answer),
@@ -494,8 +459,8 @@ async def slack_events(request: Request):
     if not slack_active():
         raise HTTPException(status_code=404, detail="Slack is not configured")
 
-    # The raw bytes, before any parsing: re-serialising changes whitespace and key
-    # order, and the HMAC then never matches.
+    # The raw bytes: re-serialising changes whitespace and key order, and the HMAC
+    # then never matches.
     body = await request.body()
     if not verify_signature(
         body,
@@ -523,8 +488,8 @@ async def slack_events(request: Request):
         SLACK_EVENTS.labels(outcome="not_a_mention").inc()
         return Response(status_code=200)
 
-    # Before any work is spawned, not after: the point is to never start the second
-    # and third 195-second job.
+    # Before any work is spawned: the point is never to start the second and third
+    # 195-second job.
     event_id = payload.get("event_id", "")
     if is_duplicate(event_id, now=time.time()):
         SLACK_EVENTS.labels(outcome="deduped_retry").inc()
@@ -540,23 +505,20 @@ async def slack_events(request: Request):
 
 @app.get("/metrics")
 def metrics():
-    """Prometheus scrape target.
-
-    Unauthenticated on purpose: Prometheus reaches this over loopback on appsrv, and a
-    bearer token in a scrape config is a secret in a third place buying nothing.
+    """Prometheus scrape target. Unauthenticated: Prometheus reaches it over loopback, and a
+    token in a scrape config is a secret in a third place.
     """
     try:
         _, collection = open_collection()
         CHUNKS_INDEXED.set(collection.count())
     except Exception:
-        # A scrape must never 500. An unreachable collection is what /health is for;
-        # here it only means this one gauge has nothing to say this time round.
+        # A scrape must never 500. An unreachable collection is what /health is for; here it
+        # only means this gauge has nothing to say this time round.
         logger.exception("metrics: collection unavailable")
 
     SESSIONS_ACTIVE.set(sessions.active_count(time.time()))
-    # Set on every scrape, including the unknown case. Skipping the set would leave the
-    # gauge holding whatever it last reported, which is how a stale reading outlives the
-    # state that produced it. NaN is Prometheus's "no data".
+    # Set on every scrape, including the unknown case: skipping it would leave the gauge
+    # holding its last reading. NaN is Prometheus's "no data".
     ALERT_SYNC_AGE.set(
         float("nan") if _last_alert_sync is None else time.time() - _last_alert_sync
     )
@@ -578,8 +540,7 @@ def health_check():
         issues.append(f"LLM provider unavailable: {e}")
 
     # Constructing a provider does no I/O, so without this the endpoint reports healthy
-    # while appsrv is down or the model was never pulled -- which reaches callers as a
-    # 502 mid-answer instead of a degraded health check.
+    # while the backend is down -- reaching callers as a 502 mid-answer.
     if llm is not None and llm.name == "ollama":
         try:
             tags = requests.get(f"{llm.base_url}/api/tags", timeout=2)
@@ -608,8 +569,7 @@ def health_check():
         "chunks_indexed": indexed,
         "similarity_floor": SIMILARITY_FLOOR,
         "slack": "active" if slack_active() else "disabled",
-        # The point of the unset branch: a deploy that forgot KC_API_TOKEN is visible
-        # here, rather than being quietly open.
+        # A deploy that forgot KC_API_TOKEN is visible here rather than quietly open.
         "auth": "required" if KC_API_TOKEN else "disabled",
         "issues": issues,
     }

@@ -1,18 +1,11 @@
-"""Alertmanager's webhook body, turned into the alerts diagnose() already takes -- Day 20.
+"""Alertmanager's webhook body, turned into the alerts diagnose() already takes.
 
-This module decides *which* alerts are worth a diagnosis. It never runs one, and it never
-calls a model: everything here is arithmetic on a dict, which is what makes the expensive
-decision testable without a key.
+Decides *which* alerts are worth a diagnosis. Never runs one and never calls a model --
+everything here is arithmetic on a dict, which is what makes the expensive decision
+testable without a key.
 
-Day 16 built the outbound direction -- tools/external.get_recent_alerts polls Alertmanager
-for what else is firing. This is the inbound one, and it closes the loop: until now every
-diagnosis started with a human running curl.
-
-The alert is passed through unchanged rather than reshaped. get_recent_alerts flattens,
-because there it is context -- "what else is going on" -- and the summary is the point. Here
-the alert *is* the problem, and every field dropped is a field the model cannot reason
-about. `namespace` and `pod` most of all: those are the arguments get_pod_logs needs, and a
-tidier dict that loses them buys nothing and costs the diagnosis.
+The alert is passed through unchanged rather than reshaped: here the alert *is* the
+problem, and `namespace` and `pod` are the arguments get_pod_logs needs.
 """
 
 import logging
@@ -47,12 +40,7 @@ class Intake:
 
 
 def _fingerprint(alert: dict) -> str:
-    """Alertmanager's own fingerprint when it sent one, the labels otherwise.
-
-    The fallback is not a nicety. Falling back to something unique-per-delivery -- a
-    timestamp, id() -- would mean no deduplication at all, silently, which is worse than
-    not deduplicating on purpose. Labels are what Alertmanager fingerprints anyway.
-    """
+    """Alertmanager's own fingerprint when it sent one, the labels otherwise."""
     given = alert.get("fingerprint")
     if given:
         return str(given)
@@ -63,10 +51,6 @@ def _fingerprint(alert: dict) -> str:
 def accept(payload: dict, now: float | None = None) -> Intake:
     """Split one webhook body into the alerts worth diagnosing, and the reasons the rest
     were not.
-
-    Defensive about shape on purpose: this is an unparsed POST from another process. A
-    KeyError here is a 500, and a 500 makes Alertmanager retry a body that will never
-    work -- forever, every group_interval.
     """
     now = time.time() if now is None else now
     _prune(now)

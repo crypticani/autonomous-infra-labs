@@ -1,7 +1,6 @@
 """The two tools that never touch the cluster: one reads Alertmanager, one reads
 knowledge-copilot. Neither needs `apis`, so both ignore the first argument -- the same
-uniform `fn(apis, **args)` dispatch shape as tools/k8s.py, without a second call
-convention for the loop (Day 17) to special-case.
+uniform `fn(apis, **args)` dispatch, without a second convention to special-case.
 """
 
 import os
@@ -14,8 +13,7 @@ from errors import RunbookError, UpstreamError
 
 load_dotenv()
 
-# Reused from the root .env, same as knowledge-copilot's own connector -- both services
-# poll the one Alertmanager and should agree on where it is.
+# Reused from the root .env: both services poll the one Alertmanager.
 ALERTMANAGER_URL = os.getenv("ALERTMANAGER_URL", "http://localhost:9093")
 ALERTMANAGER_TIMEOUT = int(os.getenv("ALERTMANAGER_TIMEOUT", "10"))
 
@@ -23,8 +21,8 @@ ALERTMANAGER_TIMEOUT = int(os.getenv("ALERTMANAGER_TIMEOUT", "10"))
 COPILOT_URL = os.getenv("SHA_KNOWLEDGE_COPILOT_URL", "http://localhost:7100")
 COPILOT_TIMEOUT = int(os.getenv("SHA_KNOWLEDGE_COPILOT_TIMEOUT", "30"))
 
-# The copilot's own bearer secret, reused rather than duplicated under an SHA_ key --
-# it authenticates against /search-runbooks, the same door /ask-runbook uses.
+# The copilot's own bearer secret, reused rather than duplicated under an SHA_ key -- it
+# authenticates against the same door /ask-runbook uses.
 KC_API_TOKEN = os.getenv("KC_API_TOKEN", "")
 
 
@@ -41,9 +39,8 @@ def get_recent_alerts(
         response.raise_for_status()
         alerts = response.json()
     except requests.exceptions.RequestException as e:
-        # No dedicated AlertmanagerError subclass: errors.py's taxonomy is declared in
-        # full on day one, and this upstream isn't in it. UpstreamError already carries
-        # `provider` for exactly this case.
+        # No dedicated subclass: errors.py's taxonomy is declared in full up front, and
+        # UpstreamError already carries `provider` for this case.
         raise UpstreamError(
             f"Alertmanager at {ALERTMANAGER_URL} did not answer: {e}",
             502,
@@ -72,13 +69,7 @@ def get_recent_alerts(
 
 
 def search_runbooks(apis, *, question: str, k: int = 4) -> dict:
-    """Retrieval only, over HTTP -- never a library import.
-
-    Chroma's PersistentClient is not safe for multi-process access, and knowledge-copilot
-    writes to that index every 60 seconds during alert sync; a second process holding
-    its own HNSW index would read stale vectors. This service's Docker build context
-    also cannot `COPY` a sibling service's modules.
-    """
+    """Retrieval only, over HTTP -- never a library import."""
     headers = {"Authorization": f"Bearer {KC_API_TOKEN}"} if KC_API_TOKEN else {}
     try:
         response = requests.post(

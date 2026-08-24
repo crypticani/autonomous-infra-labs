@@ -1,9 +1,4 @@
-"""Day 13: the outbound half. The only module in the Slack path that touches network.
-
-Raises rather than swallowing, the same discipline as connectors/alertmanager.py. A
-failed post means someone is waiting on an answer that will never arrive, and that
-belongs in the log as an error rather than in a bare `pass`.
-"""
+"""Day 13: the outbound half. The only module in the Slack path that touches network."""
 
 import logging
 import os

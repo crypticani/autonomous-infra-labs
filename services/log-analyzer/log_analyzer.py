@@ -39,11 +39,9 @@ LLM_TOKENS_TOTAL = Counter(
     ["provider", "token_type"],
 )
 
-# Was a hardcoded 60. Day 27 measured this service's five golden cases at 23.2-60.1s per
-# call on laptop CPU, so 60 sat inside the noise -- the same TC-001 log took 40.3s on one
-# run and timed out at 60.1s on the next, turning a passing case into a PARSE_ERROR for
-# reasons that had nothing to do with the model's answer. Matches knowledge-copilot's
-# LLM_TIMEOUT, which is the same env var against the same Ollama host.
+# Was a hardcoded 60, which sat inside the noise: the same golden case measured 40.3s on
+# one run and timed out at 60.1s on the next, turning a passing case into a PARSE_ERROR
+# for reasons unrelated to the answer.
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "300"))
 
 ANALYSIS_SYSTEM_PROMPT = """
@@ -73,18 +71,13 @@ Step 2. Then apply recovery as an adjustment, at most one level down.
 
 
 class LogAnalysis(BaseModel):
-    # Field order is load-bearing, not cosmetic. Ollama grammar-constrains generation to
-    # this schema in declared order, so whichever field comes first is decided before the
-    # others exist. With `severity` first, the model committed to a label before writing a
-    # word of reasoning, then reasoned correctly about a verdict it could no longer
-    # revise -- measured on Day 27, where TC-004's own likely_cause named two failing
-    # services under a HIGH label, and TC-003's said "being killed again" under MEDIUM.
-    # Prose right, label wrong, same call.
+    # Field order is behaviour, not formatting. Ollama grammar-constrains generation in
+    # declared order, so with `severity` first the model committed to a label before writing a
+    # word of reasoning, then reasoned correctly about a verdict it could no longer revise --
+    # prose right, label wrong, same call.
     #
-    # Reasoning first, label second, is chain-of-thought expressed through the schema
-    # rather than through the prompt: severity is now generated conditioned on the text
-    # above it. `confidence` stays last for the same reason -- it should be a judgment
-    # about a verdict that already exists.
+    # Reasoning first, label second, is chain-of-thought expressed through the schema rather
+    # than the prompt. `confidence` stays last, as a judgment about a verdict that exists.
     likely_cause: str
     suggested_fix: str
     severity: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
@@ -92,11 +85,9 @@ class LogAnalysis(BaseModel):
 
 
 class BaseLLMProvider(ABC):
-    # Cumulative tokens, alongside the Prometheus counter above rather than instead of
-    # it: the counter feeds Grafana, these feed Day 27's cost benchmark, which would
-    # otherwise have to reach into the registry to read a number this module already has.
-    # Read by delta -- snapshot, call, subtract. Plain ints so `+=` rebinds per instance
-    # and a class-level default is never shared.
+    # Cumulative, alongside the Prometheus counter rather than instead of it: the counter
+    # feeds Grafana, these feed the cost benchmark. Read by delta. Plain ints so `+=` rebinds
+    # per instance.
     prompt_tokens = 0
     output_tokens = 0
 
@@ -130,17 +121,13 @@ class OllamaProvider(BaseLLMProvider):
             "model": self.model_name,
             "system": json_system_prompt,
             "prompt": user_prompt,
-            # "options", not top level. Ollama silently ignores a top-level temperature,
-            # which is where this sat until Day 27 -- so every call this service has ever
-            # made ran at Ollama's default 0.8, including the eval harness that passes
-            # 0.0 explicitly. That is why the golden set returned different severities for
-            # byte-identical logs on three consecutive runs, and why "it scores 2/5" was
-            # never a fact about the prompt. An eval on a sampling model is a coin flip
-            # with a report attached.
+            # "options", not top level. Ollama silently ignores a top-level temperature, so every
+            # call this service ever made ran at the default 0.8 -- including the eval harness that
+            # passes 0.0 explicitly. That is why the golden set returned different severities for
+            # byte-identical logs. An eval on a sampling model is a coin flip with a report attached.
             #
-            # The repo already knew: security-triage's test_provider.py asserts this exact
-            # thing about its own payload. The knowledge it takes to avoid a bug being
-            # written down somewhere else in the same repo is not the same as avoiding it.
+            # The repo already knew: security-triage's test_provider.py asserts this about its own
+            # payload. Knowing it somewhere else in the same repo is not the same as avoiding it.
             "options": {"temperature": temperature},
             "stream": False,
             "format": LogAnalysis.model_json_schema(),
@@ -215,10 +202,8 @@ class GeminiProvider(BaseLLMProvider):
             usage = response.usage_metadata
             if usage:
                 prompt_tokens = usage.prompt_token_count or 0
-                # thoughts_token_count was missing here and it is not a rounding error:
-                # measured 2026-08-22, a one-word answer cost 1 candidate token and 119
-                # thinking tokens, all of them billed at the output rate. Every completion
-                # number this counter has recorded for Gemini is an undercount.
+                # thoughts_token_count was missing and it is not a rounding error: a one-word answer
+                # cost 1 candidate token and 119 thinking tokens, all billed at the output rate.
                 output_tokens = (usage.candidates_token_count or 0) + (
                     usage.thoughts_token_count or 0
                 )

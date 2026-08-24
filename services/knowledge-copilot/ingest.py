@@ -95,11 +95,9 @@ def plan_reconcile(desired: list[Chunk], existing: dict[str, str]) -> Plan:
 def existing_hashes(collection, where: dict | None = None) -> dict[str, str]:
     """Stored content hashes, optionally scoped to one source's documents.
 
-    Unscoped, plan_reconcile deletes everything not in `desired` -- correct while the
-    corpus was the only source, and catastrophic once a second one exists: an alert
-    sync's desired set contains no runbooks, so it would delete all of them on the
-    first poll. Scoping is the root-cause fix. A guard inside the alert path would
-    leave the next source (K8s events, Jenkins builds) to rediscover the same bug.
+    Unscoped, plan_reconcile deletes everything not in `desired` -- fine while the corpus was
+    the only source, catastrophic once a second exists, since an alert sync's desired set
+    contains no runbooks. Scoping is the root-cause fix.
     """
     stored = collection.get(include=["metadatas"], where=where or None)
     return {
@@ -117,12 +115,7 @@ def ingest(
     docs: list[Document] | None = None,
     where: dict | None = None,
 ) -> Plan:
-    """Reconcile `desired` against what is stored, then write the difference.
-
-    `docs` makes this source-agnostic: given documents, those are the desired set and
-    corpus_dir is ignored. `where` scopes both the read-back and therefore the
-    deletes, so each source only ever removes documents it owns.
-    """
+    """Reconcile `desired` against what is stored, then write the difference."""
 
     if reset and dry_run:
         raise ValueError("reset drops the collection; it is never a dry run")
@@ -163,10 +156,8 @@ ALERT_WHERE = {"doc_type": ALERT_DOC_TYPE}
 
 
 def indexed_alerts(collection) -> dict[str, dict]:
-    """Fingerprint -> stored metadata, for the alerts already in the collection.
-
-    This is how merge() learns what to compare a fetch against, and therefore how
-    resolution-by-absence works at all.
+    """Fingerprint -> stored metadata for the alerts already indexed. How merge() learns what to
+    compare a fetch against, and therefore how resolution-by-absence works at all.
     """
     stored = collection.get(include=["metadatas"], where=ALERT_WHERE)
     return {
@@ -185,10 +176,9 @@ def sync_alerts(
 ) -> Plan:
     """One poll: fetch, merge with what is indexed, reconcile.
 
-    `fetch` raises on any failure and this function deliberately does not catch it,
-    so a failed poll reaches the caller having read and written nothing. Callers that
-    poll on a timer log it and try again -- they must never treat it as an empty
-    alert set, because merge() would then resolve every alert in the index at once.
+    `fetch` raises on any failure and this deliberately does not catch it, so a failed poll
+    reaches the caller having read and written nothing. A caller must never treat that as an
+    empty alert set, or merge() resolves every indexed alert at once.
     """
     provider = provider or get_embedding_provider()
     client = client or default_client()
@@ -246,8 +236,8 @@ def main() -> None:
         parser.error("--reset drops the collection; it cannot be a --dry-run")
 
     if args.reset and args.source == "alerts":
-        # --reset drops the whole collection, runbooks included, which is never what
-        # a caller syncing alerts meant. Alerts are removed by retention, not reset.
+        # --reset drops the whole collection, runbooks included, which is never what a
+        # caller syncing alerts meant. Alerts are removed by retention.
         parser.error("--reset applies to the corpus; alerts expire via retention")
 
     provider = get_embedding_provider()
@@ -257,8 +247,8 @@ def main() -> None:
         try:
             plan = sync_alerts(provider=provider, client=client, dry_run=args.dry_run)
         except AlertmanagerError as e:
-            # "the server is down" is an operational condition, not a bug. A stack
-            # trace here buries the one line that says which URL failed.
+            # An operational condition, not a bug: a stack trace buries the one line that
+            # says which URL failed.
             console.print(f"[red]{e}[/red]")
             raise SystemExit(1) from None
     else:

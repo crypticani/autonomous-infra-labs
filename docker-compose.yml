@@ -28,20 +28,12 @@ services:
     container_name: knowledge-copilot
     env_file:
       - .env
-    # Single worker on purpose -- two would run two alert-sync loops racing on the same
-    # writes. uvicorn defaults to one, so no flag is needed to get it.
+    # Single worker: two would race two alert-sync loops on the same writes.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${COPILOT_PORT:-7100}"]
     ports:
-      # Loopback only: nginx terminates TLS on the same host and proxies to it. Docker
-      # publishes ports via nat/PREROUTING, ahead of any filter/INPUT rule a host
-      # firewall adds, so the bind address is the control that actually holds here.
-      # A cloud NSG still filters before the NIC, but this is the layer under it.
+      # Loopback only; nginx terminates TLS on this host and proxies to it.
       - "127.0.0.1:${COPILOT_PORT:-7100}:${COPILOT_PORT:-7100}"
-    # log-analyzer is stateless and mounts nothing; this service has a corpus and an
-    # index. A bind mount keeps the HOST directory's uid rather than inheriting the
-    # image's, and the image runs as appuser (uid 100) -- so the container user is
-    # overridden to the host owner of chroma_data, which also lets the CLI and the
-    # container share one index. Override in .env if `id -u` is not 1000.
+    # Bind mounts keep the host uid. Override in .env if `id -u` is not 1000.
     user: "${KC_UID:-1000}:${KC_GID:-1000}"
     volumes:
       - ./services/knowledge-copilot/corpus:/app/corpus:ro
@@ -64,29 +56,17 @@ services:
     container_name: self-healing-agent
     env_file:
       - .env
-    # --workers 1 for a different reason than the copilot's: approvals._proposals is
-    # in-process memory, so a second worker means Slack's click can land on the worker
-    # that does not hold the proposal, and a valid Approve returns "expired or unknown".
+    # --workers 1: approvals._proposals is in-process, so a second worker would answer
+    # "expired or unknown" to a valid Slack Approve.
     command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${SHA_PORT:-7200}", "--workers", "1"]
     ports:
-      # Loopback only, same reasoning as the copilot: nginx terminates TLS on this host
-      # and proxies to it. Slack reaches /slack/interactive through nginx, never here.
       - "127.0.0.1:${SHA_PORT:-7200}:${SHA_PORT:-7200}"
-    # Same uid problem as chroma_data: a bind mount keeps the HOST directory's owner
-    # rather than inheriting the image's, and the image runs as appuser (uid 100).
     user: "${SHA_UID:-1000}:${SHA_GID:-1000}"
     volumes:
-      # The audit log is a safety control and has to outlive the container. Without
-      # this mount, "who approved that restart" is answerable only until the next
-      # `docker compose up`.
+      # The audit log is a safety control and has to outlive the container.
       - ./services/self-healing-agent/audit:/app/audit
-      # No cluster exists yet (the Week 3 blocker). When one does, either mount a
-      # kubeconfig here read-only, or run this service in-cluster and let
-      # k8s_client.get_apis() find the ServiceAccount token instead -- it already
-      # detects which case it is in. Day 20 picks one.
       # - ${KUBECONFIG:-~/.kube/config}:/home/appuser/.kube/config:ro
     extra_hosts:
-      # knowledge-copilot's /search-runbooks, and Alertmanager, both run on the host.
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
