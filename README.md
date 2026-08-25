@@ -27,6 +27,12 @@ exposure to the AI side — they build up the concepts from scratch, then walk t
 | [`docs/self-healing-agent.md`](./docs/self-healing-agent.md) | What a tool call actually is, why RAG's one-shot retrieval can't diagnose a live problem, and how an observe-think-act loop knows when to stop |
 | [`docs/security-triage.md`](./docs/security-triage.md) | Why AI triages scanner output instead of replacing scanners, why three scanners produce three disagreeing schemas, how a dedup key stays deterministic without a rule-id crosswalk between tools, and why a proposed fix is a deterministic diff plus a human rather than an auto-commit |
 
+And one document that spans all four: [`docs/case-studies.md`](./docs/case-studies.md) — each
+project written up as a short case study (problem → architecture → tradeoffs → results), with every
+number read from the service README it came from. Start there if you want the whole repo in one
+sitting rather than one service in depth. Also published at
+[blog.crypticani.dev](https://blog.crypticani.dev/four-ai-native-devops-services-in-30-days).
+
 ## Architecture
 
 ```text
@@ -214,6 +220,11 @@ This repository follows a scaffolded 30-day learning path.
 **Project 4 complete.**
 * **The finding:** **the CI for the service that gates CI had been red on every run since the day it was written** — Days 25, 26, 27 and 28, seven runs, never once green. Six `test_provider.py` Gemini tests fail on a runner because `genai.Client()` reads the environment at construction and raises without a key: locally `provider.py`'s `load_dotenv()` finds the repo's `.env`, and on a runner there is no `.env`. The suite was green on my machine every single time, which is precisely why nobody looked at the badge. `self-healing-agent/tests/conftest.py` has carried the one-line guard for this since Day 15 — `os.environ.setdefault("GEMINI_API_KEY", ...)` before provider is imported — and security-triage never inherited it because **it had no `conftest.py` at all** until Day 28 added one for the metrics helper. A shared fix does not propagate to a service that has nowhere to put it. The failure was also invisible in the one place it should have shouted: `build-and-push` is `needs: [lint-and-test]`, so every red run showed a *skipped* publish job rather than a failed one, and "skipped" reads like a deliberate condition.
 * **And:** the interesting design decisions were all about **what an eval is allowed to assert.** Local Ollama is not reproducible even at `temperature: 0` — Day 27 made two changes off eval movements that turned out to be pure batch variance — so asserting `priority == "high"` would flap, get ignored, and then get deleted. Each case declares a *band* instead: a floor on the findings that must never be downgraded, a ceiling on the noise that must never be inflated, and nothing where nothing is defensible. `needs_human` is then graded by which bound the case carries — declining a finding the repo says is serious is a miss, declining noise is conservative and fine — which has the property that matters: Day 23's 1.5b model, which declined all five findings it was shown while satisfying every guard, fails this eval outright. The same restraint decided the copilot's row: its eval **reports rather than gates**, because a regression bar picked before the baseline was measured is just a number chosen to pass.
+
+### Wrap-up
+
+* [X] **Day 29: Case studies** — [`docs/case-studies.md`](./docs/case-studies.md): all four projects as problem → architecture → tradeoffs → results, at roughly 400 words each, with every number read out of the service README that recorded it rather than from memory. Linked from the Explainers section above and published as a standalone page.
+* **The finding:** writing them side by side surfaced a spine none of the four READMEs can show on its own — **the refusal is the feature in all four services.** `answer_source: "none"`, `proposed_action: null`, `needs_human`, `incomplete: true`: each one is a legal way to decline, each was designed before the thing it guards, and two of the four evals only function *because* declining is gradeable — the self-healing agent's golden set is built so that always proposing and never proposing both score 2/4, and security-triage's bands are built so that Day 23's 1.5b model, which declined everything while satisfying every guard, fails outright. Reading the four in one sitting also cost three of them a stale test count, each contradicted by another line in the same file.
 
 ### Future Phases
 
