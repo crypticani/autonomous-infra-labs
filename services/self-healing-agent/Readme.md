@@ -427,7 +427,7 @@ forged one is rejected.
 
 ```bash
 cd services/self-healing-agent
-python -m pytest tests/ -q      # 119 passed
+python -m pytest tests/ -q      # 123 passed
 black --check .                 # clean
 ```
 

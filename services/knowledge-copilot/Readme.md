@@ -1078,7 +1078,7 @@ pull-request code. It went from decorative to load-bearing the moment this lande
 ## Testing
 
 ```bash
-python -m pytest tests/ -q     # 193 tests, ~20s, no network
+python -m pytest tests/ -q     # 197 tests, ~20s, no network
 ```
 
 Every test file is offline and deterministic — no embedding call and no model call belongs in a

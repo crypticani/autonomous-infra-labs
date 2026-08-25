@@ -901,7 +901,7 @@ by hand, so in practice it never fires and the graphs stay per-repo.
 
 ## `eval_triage.py` — the gate the test suite cannot be
 
-153 unit tests can be green while the model has quietly got worse, because **no unit test in this
+184 unit tests can be green while the model has quietly got worse, because **no unit test in this
 repo ever calls a model**. Day 27 is the worked example: moving `priority` below `exploitability`
 and `impact` in the schema inverted the judgments, and the only reason anybody noticed is that a
 full corpus happened to get read that afternoon. Nothing failed. This is that afternoon in one
@@ -1519,28 +1519,10 @@ declines), so it carries *some* signal about declining, and none about being rig
   same gap Day 1 found in log-analyzer and Day 7 closed with an explicit rubric.
 
   Sequencing matters here: fix context first, re-run, *then* the rubric. Doing both at once makes the
-  eval unable to say which one moved the number.
-
-- **A `RequestValidationError` handler that drops `input`.** Found while testing the body cap
-  through nginx: FastAPI's 422 includes the offending body in `detail[].input`, so a malformed
-  1.5 MB envelope came back as a 1.5 MB error. At `ST_MAX_BODY_BYTES=16777216` that is a 16 MiB
-  response to a caller who already has the data, landing in their Actions log. Not a security hole
-  -- the caller sent it -- but it is bandwidth amplification on the one endpoint whose callers are
-  other people's CI runners. One `@app.exception_handler(RequestValidationError)` that rewrites
-  each error to `{type, loc, msg}` fixes it.
-
-- **Context lines in the triage prompt.** `scanners.py` captures `context` from all three scanners
-  and `fixes.py` is the only module that reads it — `_format_finding` never sends it to the model.
-  The first live run made that visible: `bandit:B105` on `password = 'hunter2'` came back
-  `needs_human`, correctly, because all the model saw was "possible hardcoded password at
-  settings.py:3, LOW". It is indistinguishable from the `/var/run/secrets/.../token` false positive
-  that is case 8 of the eval set.
-
-  Not a free fix. Day 27 measured prompt at `368 + 70.5n` tokens, and ten context lines per finding
-  roughly triples the per-finding prompt cost. Wall clock is output-bound so latency moves less than
-  tokens do, but prompt eval on CPU is not nothing. It also changes what the eval means: the three
-  noise cases carry only a `max`, so a decline *passes* them, and 12/12 today cannot distinguish
+  eval unable to say which one moved the number. Sending context also changes what the eval
+  *measures*: the noise cases carry only a `max`, so a decline passes them, and no run can then tell
   "correctly triaged as noise" from "could not see it".
+
 - **Aggregating repeated same-rule findings** — a known ceiling, deliberately not built. Day 27 fixed
   the B101 flood by not scanning test files, which is the right fix for that case but not a general
   one: 7 `bandit:B104` and 6 `checkov:CKV2_GHA_1` findings survive, and for a human
