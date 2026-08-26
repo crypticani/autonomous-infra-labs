@@ -12,13 +12,18 @@ Each service here started as a learning exercise, but is built to a standard whe
 | [`services/knowledge-copilot`](./services/knowledge-copilot) | RAG service answering ops questions ("what's the usual fix for X") over runbooks, postmortems, and live alert/event data — now live in production, taking questions in Slack, with a measured similarity floor and bearer-token auth | ✅ Complete |
 | [`services/self-healing-agent`](./services/self-healing-agent) | Tool-calling agent that diagnoses K8s alerts using read-only tools (logs, alerts, deploy history) and proposes a fix. Write actions are gated behind human approval and hard blast-radius limits | ✅ Complete |
 | [`services/security-triage`](./services/security-triage) | Wraps existing scanners (Trivy, Checkov, Bandit) and uses an LLM to deduplicate, prioritize, and explain findings, then gates CI on one risk score. Proposes fixes as deterministic diffs — never auto-applies them. Live behind TLS, dogfooding itself on this repo's own pull requests, with a golden-priority eval that measures where its judgment is unreliable | ✅ Complete |
-| [`gateway`](./gateway) | Single FastAPI entrypoint tying the services above into one AI DevOps copilot | Planned |
+| [`services/gateway`](./services/gateway) | Single FastAPI entrypoint tying the four services above into one AI DevOps copilot. `POST /ask` takes a plain-English question and an LLM routes it to whichever service can answer, with the reply attributed to it — and two distinct ways to refuse: the model can say it cannot place the question, and the gateway can say the right service was found but the request lacks the data it needs. Aggregated `/health` reports every backend's own health, not just its own liveness | ✅ Complete |
 
 ## Explainers
 
-Each service has two documents: a README covering *what was built, how to run it, and what it
-scored*, and a companion explainer covering *why it works*. The explainers assume no prior
+Each of the four projects has two documents: a README covering *what was built, how to run it, and
+what it scored*, and a companion explainer covering *why it works*. The explainers assume no prior
 exposure to the AI side — they build up the concepts from scratch, then walk the code.
+
+The gateway has no explainer, and that is not an omission. It introduces no new AI concept: it is
+constrained decoding (`docs/log-analyzer.md`) and tool selection (`docs/self-healing-agent.md`)
+applied one layer up, so its reasoning lives in [its own README](./services/gateway/Readme.md)
+rather than being taught twice.
 
 | Doc | Covers |
 |---|---|
@@ -36,19 +41,27 @@ sitting rather than one service in depth. Also published at
 ## Architecture
 
 ```text
-                 ┌─────────────────────┐
-   alerts /      │                     │
-   logs / scans  │       gateway       │
-   ────────────▶ │   (FastAPI, auth)   │
-                 └──────────┬──────────┘
-                             │
-        ┌───────────┬────────┴────────┬───────────────┐
-        ▼           ▼                 ▼                ▼
-   log-analyzer  knowledge-      self-healing      security-triage
-   (LLM call)    copilot (RAG)   agent (tools +     (scanner output
-                                 approval gate)      + LLM triage)
-
+   a question in English         ┌──────────────────────────────┐
+   + whatever it needs           │           gateway            │
+   attached (a log, an alert,    │  POST /ask — LLM intent      │
+   a scan envelope)              │    router, one edge token    │
+   ───────────────────────────▶  │  GET  /health — aggregated   │
+                                 │  /s/{service}/… — passthrough│
+                                 └───────────────┬──────────────┘
+                                                 │
+                             ┌───────────────────┴──┬──────────────────┐
+                             │                      │                  │
+   ┌─────────────────┬───────┴─────────┬────────────┴──────┬───────────┴────────┐
+   ▼                 ▼                 ▼                   ▼                    ▼
+ log-analyzer   knowledge-        self-healing       security-triage      "I can't place
+ (LLM call)     copilot (RAG)     agent (tools +     (scanner output       this" / "that's
+                                  approval gate)     + LLM triage)         log-analyzer's,
+                                                                           attach the log"
 ```
+
+The fifth arrow is the point. Only one of the four answers a bare sentence — the other three need
+material a question cannot carry — so the router's job is to name a service *and* say what it still
+needs, rather than to invent a log or an alert to send it.
 
 Every service exposes `/metrics` for Prometheus (token cost, latency, error rate — not just uptime) and ships with a small eval harness so behavior is tested, not just demoed once.
 
@@ -226,9 +239,29 @@ This repository follows a scaffolded 30-day learning path.
 * [X] **Day 29: Case studies** — [`docs/case-studies.md`](./docs/case-studies.md): all four projects as problem → architecture → tradeoffs → results, at roughly 400 words each, with every number read out of the service README that recorded it rather than from memory. Linked from the Explainers section above and published as a standalone page.
 * **The finding:** writing them side by side surfaced a spine none of the four READMEs can show on its own — **the refusal is the feature in all four services.** `answer_source: "none"`, `proposed_action: null`, `needs_human`, `incomplete: true`: each one is a legal way to decline, each was designed before the thing it guards, and two of the four evals only function *because* declining is gradeable — the self-healing agent's golden set is built so that always proposing and never proposing both score 2/4, and security-triage's bands are built so that Day 23's 1.5b model, which declined everything while satisfying every guard, fails outright. Reading the four in one sitting also cost three of them a stale test count, each contradicted by another line in the same file.
 
-### Future Phases
+* [X] **Day 30: The gateway** — [`services/gateway`](./services/gateway): FastAPI in front of all four, `POST /ask` routing a plain-English question to whichever service can answer it, aggregated `/health` reporting each backend's own status rather than its own liveness, and a `/s/{service}/{path}` passthrough that swaps one edge token for each backend's own. 81 tests, **593 across the repo**, fifth row in `eval_all.py`.
+* **The finding:** **the endpoint I planned on Day 22 did not survive reading the four request models.** All three of the plan's example questions die on the same fact — *only one of the four services can answer a bare sentence.* log-analyzer needs `raw_log`, the agent needs an `alert` dict, triage needs a scan envelope; the copilot alone takes a question. So *"why did checkout start 500ing at 3am"* routes to log-analyzer perfectly well and then has nothing to send it. The tempting fix is to let the router synthesise the body, and refusing to is the whole design — the agent has write tools behind that `alert`, and a router that invents evidence for a thing that acts on evidence is the exact failure four weeks of guards exist to prevent. What came out instead is **two refusals with different owners**: `unroutable` is the model's call, and `needs_input` is `if backend.needs and not request.attachment` — a dict lookup that never calls a model and is therefore right every time. Pushing a decision out of the model and into a lookup was available here and is almost never the first idea.
+* **And a bug worth writing down:** the passthrough shipped taking `body: Any = None`, and FastAPI reads an un-annotated `Any` from the **query string** — so every POST through the proxy forwarded an *empty body* to a backend that then answered 422 about a field the caller had definitely sent. It survived being written *and* being tested, because the test I wrote first was a GET, which passes either way. `Body(default=None)` is the fix; the lesson is that a proxy test that never sends a body is not a proxy test.
 
-* [ ] **Gateway** — unified entrypoint across all four services.
+### What's next
+
+The challenge is over; the repo is not finished, and these are the honest next items rather than a wish list.
+
+**Carried, with a required order:**
+
+* [ ] **Send `Finding.context` to the triage prompt, re-run the eval, *then* write the severity rubric.** That order specifically, so the eval can attribute the movement. Day 28's eval scored 1/12 and named two distinct defects: the model said *"insufficient context to judge exploitability and impact"* five times unprompted (a missing-input problem — `_format_finding` never sends the context lines `scanners.py` already captures), and nothing anywhere defines what `critical` means for a scanner finding (a missing-rubric problem, the same gap Day 1 found in log-analyzer). Fixing both at once would leave neither measured.
+* [ ] **Measure the gateway's router and set `GW_OLLAMA_MODEL` from the result.** It ships `qwen2.5:7b-instruct` as the *fail-safe* default, not a measured one. `eval_router.py --model qwen2.5-coder:1.5b` is one command and decides it.
+* [ ] **Prometheus/Alertmanager auto-detection in the self-healing agent**, deferred from Day 21 and still deferred.
+
+**From the challenge doc's own Beyond-Day-30 list, reordered by what this repo actually learned:**
+
+* [ ] **Harden these systems against prompt injection.** Now the most obvious gap. Scanner output, log text and alert annotations are all attacker-influenced strings that reach a model, and the gateway made it worse by design: `/ask` puts 200 characters of caller-supplied attachment into the routing prompt. Nothing in this repo defends that yet.
+* [ ] **Turn the Day 18 audit log into SOC2-style compliance evidence.** The record already exists and is append-only; what is missing is the reporting layer over it.
+* [ ] **Cost forecasting from the same LLM+metrics pattern.** Day 27 built the token plumbing through all four provider seams and fitted a curve that predicted a nine-call run to within 0.85%, so the input to this is already instrumented.
+* [ ] **Fine-tune a small open model for triage.** Interesting precisely because Day 23 proved 1.5b cannot do this job untuned — which makes it the one place a fine-tune has a measurable before.
+* [ ] **Multi-agent orchestration — a planner delegating to specialists.** Last deliberately. The gateway is the honest one-layer version of it, and there is no evidence yet that a planner beats a router at this scale.
+
+**Not planned:** a UI, a queue, or response caching. They would make the demo better and teach nothing.
 
 ## License
 

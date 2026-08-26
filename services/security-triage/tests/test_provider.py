@@ -207,7 +207,7 @@ def test_counters_are_per_instance_not_shared():
 
 
 def test_the_service_specific_ollama_host_wins_over_the_shared_one(monkeypatch):
-    """Day 28. appsrv runs all four services off one shared `.env`, and only this one's
+    """Day 28. appsrv runs all five services off one shared `.env`, and only this one's
     backend moved to a laptop over Tailscale -- so editing the shared name would have
     silently taken log-analyzer and knowledge-copilot with it, onto a host that is asleep
     most of the time. The precedence is the whole point of the variable.

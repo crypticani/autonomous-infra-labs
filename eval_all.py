@@ -1,19 +1,21 @@
 """Every service's eval, one command, one table.
 
 The tests can be green while the model has quietly got worse, because no unit test here
-ever calls one. Each service carries an eval that does; this runs all four.
+ever calls one. Each service carries an eval that does; this runs all five.
 
     python eval_all.py                          # everything
     python eval_all.py security-triage          # one service
     python eval_all.py --list
 
-Subprocesses, not imports: `app`, `provider` and `errors` each exist three times over in
+Subprocesses, not imports: `app`, `provider` and `errors` each exist five times over in
 this repo and would collide in one process. The contract is one line -- each eval prints
 `EVAL_RESULT {"passed": n, "total": n}` last, and its exit status is the verdict. An eval
 that prints no such line still gets its row and a `-`.
 
-**This needs the backends up.** Three of the four call a real model and the fourth needs
-a populated Chroma index, so a run is minutes, not seconds.
+**This needs the backends up.** Four of the five call a real model and the other needs a
+populated Chroma index, so a run is minutes, not seconds. The gateway's eval is the one
+exception to "backends up": it grades routing, which never reaches a backend, so it needs
+only the router's own model.
 """
 
 import argparse
@@ -42,7 +44,7 @@ class Eval:
     backend: str
 
 
-# The `measures` column is not decoration: the four evals grade different things, and bare
+# The `measures` column is not decoration: the five evals grade different things, and bare
 # pass counts would imply they are comparable.
 EVALS = [
     Eval(
@@ -70,13 +72,21 @@ EVALS = [
         measures="priority bands",
         backend="ollama",
     ),
+    Eval(
+        service="gateway",
+        # Grades the route the gateway would act on, so the confidence floor is inside
+        # what is being measured rather than applied to the score afterwards.
+        command=[sys.executable, "eval_router.py"],
+        measures="intent routes, incl. declines",
+        backend="ollama",
+    ),
 ]
 
 
 def run(spec: Eval, verbose: bool) -> dict:
     """One eval, in its own service directory.
 
-    Output is captured rather than streamed, because four rich tables interleaved is
+    Output is captured rather than streamed, because five rich tables interleaved is
     unreadable -- but a failing eval prints its whole output below the table.
     """
     workdir = ROOT / "services" / spec.service
@@ -161,7 +171,7 @@ def report(results: list[dict]) -> bool:
 def selftest() -> int:
     """The parser, checked without a backend.
 
-    RESULT_LINE is the whole contract between this file and four others, and it breaks
+    RESULT_LINE is the whole contract between this file and five others, and it breaks
     quietly: a service that stops emitting the line still exits 0 and the table reads `-`
     forever. Runs in milliseconds.
     """
@@ -191,7 +201,7 @@ def main() -> int:
     parser.add_argument(
         "services",
         nargs="*",
-        help="service names to run; all four if omitted",
+        help="service names to run; all five if omitted",
     )
     parser.add_argument("--list", action="store_true", help="show the evals and exit")
     parser.add_argument(

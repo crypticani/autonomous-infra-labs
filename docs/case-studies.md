@@ -282,7 +282,7 @@ model's reasoning order. Every time I swapped a textual guarantee for a structur
 stopped coming back.
 
 **The eval is the product.** Not one unit test in this repo calls a model, so 512 of them can be
-green while quality quietly rots. `python eval_all.py` runs all four evals and prints one table,
+green while quality quietly rots. `python eval_all.py` runs all five evals and prints one table,
 which is the closest thing I have to a checkable version of "production-ready".
 
 ---
@@ -304,6 +304,14 @@ I'm leaving them red. The first case study on this page is an eval that passed o
 re-run, and had been measuring nothing for three weeks — a green number nobody re-runs is a record
 of one afternoon. A red one with a cause written next to it is a work queue.
 
-Next is a gateway in front of all four, routing a plain-English question to whichever service can
-answer it. After that, the two triage fixes: context lines first, then the rubric, in that order, so
-the eval can tell me which one moved the number.
+Since writing that, the gateway in front of all four is built — and it taught me something about
+these four services I had not noticed writing them up separately. Routing a plain-English question
+to whichever one can answer it turns out to be the easy half. The hard half is that **only one of
+the four can answer a bare sentence at all**: the copilot takes a question, and the other three need
+a log, an alert, or a scan envelope that no amount of English contains. So the router has two ways
+to refuse rather than one — it can say it cannot place the question, and the gateway can say the
+right service was found but the request has nothing to send it. Which is the same shape as every
+refusal on this page, arrived at from a completely different direction.
+
+After that, the two triage fixes: context lines first, then the rubric, in that order, so the eval
+can tell me which one moved the number.

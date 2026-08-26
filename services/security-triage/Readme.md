@@ -958,7 +958,7 @@ the first real run is what says whether the model clears them — that number go
 ## Every service's eval, one command
 
 ```bash
-python eval_all.py                    # all four, from the repo root
+python eval_all.py                    # all five, from the repo root
 python eval_all.py security-triage    # one
 python eval_all.py --selftest         # the runner's own parsing; needs no backend
 ```
@@ -1030,7 +1030,7 @@ rather than quietly triaging against something unexpected.
 
 ### `ST_OLLAMA_BASE_URL`, and why it had to exist
 
-The compose deploy runs all four services off **one shared `.env`**, and this is the only one whose
+The compose deploy runs all five services off **one shared `.env`**, and this is the only one whose
 model backend is a laptop over Tailscale. Editing the shared `OLLAMA_BASE_URL` to point there would
 have taken log-analyzer and knowledge-copilot along with it, onto a host that is asleep most of the
 time, for no reason either of them asked for — the deploy would have "worked" and quietly broken two
@@ -1095,7 +1095,7 @@ server {
 produced a 404 and neither 404 said which.
 
 **First: the wrong upstream port**, which returned `{"detail":"Not Found"}` -- the app's own JSON, so
-nginx was plainly proxying. That body is ambiguous here in a way it would not be elsewhere: all four
+nginx was plainly proxying. That body is ambiguous here in a way it would not be elsewhere: all five
 services in this repo are FastAPI, and every one answers `{"detail":"Not Found"}` for an unknown
 path, so pointing at 7100 or 7200 gets a *sibling service's* 404, byte-identical to this one's. A
 trailing slash on `proxy_pass` produces the same body by a different route -- `proxy_pass

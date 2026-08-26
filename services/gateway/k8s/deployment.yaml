@@ -1,0 +1,128 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: gateway
+  labels:
+    app: gateway
+spec:
+  # One replica is a constraint, not a starting point: the rate-limit buckets and the
+  # Prometheus registry are both process-local. Recreate, because RollingUpdate would
+  # briefly run two and halve the effective rate limit.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "7400"
+        prometheus.io/path: "/metrics"
+    spec:
+      # CKV_K8S_38. This service talks to four HTTP endpoints and never to the Kubernetes
+      # API -- the one that does is the self-healing agent, and it has its own token.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        # Matches the numeric USER in the Dockerfile; a name would leave the kubelet unable
+        # to verify non-root and the pod would never start.
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: ghcr.io/crypticani/autonomous-infra-labs/gateway:latest
+          ports:
+            - name: http
+              containerPort: 7400
+          envFrom:
+            - configMapRef:
+                name: gateway-config
+          env:
+            # Not optional: without tokens this endpoint fronts all four services to
+            # anyone who finds it, so a missing Secret should fail the pod rather than
+            # degrade it.
+            - name: GW_API_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: GW_API_TOKENS
+            # The tokens the gateway presents *to* the backends, not the one it checks at
+            # the edge. Optional individually: a backend with auth disabled needs none, and
+            # the gateway sends no Authorization header rather than an empty Bearer.
+            - name: KC_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: KC_API_TOKEN
+                  optional: true
+            - name: SHA_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: SHA_API_TOKEN
+                  optional: true
+            - name: ST_API_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: ST_API_TOKENS
+                  optional: true
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: gateway-secrets
+                  key: GEMINI_API_KEY
+                  optional: true
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            # Lighter than the four behind it, and that is the whole shape of this service:
+            # one small model call and then waiting on somebody else's socket.
+            limits:
+              memory: "256Mi"
+              cpu: "300m"
+          volumeMounts:
+            # readOnlyRootFilesystem with nowhere writable is how a Python service dies on
+            # its first tempfile.
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            # /health answers 200 while reporting `degraded`, deliberately. Every backend
+            # being down is a normal state here: /ask still routes and still declines
+            # correctly, and pulling this pod out of service would only hide the one
+            # endpoint that can say which of the four is broken.
+            #
+            # timeoutSeconds clears GW_HEALTH_TIMEOUT: the fan-out is concurrent, so the
+            # endpoint's worst case is one backend timeout plus overhead, not four.
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}

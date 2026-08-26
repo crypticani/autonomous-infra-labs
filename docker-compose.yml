@@ -75,3 +75,52 @@ services:
       timeout: 30s
       retries: 3
       start_period: 10s
+
+  security-triage:
+    build:
+      context: ./services/security-triage
+      dockerfile: Dockerfile
+    image: security-triage:latest
+    container_name: security-triage
+    env_file:
+      - .env
+    # --workers 1 for three reasons here: _runs holds verdicts, _starts holds rate-limit
+    # buckets, and the Prometheus registry is per-process.
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${ST_PORT:-7300}", "--workers", "1"]
+    ports:
+      - "127.0.0.1:${ST_PORT:-7300}:${ST_PORT:-7300}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:${ST_PORT:-7300}/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 10s
+
+  gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    image: gateway:latest
+    container_name: gateway
+    env_file:
+      - .env
+    # --workers 1: _starts holds the per-token rate-limit buckets and the Prometheus
+    # registry is per-process.
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${GW_PORT:-7400}", "--workers", "1"]
+    ports:
+      - "127.0.0.1:${GW_PORT:-7400}:${GW_PORT:-7400}"
+    # No depends_on, deliberately. The gateway is correct with every backend down: /ask
+    # still routes and still declines, and /health is the endpoint that says which of the
+    # four is missing. Waiting on them would delay the one service that can report on them.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:${GW_PORT:-7400}/health"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 10s

@@ -77,7 +77,7 @@ class OllamaProvider(BaseTriageProvider):
         # byte-identical explanations and needs_human for everything, every guard
         # satisfied. 7b is right at ~3.3x the wall clock.
         self.model_name = os.getenv("ST_OLLAMA_MODEL", "qwen2.5-coder:7b")
-        # Service-specific first: the deploy runs all four services off one shared .env
+        # Service-specific first: the deploy runs all five services off one shared .env
         # and only this one's backend moved to a laptop, so editing the shared name would
         # silently take the other two with it. The fallback means a host where everything
         # does share a backend needs no new variable.

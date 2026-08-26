@@ -1,0 +1,125 @@
+[
+  {
+    "label": "asks what a log line means",
+    "question": "What does this OOMKilled kubelet message actually mean?",
+    "attachment": "Aug 25 03:14:02 kubelet[912]: Memory cgroup out of memory: Killed process 4471 (node) total-vm:2118440kB anon-rss:1048320kB",
+    "expect": "log-analyzer"
+  },
+  {
+    "label": "asks for a severity from raw output",
+    "question": "Classify how serious this error output is and what caused it.",
+    "expect": "log-analyzer"
+  },
+  {
+    "label": "a repeating log line, no other context",
+    "question": "This line keeps repeating in the output, what is it telling me?",
+    "expect": "log-analyzer"
+  },
+  {
+    "label": "asks the documented procedure",
+    "question": "What is our documented procedure for draining a node before maintenance?",
+    "expect": "knowledge-copilot"
+  },
+  {
+    "label": "asks what the runbook says",
+    "question": "What does the runbook say to do when the disk fills up on a database host?",
+    "expect": "knowledge-copilot"
+  },
+  {
+    "label": "asks about our own definitions",
+    "question": "What is our incident severity scale, and what counts as a SEV-2?",
+    "expect": "knowledge-copilot"
+  },
+  {
+    "label": "keyword trap: runbook question using a log word",
+    "question": "What does our runbook say we should do about OOMKilled pods?",
+    "expect": "knowledge-copilot"
+  },
+  {
+    "label": "keyword trap: log question about the same word",
+    "question": "This pod was OOMKilled -- what is the kubelet message telling me happened?",
+    "expect": "log-analyzer"
+  },
+  {
+    "label": "a firing alert, asked what to do",
+    "question": "KubePodCrashLooping is firing in the sandbox namespace. What should be done about it?",
+    "attachment": "{\"labels\": {\"alertname\": \"KubePodCrashLooping\", \"namespace\": \"sandbox\", \"pod\": \"checkout-7d9f\"}}",
+    "expect": "self-healing-agent"
+  },
+  {
+    "label": "asks for a diagnosis against the cluster",
+    "question": "Diagnose this firing alert against the cluster and propose a remediation.",
+    "expect": "self-healing-agent"
+  },
+  {
+    "label": "asks for a cluster change",
+    "question": "The sandbox deployment has fewer replicas than it should. Can something scale it back up?",
+    "expect": "self-healing-agent"
+  },
+  {
+    "label": "discrimination pair A: what does the log mean",
+    "question": "The logs say the deployment is unhealthy. What does that log line actually mean?",
+    "expect": "log-analyzer"
+  },
+  {
+    "label": "discrimination pair B: what do I do about it",
+    "question": "The logs say the deployment is unhealthy. What should I do about the deployment?",
+    "expect": "self-healing-agent"
+  },
+  {
+    "label": "asks for a CI verdict on scan output",
+    "question": "Here is the scanner output for this branch. Should CI block the merge?",
+    "attachment": "{\"repo\": \"git@github.com:crypticani/autonomous-infra-labs\", \"scans\": {\"bandit\": {\"results\": []}}}",
+    "expect": "security-triage"
+  },
+  {
+    "label": "asks to rank findings by real impact",
+    "question": "Rank these Trivy and Bandit findings by how much they actually matter.",
+    "expect": "security-triage"
+  },
+  {
+    "label": "asks for a risk score",
+    "question": "Give me a risk score for these scan results and tell me which ones to fix first.",
+    "expect": "security-triage"
+  },
+  {
+    "label": "the plan's own example: is this safe to ship",
+    "question": "Is this Dockerfile safe to ship to production?",
+    "expect": "security-triage"
+  },
+  {
+    "label": "too vague: a symptom and nothing else",
+    "question": "Something is wrong with checkout.",
+    "expect": null
+  },
+  {
+    "label": "too vague: safe how, and safe what",
+    "question": "Is this actually safe or not?",
+    "expect": null
+  },
+  {
+    "label": "too vague: no subject at all",
+    "question": "Can you just fix it for me please?",
+    "expect": null
+  },
+  {
+    "label": "too vague: a time and no question",
+    "question": "What happened last night around three in the morning?",
+    "expect": null
+  },
+  {
+    "label": "not an ops question at all",
+    "question": "How do I make the whole thing faster in general?",
+    "expect": null
+  },
+  {
+    "label": "genuinely two services, either or neither is defensible",
+    "question": "This alert has been firing for an hour and I want to know what the pod logs say about it.",
+    "expect": ["log-analyzer", "self-healing-agent", null]
+  },
+  {
+    "label": "a security question that is really a runbook question",
+    "question": "What is our documented process for handling a leaked credential?",
+    "expect": ["knowledge-copilot", null]
+  }
+]

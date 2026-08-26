@@ -1,0 +1,496 @@
+# Service: Gateway
+
+One address in front of the other four, and one endpoint that decides which of them a
+plain-English question belongs to.
+
+The reverse-proxy half of this is not interesting — nginx already does it, and I wrote about
+twenty lines of it. The interesting half is `POST /ask`: a sentence goes in, and a model
+picks which of four services can answer it, with the answer coming back attributed to
+whichever one produced it. It is Day 2's structured-output lesson and Week 3's
+tool-selection lesson applied one layer up, and it is what makes four ports read as one
+product.
+
+It is also where the four services stop being four services I built and start being a thing
+with a front door, which is the only reason Day 30 is a build day and not a victory lap.
+
+## The problem the plan didn't survive
+
+I planned this endpoint on Day 22 with three example questions. Reading the four request
+models before writing any code killed all three.
+
+| service | endpoint | body | answerable from a sentence? |
+|---|---|---|---|
+| knowledge-copilot | `POST /ask-runbook` | `{question, k}` | **yes** |
+| log-analyzer | `POST /analyze-log` | `{raw_log}`, min 15 chars | no — needs the log |
+| self-healing-agent | `POST /diagnose` | `{alert: dict}` | no — needs the alert |
+| security-triage | `POST /triage` | `{repo, scans}` | no — needs scanner output |
+
+*"Why did checkout start 500ing at 3am"* routes to log-analyzer perfectly well and then has
+nothing to send it: log-analyzer reads log text it is handed and cannot fetch, search or
+tail anything. *"Is this Dockerfile safe to ship"* is security-triage's question and
+security-triage reasons about scanner output rather than running scanners. Exactly one of my
+four services answers a bare question.
+
+The tempting fix is to let the router fill in the body — extract an `alert` dict from the
+prose, synthesise a plausible `raw_log`. I did not build that, and refusing to is the whole
+design. The self-healing agent has write tools behind that `alert`. A router that invents
+evidence to hand to an agent that acts on evidence is not a convenience, it is the failure
+this repo has spent four weeks building guards against.
+
+So the router never fabricates a body. It says which service, and it says what to attach.
+
+## The split that makes it honest
+
+The model decides **which service**. Plain Python decides **whether the request can
+proceed**. There are exactly two refusals here and only one of them can be a model's fault:
+
+```
+"I don't know which of these you want"    <- router.py, the model's call, as service "none"
+"I know, but you didn't send the data"    <- app.py, a dict lookup, cannot be wrong
+```
+
+That second one is the part I like. `needs_input` is not a judgment — it is
+`if backend.needs and not request.attachment`. It never calls a model, it never guesses, and
+it is right every single time. Pushing a decision out of the model and into a lookup is
+almost always available and almost never the first idea.
+
+The first one is Day 23's lesson one layer up. A 1.5b model satisfied every guard in triage
+and produced five byte-identical explanations with `needs_human` on everything. What made
+triage's confident answers worth reading afterwards was that declining was a legal move —
+so `none` is a member of the router's enum, not an error path.
+
+## `backends.py` — one table, three readers
+
+Each service is described once, and three things read the description: the router prompt is
+generated from `answers`, the needs-check reads `needs`, and the proxy reads `url()` and
+`token()`.
+
+```python
+Backend(
+    name="log-analyzer",
+    answers=(
+        "Reads raw log text and returns a structured diagnosis: severity, error type, "
+        "root cause and a suggested fix. It analyses log text it is handed and cannot "
+        "fetch, search or tail logs itself, so the log must be supplied."
+    ),
+    path="/analyze-log",
+    url_env="GW_LOG_ANALYZER_URL",
+    default_url="http://log-analyzer:7000",
+    token_env="",
+    needs="raw_log",
+    hint="attach the log text itself as `attachment`",
+    body=lambda question, attachment: {"raw_log": attachment},
+)
+```
+
+`answers` is prompt text, so it is written for a model rather than for me — and every entry
+names what its service needs, because the model's classification and the code's needs-check
+have to agree about that or the two halves of a decline contradict each other.
+
+Two details that are less obvious than they look:
+
+**`token()` splits on comma and takes the first.** `ST_API_TOKENS` is plural because triage
+issues one per onboarded repo; `KC_API_TOKEN` and `SHA_API_TOKEN` are singular. A singular
+value contains no comma, so splitting is a no-op on it — one code path covers both shapes
+and there is no per-backend flag saying which to expect.
+
+**Triage's `body` forwards the attachment unchanged.** `scan.sh` already emits exactly the
+envelope `POST /triage` takes, `repo` and all. Re-assembling one here would only have been a
+chance to assemble it differently.
+
+**`url()` is read per call, not frozen at import.** The sibling services read their config
+once at import and report it on `/health`, which is right for a policy value somebody might
+have got wrong. A backend address is not policy — it is the difference between a test
+pointing at a stub and a container pointing at compose DNS, and an import-time read makes
+the first of those need `object.__setattr__` on a frozen dataclass.
+
+## `router.py` — the schema is the guard, not the validator
+
+```python
+NONE = "none"
+ServiceName = Literal[backends.NAMES + (NONE,)]
+
+class Route(BaseModel):
+    reason: str = Field(max_length=200, ...)
+    service: ServiceName
+    confidence: float = Field(ge=0.0, le=1.0)
+```
+
+Three decisions in nine lines, and all three are things I got wrong somewhere earlier in the
+month.
+
+**`none` is an enum member, not a nullable field.** `Literal[...] | None` compiles to a
+JSON-schema `anyOf`, and `anyOf` is the part of grammar-constrained decoding least likely to
+survive a backend change. Built from `backends.NAMES`, a flat five-value enum comes out as
+one `"enum": [...]` that Ollama's `format` and Gemini's `response_schema` handle identically:
+
+```json
+{"enum": ["knowledge-copilot", "log-analyzer", "self-healing-agent",
+          "security-triage", "none"], "type": "string"}
+```
+
+An invented service name is therefore not validated away after the fact — it is
+unrepresentable. And because the enum is generated from the table, a fifth backend cannot be
+added without the model being allowed to name it, or named by the model unless it is in the
+table.
+
+**Field order is behaviour.** Day 27 found this the expensive way in triage: moving
+`priority` below `exploitability` and `impact` inverted judgments and nothing failed.
+Generation runs left to right, so `reason` first means the service name is produced *after*
+the sentence explaining it — the explanation is a premise. Reverse the two and the model
+picks first and writes whatever justifies the pick, which reads identically and is worth
+nothing.
+
+**`max_length=200` on `reason` is enforced, not requested.** Day 26 asked the prompt for
+"one short sentence" and shipped 270-character paragraphs for a month.
+
+### The confidence floor, and why the prompt doesn't mention it
+
+`GW_MIN_CONFIDENCE=0.6`. Below it the gateway declines whatever the model named — the
+backstop for the failure mode a confidence field exists to catch, which is a model that
+picks *something* rather than nothing.
+
+The prompt tells the model that a low score means the gateway will decline. It does not tell
+it the number. Name a threshold to a model and you get a model that reports one point above
+it, and then the floor is measuring its own instruction. There is a test asserting the number
+does not appear in the prompt, because that is exactly the kind of helpful edit a later me
+would make.
+
+### Attachments as routing evidence
+
+The router sees the first 200 characters of any attachment. A JSON alert is nearly proof
+it's the agent's; a scan envelope is nearly proof it's triage's. That signal is entirely in
+the first couple of hundred bytes, and sending a 16 MiB scan envelope to a classifier would
+be paying LLM prices to re-read what a dict lookup already knows.
+
+## `app.py` — five outcomes, and which of them are 200s
+
+| outcome | HTTP | when |
+|---|---|---|
+| `answered` | 200 | backend returned 200; its body is `answer` |
+| `accepted` | 200 | backend returned 202 — triage only — plus a `poll` path |
+| `needs_input` | 200 | service known, `backend.needs` unsatisfied |
+| `unroutable` | 200 | `service: "none"`, or confidence under the floor |
+| `failed` | the backend's own | backend unreachable or errored |
+
+The two refusals are 200s, and that is a deliberate call rather than laziness. A declared
+refusal being a field inside a successful response is already how two services here behave:
+triage returns `needs_human` as a priority inside a 200, and the copilot returns
+`grounded: false` the same way. `outcome` is the contract. A backend *failure* is a
+different thing and does surface as the backend's real status code — a 422 means the
+attachment was wrong and a 429 means try later, and flattening both to 502 throws away the
+only instruction the caller could act on.
+
+`service`, `confidence` and `reason` ride on **every** outcome, successes included. A router
+you cannot second-guess after the fact is one whose mistakes are invisible, and its
+confident answers are only worth something if a wrong route is legible next to them.
+
+```jsonc
+// POST /ask {"question": "why did checkout start 500ing at 3am"}
+{
+  "outcome": "needs_input",
+  "service": "log-analyzer",
+  "confidence": 0.95,
+  "reason": "asks why a service returned errors, which is a log question",
+  "detail": "log-analyzer can answer this, but attach the log text itself as `attachment`",
+  "needs": "raw_log",
+  "answer": null
+}
+```
+
+Send the same question again with the log attached and it comes back `answered`, with
+`attributed_to: "log-analyzer POST /analyze-log"`.
+
+### The edge controls
+
+`GW_API_TOKENS` is plural for the same reason triage's is: one token per caller, so
+revoking a leaked one is a list edit rather than a rotation everybody has to be told about.
+
+The 16 MiB body cap is middleware on `Content-Length`, not a `Depends` guard — FastAPI
+parses the body before it solves dependencies, so a dependency-level cap fires after the
+megabytes it exists to refuse are already dicts. It matches triage's cap exactly, because
+the same scan envelope arrives here as an `attachment` and is then forwarded there; a
+smaller number at the edge would make the gateway refuse bodies the service behind it
+accepts.
+
+The rate limit is 60 asks/hour per token, against triage's 5. A human is typing these. It
+exists at all because `/ask` spends a model call *before* any backend's own limit gets a
+say, so without it one valid token can burn the router freely.
+
+### Everything is `def`, not `async def`
+
+log-analyzer's own comment is the reason, written on Day 3 and still correct: the provider
+clients are blocking, so a blocking call inside `async def` stalls FastAPI's event loop and
+freezes health checks and metrics along with it, while a plain `def` gets offloaded to
+starlette's threadpool. That decision is why this service uses `requests` throughout and
+`ThreadPoolExecutor` for the health fan-out rather than pulling in a second HTTP client.
+`httpx` is in `requirements.txt` for `TestClient` only, same as in three of the four
+siblings.
+
+## The passthrough
+
+```
+GET|POST|PUT|PATCH|DELETE  /s/{service}/{path}
+```
+
+One edge token in, each backend's own token out. No model, no routing, no rewriting — this
+is what a caller uses when it already knows which service it wants, which is every CI job.
+
+```bash
+curl -sS -H "Authorization: Bearer $GW_TOKEN" \
+  https://gw.example.dev/s/security-triage/triage/9fd2c1a4b0e7 | jq .risk
+```
+
+Under `/s/` rather than at the root so it can never shadow `/ask`, `/health` or `/metrics`.
+A bare `/{service}/{path}` would work today and depend on route declaration order to keep
+working, which is a thing to discover during an incident.
+
+**It shipped with a bug I want written down**, because it is a good one. The handler
+originally took `body: Any = None`. FastAPI reads an un-annotated `Any` from the **query
+string**, not the body — so every POST through the proxy forwarded an empty body to a
+backend that then answered 422 about a field the caller had definitely sent. `Body(default=
+None)` is the fix. What makes it worth a paragraph is that my first test used a GET, which
+passes either way; the bug survived being written *and* tested and only died when I added a
+POST case. A proxy test that never sends a body is not a proxy test.
+
+## Aggregated `/health`
+
+Unauthenticated, so the container's own `HEALTHCHECK` can run it. It reports every
+backend's own health rather than this process's liveness — a gateway that says `healthy`
+while three of the four services behind it are down is reporting on the wrong thing.
+
+The shape, with one of each state in it:
+
+```jsonc
+{
+  "status": "degraded",
+  "provider": "ollama",
+  "model": "qwen2.5:7b-instruct",
+  "auth": "2 token(s)",
+  "policy": { "min_confidence": 0.6, "max_asks_per_hour": 60, ... },
+  "backends": [
+    {"service": "log-analyzer",       "status": "healthy",     "http": 200,  "latency_ms": 6,  "issues": []},
+    {"service": "knowledge-copilot",  "status": "degraded",    "http": 200,  "latency_ms": 41,
+     "issues": ["collection 'runbooks' is empty; run ingest.py"]},
+    {"service": "self-healing-agent", "status": "unreachable", "http": null, "latency_ms": 5001,
+     "issues": ["HTTPConnectionPool(host='self-healing-agent', port=7200)..."]},
+    {"service": "security-triage",    "status": "healthy",     "http": 200,  "latency_ms": 9,  "issues": []}
+  ],
+  "issues": ["knowledge-copilot is degraded", "self-healing-agent is unreachable"]
+}
+```
+
+Four things here I would get wrong if I wrote it again quickly.
+
+**It pings the router's own model backend too, not just the four services.** Constructing a
+provider does no I/O, so without an `/api/tags` call this endpoint reports a healthy router
+while Ollama is unreachable — and the caller finds out as a 503 from `/ask` instead. The
+copilot's `/health` has carried this check since Day 12 and log-analyzer's does it too; I
+left it out of the first version of this file and only noticed when I went to write the
+run-it instructions. It matters more here than in either sibling, because the laptop hosting
+Ollama is *expected* to be asleep — "unreachable model" is a normal state, so it has to be
+legible rather than a surprise. The same call catches a `GW_OLLAMA_MODEL` that is set to
+something plausible and not pulled, which otherwise 502s every `/ask` while the pod looks
+perfectly healthy.
+
+**It believes each backend's own word rather than its status code.** All four of these
+answer 200 while calling themselves `degraded` — that is the case that matters, and a
+status-code check is exactly the check that misses it.
+
+**The fan-out is concurrent.** Sequentially this would be four `GW_HEALTH_TIMEOUT`s, which
+is long enough to fail the container healthcheck it exists to serve. The pool is
+module-level, not per-request, because `with ThreadPoolExecutor(...)` spawns and joins four
+OS threads on every call and Prometheus scrapes forever.
+
+**It reports `degraded`, never `unhealthy`.** `/ask` still routes correctly with every
+backend down — it routes and then declines, which is a useful answer. A container that
+reports itself dead gets restarted, and restarting this one fixes nothing when the fault is
+somebody else's.
+
+## `eval_router.py` — grading a router that is allowed to decline
+
+`python eval_router.py`. Twenty-four labelled questions in `eval_set.json`, and the set is
+built around one constraint: **two degenerate routers exist and both have to score badly.**
+
+A router that names a service for everything is easy to build by accident. So is one that
+declines everything — Day 23 shipped its equivalent. So a case with a named `expect` is one
+this repo says is definitely that service's, and declining it is a miss; a case with
+`expect: null` is one nothing should be confident about, and naming a service is a miss. The
+score means something only because both mistakes cost the same.
+
+Nineteen cases name a service, five expect a decline. The two numbers printed under the
+table are the ones worth reading, because they are the two ways to be wrong and each
+degenerate router maxes out exactly one of them:
+
+```
+n/24 routed as expected  declined a definite question: n/19  answered a vague one: n/5
+```
+
+Both have to stay low. Optimising either alone is trivial and produces a router nobody
+would ship. No score is recorded here yet — see *Picking the model* below.
+
+A few cases accept a list, which is the same concession `eval_triage.py` makes with bands:
+local Ollama is not reproducible even at `temperature: 0`, and a question that genuinely
+fits two services should not flap the score. A list containing `null` means declining is
+also defensible.
+
+The rows I care most about are four questions arranged in two pairs, because they are where
+keyword matching and intent come apart:
+
+| question | expects |
+|---|---|
+| "The logs say the deployment is unhealthy. What does that log line actually mean?" | log-analyzer |
+| "The logs say the deployment is unhealthy. What should I do about the deployment?" | self-healing-agent |
+| "What does our runbook say we should do about OOMKilled pods?" | knowledge-copilot |
+| "This pod was OOMKilled — what is the kubelet message telling me happened?" | log-analyzer |
+
+Same subjects, different asks. A router that passes the rest of the set and fails these is
+matching words rather than intent, and the prompt has a rule against exactly that.
+
+Grading happens on the route the gateway would **act on** — after the confidence floor, not
+before. Scoring the model's raw pick would be scoring a decision the gateway then overrides,
+which is not the thing anybody uses.
+
+### Picking the model
+
+**Not yet measured.** `GW_OLLAMA_MODEL` ships as `qwen2.5:7b-instruct` — an instruct tune
+rather than the coder model triage runs, because this call classifies prose about incidents,
+and both are already pulled so the choice cost nothing to make on the merits. 7b is the
+*fail-safe* default: Day 23 proved 1.5b cannot write triage explanations, which is a far
+bigger job than picking one of four names, so evidence gets to lower this and a wish for a
+faster demo does not.
+
+```bash
+python eval_router.py                              # the shipped default
+python eval_router.py --model qwen2.5-coder:1.5b   # the cheap candidate
+python eval_router.py --provider gemini
+python eval_router.py --limit 5                    # smoke test before the full run
+```
+
+The eval prints seconds per route and tokens per route alongside the score, so the
+comparison that decides it is one table each way. Latency matters more here than anywhere
+else in the repo: this is the only model call a human waits on synchronously.
+
+## `metrics.py` and `/metrics`
+
+Seven series, and the label sets all come from closed sets this service can see — four
+service names, five outcomes — so unlike triage's `repo` label there is nothing a request
+body can invent a new time series with.
+
+| metric | what it answers |
+|---|---|
+| `gw_routes{service,outcome}` | the whole day in one metric: what got routed where, and how it ended |
+| `gw_router_confidence` | a router pinned at 0.95 is a router that never doubts |
+| `gw_router_duration_seconds` | the classification call alone |
+| `gw_backend_duration_seconds{service}` | the forward, kept separate — "/ask is slow" has two causes |
+| `gw_proxy_requests{service,status}` | the passthrough, which never involves a model |
+| `gw_refusals{reason}` | auth / rate_limit / body_size / unknown_service / bad_attachment |
+| `gw_model_tokens{direction}` | what routing costs |
+
+`unroutable` is counted under `service="none"`, deliberately kept apart from a backend
+outage. Both are "no answer" and they need completely different fixes.
+
+## Tests
+
+81, offline, no model and no backends:
+
+```bash
+cd services/gateway && python -m pytest tests/ -q
+```
+
+```
+test_backends.py       the table, the body builders, plural-vs-singular tokens
+test_router.py         the schema enum, field order, the floor, prompt invariants
+test_app.py            the five outcomes end to end, the edge controls, the proxy
+test_metrics.py        which label each outcome lands under
+test_eval_router.py    the grading, and that both degenerate routers fail the set
+```
+
+`tests/conftest.py` assigns its environment rather than using `setdefault`, and that block
+is load-bearing. Five services share one root `.env`, `load_dotenv()` runs at import in
+three modules here, and `load_dotenv`'s `override=False` means an explicit assignment wins.
+Without it the suite reads real tokens and real backend addresses on my laptop and none of
+either on a runner — and both versions pass, sometimes. Day 28 lost a whole workflow to
+exactly this with `KC_API_TOKEN`.
+
+Two tests exist purely to protect a decision from a future well-meaning edit: one asserts
+the confidence floor's value does not appear in the system prompt, and one asserts
+`Route`'s field order. Both would look like harmless cleanups.
+
+## Running it
+
+```bash
+cd services/gateway
+pip install -r requirements.txt
+python app.py                                  # :7400
+```
+
+Locally the four backends are on localhost rather than compose DNS, so:
+
+```bash
+export GW_LOG_ANALYZER_URL=http://localhost:7000
+export GW_KNOWLEDGE_COPILOT_URL=http://localhost:7100
+export GW_SELF_HEALING_AGENT_URL=http://localhost:7200
+export GW_SECURITY_TRIAGE_URL=http://localhost:7300
+```
+
+```bash
+# what it thinks it can reach
+curl -sS localhost:7400/health | jq '.status, .backends[] | {service, status}'
+
+# a question one backend answers from a sentence
+curl -sS -X POST localhost:7400/ask \
+  -H "Authorization: Bearer $GW_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"question": "what is our documented procedure for draining a node"}' | jq
+
+# a question that needs material, without the material
+curl -sS -X POST localhost:7400/ask \
+  -H "Authorization: Bearer $GW_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"question": "why did checkout start 500ing at 3am"}' | jq '.outcome, .needs, .detail'
+
+# and with it
+curl -sS -X POST localhost:7400/ask \
+  -H "Authorization: Bearer $GW_TOKEN" -H 'Content-Type: application/json' \
+  -d "$(jq -n --rawfile log /tmp/checkout.log \
+        '{question: "why did checkout start 500ing at 3am", attachment: $log}')" | jq
+```
+
+## Deploying it
+
+Fifth entry in `docker-compose.prod.yml`, loopback bind on 7400, GHCR image published by
+`.github/workflows/gateway_ci.yml` on push to `main`. No `depends_on`, deliberately: the
+gateway is correct with every backend down, and making it wait would delay the one endpoint
+that can report which of the four is missing.
+
+```bash
+# on the host, after the image exists
+docker compose -f docker-compose.prod.yml pull gateway
+docker compose -f docker-compose.prod.yml up -d gateway
+curl -sS localhost:7400/health | jq '.status, .auth'
+```
+
+`.env` needs `GW_API_TOKENS` at minimum. `/health` reports `degraded` and says
+`auth: disabled` without it, which is the loud version of a deploy that left the front door
+to all four services open.
+
+**The nginx `client_max_body_size` trap.** nginx defaults to 1 MiB and terminates TLS in
+front of this. The gateway's own cap is 16 MiB to match triage's, so a scan envelope between
+those two sizes is refused by nginx with an HTML 413 that never reaches any of my code —
+the same shape of problem that cost an evening on Day 28. Raise it in the server block or
+accept 1 MiB as the real limit.
+
+**The laptop hosting Ollama does not need to be awake.** Accepted on Day 28 and it applies
+here too: with the model unreachable, `/ask` answers 503 naming the router provider, and
+`/health` says `degraded` with the reason. That is the correct and visible outcome for a
+learning build, and the passthrough keeps working throughout — it never touches a model.
+
+## Not built
+
+A UI, response caching, and a queue. Those are a fifth project, and I said so before
+starting rather than after.
+
+Also deliberately absent: any retry on the router. A routing decision has nothing to retry
+*into* — if the model cannot say which service a question belongs to, saying so is the
+answer, not something to ask again for. And no fallback service when the router fails: a
+502 is correct, because picking a default would be exactly the behaviour `none` exists to
+prevent, decided by a bug rather than by the model.
