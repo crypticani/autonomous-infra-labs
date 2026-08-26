@@ -22,8 +22,11 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# 120, not triage's 600: a human waits on this one synchronously.
-LLM_TIMEOUT = int(os.getenv("GW_LLM_TIMEOUT", "120"))
+# 300, from a measurement rather than the principle. 120 came from "a human waits on this
+# one synchronously", which is true and was never checked against a cold start: on the
+# deployed host the same call measured 9.0s warm and 186.9s cold, almost all of it model
+# load, so 120 guaranteed a 504 on the first call after any idle period.
+LLM_TIMEOUT = int(os.getenv("GW_LLM_TIMEOUT", "300"))
 
 # ~4x what a routing decision needs. A ceiling exists at all because an unbounded
 # generation loop filled the context once.

@@ -157,8 +157,11 @@ the sentence explaining it — the explanation is a premise. Reverse the two and
 picks first and writes whatever justifies the pick, which reads identically and is worth
 nothing.
 
-**`max_length=200` on `reason` is enforced, not requested.** Day 26 asked the prompt for
-"one short sentence" and shipped 270-character paragraphs for a month.
+**`reason` truncates rather than rejects.** It shipped with `max_length=200`, described here
+as "enforced, not requested" -- and that was the same mistake as the float below. A grammar
+does not enforce `maxLength` either: a live call returned a 199-character reason against that
+cap, one character from a 502 on a field that is prose for a human. It is a `BeforeValidator`
+that clips now, so the constraint holds without a failed route being the cost.
 
 **`confidence` is three levels because a float's range is not a guard.** This shipped as
 `float = Field(ge=0.0, le=1.0)` and I described it, in this file, as the same kind of

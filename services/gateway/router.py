@@ -8,9 +8,9 @@ import json
 import logging
 import os
 import time
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, BeforeValidator, Field, ValidationError
 
 import backends
 import metrics
@@ -46,12 +46,21 @@ ROUTE_ON = _validated_level(os.getenv("GW_ROUTE_ON", "medium"))
 # Enough of the attachment to be evidence, not enough to pay LLM prices for.
 ATTACHMENT_PREVIEW = int(os.getenv("GW_ATTACHMENT_PREVIEW", "200"))
 
+REASON_CHARS = 200
+
+# Truncated, not rejected. A grammar does not enforce maxLength any more than it enforced
+# `ge/le`, so `max_length` here would be a 502 whenever the model ran long -- measured at
+# 199 of 200 characters once. `reason` is prose for a human, so clipping it costs nothing
+# and a failed route costs the whole request.
+Reason = Annotated[
+    str, BeforeValidator(lambda v: v[:REASON_CHARS] if isinstance(v, str) else v)
+]
+
 
 class Route(BaseModel):
     """Field order is behaviour: `reason` before `service` conditions the pick on it."""
 
-    reason: str = Field(
-        max_length=200,
+    reason: Reason = Field(
         description="One short sentence: what in the question decides this.",
     )
     service: ServiceName = Field(

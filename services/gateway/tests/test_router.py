@@ -62,11 +62,15 @@ def test_a_service_outside_the_table_does_not_validate():
         Route(reason="x", service="grafana", confidence="high")
 
 
-def test_reason_is_capped_rather_than_asked_nicely():
-    """Day 26 asked the prompt for `one short sentence` and shipped 270-character
-    paragraphs for a month."""
-    with pytest.raises(ValidationError):
-        Route(reason="x" * 201, service="log-analyzer", confidence="high")
+def test_an_over_long_reason_is_truncated_not_rejected():
+    """A grammar enforces neither maxLength nor `ge/le`, so a cap here would 502 whenever
+    the model ran long -- measured once at 199 of 200 characters. `reason` is prose for a
+    human, so clipping costs nothing and a failed route costs the request."""
+    route = Route(reason="x" * 400, service="log-analyzer", confidence="high")
+    assert len(route.reason) == router.REASON_CHARS
+
+    # And the schema no longer advertises a constraint nothing enforces.
+    assert "maxLength" not in Route.model_json_schema()["properties"]["reason"]
 
 
 def test_confidence_is_an_enum_the_grammar_can_enforce():

@@ -13,8 +13,8 @@ data:
   # An instruct tune, not triage's coder model; set from eval_router.py.
   GW_OLLAMA_MODEL: "qwen2.5:7b-instruct"
 
-  # 120, not triage's 600: a human waits on this one synchronously.
-  GW_LLM_TIMEOUT: "120"
+  # 300, measured: 9s warm and 187s cold on the deployed host, almost all model load.
+  GW_LLM_TIMEOUT: "300"
   GW_MAX_TOKENS: "256"
 
   # The lowest confidence level the gateway acts on: low, medium or high. "high" makes the
