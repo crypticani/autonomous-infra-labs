@@ -746,33 +746,26 @@ network, and publishing routing volumes and token spend to the internet is free 
 intelligence for anyone who asks.
 
 ```bash
-dig +short gw.crypticani.dev          # before touching nginx; certbot's HTTP-01 needs it
+dig +short aiops.crypticani.dev          # before touching nginx; certbot's HTTP-01 needs it
 sudo nginx -t && sudo systemctl reload nginx
-sudo certbot --nginx --expand -d gw.crypticani.dev
+sudo certbot --nginx --expand -d aiops.crypticani.dev
 ```
 
 ```nginx
 server {
-    server_name gw.crypticani.dev;
+    server_name aiops.crypticani.dev;
 
-    # /ask, /health, and the /s/{service}/{path} passthrough. Prefix matches, because
-    # every one of them carries something after the first segment.
+    # /ask, /health and the /s/{service}/{path} passthrough. Nothing else is proxied.
     location ~ ^/(ask|health|s/) {
         proxy_pass http://127.0.0.1:7500;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
 
-        # THE ONE THAT MATTERS, for the second time this month. nginx defaults to 1 MiB;
-        # this service's own cap is 16 MiB to match triage's, because the same scan
-        # envelope arrives here as an `attachment` and gets forwarded there. Without this
-        # line a 2.7 MB envelope gets nginx's HTML 413 and GW_MAX_BODY_BYTES never gets a
-        # say. A cap silently overridden by a smaller cap one layer up is worse than no
-        # cap: the control you tested is not the control that fired.
+        # nginx defaults to 1 MiB and would refuse a scan envelope with its own HTML 413
+        # before GW_MAX_BODY_BYTES got a say.
         client_max_body_size 16m;
 
-        # A router call is one CPU-bound model call and the copilot behind it can take
-        # 300s. nginx's default 60s proxy_read_timeout would 504 a request the gateway
-        # was still legitimately serving.
+        # nginx's default 60s would 504 a request the gateway is still serving.
         proxy_read_timeout 320s;
     }
 
@@ -782,9 +775,9 @@ server {
 }
 ```
 
-**Not yet run.** Everything above is derived from the four blocks that came before it rather
-than from a verified deploy, so treat the `proxy_read_timeout` and the regex location as the
-two lines most likely to want adjusting.
+**Not yet run through TLS.** The compose deploy is verified -- `/health` reports all four
+backends healthy -- but this server block is derived from the four before it rather than
+from a live run.
 
 **The laptop hosting Ollama does not need to be awake.** Accepted on Day 28 and it applies
 here too: with the model unreachable, `/ask` answers 503 naming the router provider, and
