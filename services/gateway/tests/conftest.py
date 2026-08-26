@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # import time.
 os.environ["GEMINI_API_KEY"] = "test-key-never-sent"
 os.environ["GW_API_TOKENS"] = ""
-os.environ["GW_MIN_CONFIDENCE"] = "0.6"
+os.environ["GW_ROUTE_ON"] = "medium"
 os.environ["GW_LLM_PROVIDER"] = "ollama"
 
 # Both pinned for a sharper reason than the rest: /health now calls the model backend's

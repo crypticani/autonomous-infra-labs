@@ -175,7 +175,10 @@ class AskResponse(BaseModel):
 
     outcome: Literal["answered", "accepted", "needs_input", "unroutable", "failed"]
     service: str | None
-    confidence: float
+    # Three levels, not a float, and the change is measured rather than cosmetic: see
+    # router.LEVELS. A float's range is the one constraint the model's grammar could not
+    # enforce, so out-of-range answers reached this field as 502s.
+    confidence: router.Confidence
     # The model's sentence.
     reason: str
     # The gateway's, when it has something of its own to say.
@@ -457,7 +460,7 @@ def health_check():
         # What this process loaded, not what the image ships: .env overrides image
         # defaults and a stale one has cost an evening before.
         "policy": {
-            "min_confidence": router.MIN_CONFIDENCE,
+            "route_on": router.ROUTE_ON,
             "max_body_bytes": MAX_BODY_BYTES,
             "max_asks_per_hour": MAX_ASKS_PER_HOUR,
             "window": RATE_WINDOW,

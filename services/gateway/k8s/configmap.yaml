@@ -21,9 +21,14 @@ data:
   GW_LLM_TIMEOUT: "120"
   GW_MAX_TOKENS: "256"
 
-  # Below this the gateway declines whatever the model named. Raise it to make the router
-  # quieter and more often wrong-by-omission; lower it to make it guess.
-  GW_MIN_CONFIDENCE: "0.6"
+  # The lowest confidence level the gateway will act on: low, medium or high. Anything
+  # under it is declined with the service it would have picked still named. "high" makes
+  # the router quieter and more often wrong by omission; "low" disables the floor.
+  #
+  # Three levels rather than a float because the float's range was the one constraint the
+  # model's grammar could not enforce -- both models emitted out-of-range numbers, and each
+  # one was a 502. An enum is structural, like GW_ROUTE_ON's sibling constraint on service.
+  GW_ROUTE_ON: "medium"
 
   # Fully-qualified cross-namespace DNS, because each backend lives in its own namespace.
   # A bare service name would resolve inside `gateway` and find nothing.

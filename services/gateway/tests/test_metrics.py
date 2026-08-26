@@ -24,7 +24,7 @@ def client(monkeypatch):
     return TestClient(app)
 
 
-def _route(monkeypatch, service, confidence=0.9):
+def _route(monkeypatch, service, confidence="high"):
     route = Route(reason="because", service=service, confidence=confidence)
     monkeypatch.setattr(app_module, "classify", lambda q, a="": route)
 
@@ -63,8 +63,8 @@ def test_an_unroutable_ask_is_counted_under_none(client, monkeypatch):
 
 
 def test_a_confidence_the_floor_will_reject_is_still_recorded(monkeypatch):
-    """The histogram has to see the low scores or it cannot show that the floor ever fires.
-    A router that is always 0.95 is a router that never doubts, and that is the failure mode
+    """The counter has to see the low levels or it cannot show that the floor ever fires. A
+    router that is always sure is a router that never doubts, and that is the failure mode
     the confidence field exists to catch -- so the observation belongs in classify(), before
     anything decides whether to act on the route.
 
@@ -81,18 +81,16 @@ def test_a_confidence_the_floor_will_reject_is_still_recorded(monkeypatch):
 
         def generate(self, system, user, schema):
             return json.dumps(
-                {"reason": "a guess", "service": "security-triage", "confidence": 0.2}
+                {"reason": "a guess", "service": "security-triage", "confidence": "low"}
             )
 
     monkeypatch.setattr(router, "get_router_provider", Fake)
-    before = metric("gw_router_confidence_count")
-    before_sum = metric("gw_router_confidence_sum")
+    before = metric("gw_router_confidence_total", level="low")
 
     route = router.classify("should I ship this thing")
 
     # Recorded, and then rejected: two separate steps, and the metric sees both halves.
-    assert metric("gw_router_confidence_count") == before + 1
-    assert metric("gw_router_confidence_sum") == pytest.approx(before_sum + 0.2)
+    assert metric("gw_router_confidence_total", level="low") == before + 1
     assert router.decision(route)[0] is None
 
 

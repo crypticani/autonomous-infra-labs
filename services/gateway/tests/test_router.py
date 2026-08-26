@@ -64,19 +64,31 @@ def test_reason_is_generated_before_the_service_it_explains():
 
 def test_a_service_outside_the_table_does_not_validate():
     with pytest.raises(ValidationError):
-        Route(reason="x", service="grafana", confidence=0.9)
+        Route(reason="x", service="grafana", confidence="high")
 
 
 def test_reason_is_capped_rather_than_asked_nicely():
     """Day 26 asked the prompt for `one short sentence` and shipped 270-character
     paragraphs for a month."""
     with pytest.raises(ValidationError):
-        Route(reason="x" * 201, service="log-analyzer", confidence=0.9)
+        Route(reason="x" * 201, service="log-analyzer", confidence="high")
 
 
-def test_confidence_outside_zero_to_one_does_not_validate():
+def test_confidence_is_an_enum_the_grammar_can_enforce():
+    """The finding that made this a `Literal` instead of a float. Both candidate models
+    emitted out-of-range numbers against `ge=0.0, le=1.0` -- `10` from the 1.5b and `2`
+    from the 7b that ships -- because grammar-constrained decoding enforces structure and
+    not value ranges, so the bound was Pydantic rejecting after the fact and every
+    rejection was a 502. As an enum it is unrepresentable, exactly like `service`.
+    """
+    field = Route.model_json_schema()["properties"]["confidence"]
+    assert field["enum"] == list(router.LEVELS)
+    assert field["type"] == "string"
+
     with pytest.raises(ValidationError):
         Route(reason="x", service="log-analyzer", confidence=1.4)
+    with pytest.raises(ValidationError):
+        Route(reason="x", service="log-analyzer", confidence="very")
 
 
 # --- the prompt ---
@@ -88,11 +100,18 @@ def test_the_system_prompt_lists_every_service():
     assert NONE in router.SYSTEM_PROMPT
 
 
-def test_the_system_prompt_does_not_name_the_confidence_floor():
-    """Telling a model the threshold is how you get a model that reports one point above
-    it. The prompt says a low score means the gateway declines, and leaves the number out.
+def test_the_prompt_defines_the_levels_without_naming_the_bar():
+    """The model needs the vocabulary, so low/medium/high have to appear or it is guessing
+    at an enum. Which level the gateway *acts* on is a different fact and stays out: name a
+    threshold to a model and you get a model that reports one notch above it, and then the
+    floor is measuring its own instruction.
     """
-    assert str(router.MIN_CONFIDENCE) not in router.SYSTEM_PROMPT
+    for level in router.LEVELS:
+        assert level in router.SYSTEM_PROMPT
+
+    leaks = ("or above", "or higher", "at least", f"under {router.ROUTE_ON}")
+    for phrase in leaks:
+        assert phrase not in router.SYSTEM_PROMPT.lower(), phrase
 
 
 def test_a_question_with_no_attachment_carries_no_attachment_block():
@@ -123,7 +142,7 @@ def test_a_good_answer_becomes_a_route(use):
             {
                 "reason": "asks what a log means",
                 "service": "log-analyzer",
-                "confidence": 0.88,
+                "confidence": "high",
             }
         )
     )
@@ -131,7 +150,7 @@ def test_a_good_answer_becomes_a_route(use):
     route = classify("what does this OOMKilled line mean", "some log text")
 
     assert route.service == "log-analyzer"
-    assert route.confidence == 0.88
+    assert route.confidence == "high"
     # The schema goes to the provider as a class, so each backend can ask it for the shape
     # it wants -- Ollama the JSON schema, Gemini the class itself.
     assert fake.schema is Route
@@ -150,7 +169,7 @@ def test_non_json_is_a_502_and_never_a_default_route(use):
 
 def test_a_valid_shape_with_an_invalid_service_is_a_502(use):
     """Belt to the schema's braces: a backend that ignored `format` gets caught here."""
-    use(json.dumps({"reason": "x", "service": "prometheus", "confidence": 0.9}))
+    use(json.dumps({"reason": "x", "service": "prometheus", "confidence": "high"}))
 
     with pytest.raises(GatewayProviderError) as caught:
         classify("what broke")
@@ -161,7 +180,7 @@ def test_a_valid_shape_with_an_invalid_service_is_a_502(use):
 
 
 def test_the_model_declining_is_a_decline():
-    route = Route(reason="could be either", service=NONE, confidence=0.9)
+    route = Route(reason="could be either", service=NONE, confidence="high")
     name, note = decision(route)
 
     assert name is None
@@ -170,7 +189,7 @@ def test_the_model_declining_is_a_decline():
 
 def test_a_confident_route_passes_through_with_nothing_added():
     route = Route(
-        reason="asks what a log means", service="log-analyzer", confidence=0.9
+        reason="asks what a log means", service="log-analyzer", confidence="high"
     )
     assert decision(route) == ("log-analyzer", None)
 
@@ -178,18 +197,44 @@ def test_a_confident_route_passes_through_with_nothing_added():
 def test_the_floor_overrides_a_service_the_model_named():
     """The failure mode a confidence field exists to catch: a model that picks something
     rather than nothing."""
-    route = Route(reason="a guess", service="security-triage", confidence=0.4)
+    route = Route(reason="a guess", service="security-triage", confidence="low")
     name, note = decision(route)
 
     assert name is None
-    assert "0.40" in note
+    assert "low" in note
+    # Named, not hidden: the caller can decide the router was right and retry explicitly.
     assert "security-triage" in note
 
 
-def test_the_floor_is_inclusive_at_its_own_value(monkeypatch):
-    monkeypatch.setattr(router, "MIN_CONFIDENCE", 0.6)
-    route = Route(reason="borderline", service="log-analyzer", confidence=0.6)
+def test_the_floor_is_inclusive_at_its_own_level(monkeypatch):
+    monkeypatch.setattr(router, "ROUTE_ON", "medium")
+    route = Route(reason="borderline", service="log-analyzer", confidence="medium")
     assert decision(route)[0] == "log-analyzer"
+
+
+def test_raising_the_bar_to_high_rejects_medium(monkeypatch):
+    """The levels are ranked by position in LEVELS, not compared as strings: `"low" <
+    "medium"` is true alphabetically and `"medium" < "high"` is not, so the obvious
+    comparison is wrong in a way that passes half its cases."""
+    assert router.LEVELS == ("low", "medium", "high")
+    monkeypatch.setattr(router, "ROUTE_ON", "high")
+
+    medium = Route(reason="probably", service="log-analyzer", confidence="medium")
+    high = Route(reason="plainly", service="log-analyzer", confidence="high")
+
+    assert decision(medium)[0] is None
+    assert decision(high)[0] == "log-analyzer"
+
+
+def test_an_unknown_route_on_value_refuses_to_load():
+    """A typo here is a gateway with no floor at all, which is what the constant exists to
+    prevent -- so it fails rather than quietly accepting everything."""
+    assert router._validated_level("  HIGH ") == "high"
+
+    with pytest.raises(ValueError, match="GW_ROUTE_ON"):
+        router._validated_level("quite-sure")
+    with pytest.raises(ValueError, match="GW_ROUTE_ON"):
+        router._validated_level("0.6")
 
 
 def test_the_provider_seam_still_reports_tokens():

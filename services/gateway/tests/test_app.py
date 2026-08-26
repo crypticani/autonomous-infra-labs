@@ -31,7 +31,7 @@ def routed(monkeypatch):
     """Decide what the router says, without a model."""
 
     def install(
-        service="knowledge-copilot", confidence=0.9, reason="a runbook question"
+        service="knowledge-copilot", confidence="high", reason="a runbook question"
     ):
         route = Route(reason=reason, service=service, confidence=confidence)
         monkeypatch.setattr(app_module, "classify", lambda q, a="": route)
@@ -62,7 +62,7 @@ def upstream(monkeypatch):
 
 
 def test_a_routed_question_is_forwarded_and_attributed(client, routed, upstream):
-    routed("knowledge-copilot", 0.93, "asks what the documented procedure is")
+    routed("knowledge-copilot", "high", "asks what the documented procedure is")
     calls = upstream(FakeResponse(200, {"answer": "drain it first", "grounded": True}))
 
     body = client.post(
@@ -75,7 +75,7 @@ def test_a_routed_question_is_forwarded_and_attributed(client, routed, upstream)
     assert body["attributed_to"] == "knowledge-copilot POST /ask-runbook"
     # The routing rides along on a success too, which is what makes a misroute legible in
     # the answer rather than hidden behind it.
-    assert body["confidence"] == 0.93
+    assert body["confidence"] == "high"
     assert body["reason"] == "asks what the documented procedure is"
     assert body["detail"] is None
 
@@ -86,7 +86,7 @@ def test_a_routed_question_is_forwarded_and_attributed(client, routed, upstream)
 
 
 def test_an_attachment_reaches_the_backend_that_needed_it(client, routed, upstream):
-    routed("log-analyzer", 0.95, "asks what a log line means")
+    routed("log-analyzer", "high", "asks what a log line means")
     calls = upstream(FakeResponse(200, {"severity": "critical"}))
     log = "2026-08-25 12:04:11 ERROR OutOfMemoryError in checkout-7d9f"
 
@@ -106,7 +106,7 @@ def test_an_attachment_reaches_the_backend_that_needed_it(client, routed, upstre
 def test_a_json_attachment_is_parsed_for_the_backend_that_wants_an_object(
     client, routed, upstream
 ):
-    routed("self-healing-agent", 0.9, "asks what to do about a firing alert")
+    routed("self-healing-agent", "high", "asks what to do about a firing alert")
     calls = upstream(FakeResponse(200, {"summary": "the pod is OOMKilling"}))
 
     client.post(
@@ -125,7 +125,7 @@ def test_a_json_attachment_is_parsed_for_the_backend_that_wants_an_object(
 def test_triage_answering_202_is_accepted_and_not_answered(client, routed, upstream):
     """Calling a pending run `answered` would be a lie the response body immediately
     contradicts."""
-    routed("security-triage", 0.94, "asks whether scanner findings are shippable")
+    routed("security-triage", "high", "asks whether scanner findings are shippable")
     upstream(FakeResponse(202, {"run_id": "9fd2c1a4b0e7", "status": "pending"}))
 
     body = client.post(
@@ -151,7 +151,7 @@ def test_the_model_declining_is_a_200_that_names_no_service(client, routed, upst
     """A declared refusal is a 200 with a field, following the two services that already do
     it: triage returns needs_human inside a 200 and the copilot returns grounded false.
     """
-    routed(NONE, 0.9, "could be the log analyzer or the cluster agent")
+    routed(NONE, "high", "could be the log analyzer or the cluster agent")
     upstream(FakeResponse(200, {"never": "called"}))
 
     response = client.post(
@@ -171,7 +171,7 @@ def test_the_model_declining_is_a_200_that_names_no_service(client, routed, upst
 def test_a_low_confidence_route_is_declined_and_says_what_it_would_have_picked(
     client, routed
 ):
-    routed("security-triage", 0.35, "mentions shipping")
+    routed("security-triage", "low", "mentions shipping")
     body = client.post(
         "/ask", json={"question": "should I ship this or not"}, headers=AUTH
     ).json()
@@ -179,13 +179,13 @@ def test_a_low_confidence_route_is_declined_and_says_what_it_would_have_picked(
     assert body["outcome"] == "unroutable"
     # Named, not hidden: the caller can decide the router was right and retry explicitly.
     assert body["service"] == "security-triage"
-    assert "0.35" in body["detail"]
+    assert "low" in body["detail"]
 
 
 def test_the_right_service_with_no_attachment_asks_for_one(client, routed, upstream):
     """The honest end of the plan's own example. "why did checkout start 500ing at 3am" is
     log-analyzer's question, and log-analyzer analyses text it is handed."""
-    routed("log-analyzer", 0.95, "asks why a service returned errors")
+    routed("log-analyzer", "high", "asks why a service returned errors")
     calls = upstream(FakeResponse(200, {"never": "called"}))
 
     body = client.post(
@@ -204,7 +204,7 @@ def test_the_right_service_with_no_attachment_asks_for_one(client, routed, upstr
 def test_the_copilot_never_asks_for_an_attachment(client, routed, upstream):
     """It is the one backend a sentence is enough for, so `needs` is None and the check
     that would refuse never fires."""
-    routed("knowledge-copilot", 0.9)
+    routed("knowledge-copilot", "high")
     upstream(FakeResponse(200, {"answer": "here"}))
 
     body = client.post(
@@ -216,7 +216,7 @@ def test_the_copilot_never_asks_for_an_attachment(client, routed, upstream):
 def test_an_unparseable_json_attachment_is_a_400_naming_the_field(
     client, routed, upstream
 ):
-    routed("self-healing-agent", 0.9)
+    routed("self-healing-agent", "high")
     calls = upstream(FakeResponse(200, {"never": "called"}))
 
     response = client.post(
@@ -234,7 +234,7 @@ def test_an_unparseable_json_attachment_is_a_400_naming_the_field(
 
 
 def test_an_unreachable_backend_is_a_503_that_names_it(client, routed, upstream):
-    routed("knowledge-copilot", 0.9)
+    routed("knowledge-copilot", "high")
     upstream(requests.exceptions.ConnectionError("connection refused"))
 
     response = client.post(
@@ -252,7 +252,7 @@ def test_an_unreachable_backend_is_a_503_that_names_it(client, routed, upstream)
 def test_a_backend_status_is_mirrored_rather_than_flattened(client, routed, upstream):
     """A 422 means the attachment was wrong and a 429 means try later. Those are different
     instructions and only the real status carries them."""
-    routed("log-analyzer", 0.95)
+    routed("log-analyzer", "high")
     upstream(FakeResponse(422, {"detail": "raw_log is too short"}))
 
     response = client.post(
@@ -272,7 +272,7 @@ def test_a_non_json_body_from_upstream_does_not_become_a_stack_trace(
 ):
     """A 502 page from an intermediary is not JSON, and letting .json() raise would turn
     somebody else's outage into a traceback in this service's logs."""
-    routed("knowledge-copilot", 0.9)
+    routed("knowledge-copilot", "high")
     upstream(FakeResponse(502, None, text="<html>Bad Gateway</html>"))
 
     response = client.post(
@@ -324,7 +324,7 @@ def test_the_body_cap_reads_content_length_not_the_parsed_body():
 def test_the_rate_limit_refuses_the_next_ask(client, routed, upstream, monkeypatch):
     """It exists because /ask spends a model call before any backend's own limit gets a
     say, so without it one token can burn the router freely."""
-    routed("knowledge-copilot", 0.9)
+    routed("knowledge-copilot", "high")
     upstream(FakeResponse(200, {"answer": "here"}))
     monkeypatch.setattr(app_module, "MAX_ASKS_PER_HOUR", 2)
 
@@ -489,7 +489,7 @@ def test_health_is_open_and_reports_every_backend(client, monkeypatch):
         "security-triage",
     }
     assert all(b["latency_ms"] >= 0 for b in body["backends"])
-    assert body["policy"]["min_confidence"] == 0.6
+    assert body["policy"]["route_on"] == "medium"
 
 
 def test_one_degraded_backend_degrades_the_gateway(client, monkeypatch):

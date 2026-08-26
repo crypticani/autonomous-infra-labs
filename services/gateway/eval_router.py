@@ -216,7 +216,7 @@ def main() -> int:
     provider = get_router_provider()
     console.print(
         f"{len(cases)} cases against [bold]{provider.name}[/bold] "
-        f"({provider.model_name}), floor {router.MIN_CONFIDENCE}"
+        f"({provider.model_name}), acting on {router.ROUTE_ON} confidence and up"
     )
 
     # One throwaway call before the clock starts, because Ollama loads the model on first

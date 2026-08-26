@@ -16,12 +16,15 @@ ROUTES = Counter(
     ["service", "outcome"],  # answered | accepted | needs_input | unroutable | failed
 )
 
-# A router that is always 0.95 is a router that never doubts, and that is the failure mode
-# worth catching: the confidence floor can only help if the numbers spread.
-CONFIDENCE = Histogram(
+# A router that is always sure is a router that never doubts, and that is the failure mode
+# worth catching: the floor can only help if the levels spread. It was a histogram over a
+# float until 2026-08-26, when the measured run came back 1.00 or 0.00 and nothing else --
+# nine buckets to describe a boolean. A counter over the three levels the field now holds
+# says the same thing in three series, and cannot go out of range.
+CONFIDENCE = Counter(
     "gw_router_confidence",
     "Confidence the router reported, including asks it then declined",
-    buckets=(0.1, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0),
+    ["level"],  # low | medium | high
 )
 
 # Seconds, and the buckets are wide because the same call is sub-second on Gemini and tens

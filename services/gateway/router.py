@@ -43,11 +43,39 @@ NONE = "none"
 # fact, it is unrepresentable.
 ServiceName = Literal[backends.NAMES + (NONE,)]
 
-# Below this the gateway declines whatever the model named. A backstop for the failure mode
-# a confidence field exists to catch: a model that picks something rather than nothing.
-# 0.6, matching the copilot's SIMILARITY_FLOOR in spirit -- both are "refuse rather than
-# serve a bad answer", and both are a number a measurement is allowed to move.
-MIN_CONFIDENCE = float(os.getenv("GW_MIN_CONFIDENCE", "0.6"))
+# Three levels rather than the float this shipped with, and the reason is measured. A float
+# with `ge=0.0, le=1.0` looked like the same kind of guard as `service`'s enum and is not:
+# grammar-constrained decoding enforces *structure*, so `service` never once left its enum
+# across 72 calls, while the range on a number is only checked by Pydantic afterwards. Both
+# models emitted out-of-range values -- `10` from the 1.5b four times, and `2` from the 7b
+# that actually ships -- and each one is a 502 on a field that changed no outcome anyway.
+#
+# An enum makes it unrepresentable instead of rejected. It is also no loss of signal: the
+# shipped model's float was 1.00 or 0.00 and nothing in between, so three levels is strictly
+# more than the boolean it was really reporting.
+LEVELS: tuple[str, ...] = ("low", "medium", "high")
+Confidence = Literal[LEVELS]
+
+
+def _validated_level(value: str) -> str:
+    """A level name, or a loud failure.
+
+    Its own function only so a test can reach it: the check runs at import, and testing it
+    through the import would mean `importlib.reload`, which raises halfway through and
+    leaves this module missing everything below the raise for the rest of the session.
+    """
+    level = value.strip().lower()
+    if level not in LEVELS:
+        # Refuse to load rather than silently accepting everything: a typo here is a
+        # gateway with no floor at all, which is what this constant exists to prevent.
+        raise ValueError(f"GW_ROUTE_ON must be one of {LEVELS}, got {value!r}")
+    return level
+
+
+# The lowest level the gateway will act on. `medium` because the float it replaces was 0.6
+# on a 0-1 scale, which accepted the middle of the range -- tightening the shipped policy
+# while translating it would hide a behaviour change inside a refactor.
+ROUTE_ON = _validated_level(os.getenv("GW_ROUTE_ON", "medium"))
 
 # How much of the attachment the router is shown. An attachment is real evidence -- a JSON
 # alert is almost certainly the agent's, a scan envelope almost certainly triage's -- and
@@ -74,8 +102,9 @@ class Route(BaseModel):
     service: ServiceName = Field(
         description=f"The service that can answer it, or {NONE!r} if you cannot tell."
     )
-    confidence: float = Field(
-        ge=0.0, le=1.0, description="How sure you are of the service, 0.0 to 1.0."
+    # An enum, so an out-of-range answer is impossible rather than rejected. See LEVELS.
+    confidence: Confidence = Field(
+        description="How sure you are of the service: high, medium or low."
     )
 
 
@@ -97,8 +126,10 @@ a cluster question if it asks what to do about the deployment.
 is being asked; the gateway tells them what to attach.
 - Write `reason` first, as one short sentence naming what in the question decided it. It is \
 your reasoning, not a defence of a choice you have already made.
-- `confidence` is how sure you are of the service. Report it honestly: the gateway declines \
-a low-confidence route rather than guessing, which is what you want when you are unsure.\
+- `confidence` is how sure you are of the service: `high` if the question plainly belongs \
+there, `medium` if it probably does, `low` if you are guessing. Report it honestly -- the \
+gateway declines a route you are not confident in rather than passing the guess along, which \
+is what you want when you are unsure.\
 """
 
 
@@ -170,9 +201,9 @@ def classify(question: str, attachment: str = "") -> Route:
             provider=provider.name,
         ) from e
 
-    metrics.CONFIDENCE.observe(route.confidence)
+    metrics.CONFIDENCE.labels(level=route.confidence).inc()
     logger.info(
-        f"routed to {route.service} at {route.confidence:.2f}: {route.reason!r}"
+        f"routed to {route.service} at {route.confidence} confidence: {route.reason!r}"
     )
     return route
 
@@ -192,10 +223,13 @@ def decision(route: Route) -> tuple[str | None, str | None]:
     """
     if route.service == NONE:
         return None, "the router could not place this question against any of the four"
-    if route.confidence < MIN_CONFIDENCE:
+    # Compared by position in LEVELS rather than by string: "low" < "medium" happens to be
+    # true alphabetically and "medium" < "high" is not, so the obvious comparison is wrong
+    # in a way that passes half its cases.
+    if LEVELS.index(route.confidence) < LEVELS.index(ROUTE_ON):
         return None, (
-            f"the router suggested {route.service} but only at {route.confidence:.2f} "
-            f"confidence, below the {MIN_CONFIDENCE} floor, so the gateway declined "
-            f"rather than guess"
+            f"the router suggested {route.service} but only at {route.confidence} "
+            f"confidence, under the {ROUTE_ON} floor, so the gateway declined rather "
+            f"than guess"
         )
     return route.service, None

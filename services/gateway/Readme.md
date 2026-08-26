@@ -83,9 +83,25 @@ Backend(
 )
 ```
 
-`answers` is prompt text, so it is written for a model rather than for me — and every entry
-names what its service needs, because the model's classification and the code's needs-check
-have to agree about that or the two halves of a decline contradict each other.
+`answers` is prompt text, so it is written for a model rather than for me.
+
+**The first version of this paragraph gave a reason that turned out to be wrong**, and it is
+worth leaving the correction visible. I had written that every entry names what its service
+needs *"because the model's classification and the code's needs-check have to agree about
+that or the two halves of a decline contradict each other."* They do not have to agree. The
+needs-check is `if backend.needs and not request.attachment` — it never consults the model,
+which was the entire point of the split two sections up. And the prompt says so out loud:
+
+> *Whether the caller supplied the data a service needs is not your problem. Route on what
+> is being asked; the gateway tells them what to attach.*
+
+Then three entries end with *"so the log must be supplied"*, *"so the scan results must be
+supplied"*, and — the agent's — *"a description of an alert is not an alert."* I told the
+model not to do the needs-check and wrote the needs-check into the descriptions anyway. The
+measured cost of that contradiction is in *What the 7b gets wrong* below: the one miss that
+has survived every run is a bare *"can something scale it back up?"* that gets **declined**
+rather than routed to the agent, and routing it there would have passed, because
+`needs_input` is what should have handled the missing alert.
 
 Two details that are less obvious than they look:
 
@@ -113,10 +129,10 @@ ServiceName = Literal[backends.NAMES + (NONE,)]
 class Route(BaseModel):
     reason: str = Field(max_length=200, ...)
     service: ServiceName
-    confidence: float = Field(ge=0.0, le=1.0)
+    confidence: Literal["low", "medium", "high"]
 ```
 
-Three decisions in nine lines, and all three are things I got wrong somewhere earlier in the
+Four decisions in nine lines. Three are things I got wrong somewhere earlier in the
 month.
 
 **`none` is an enum member, not a nullable field.** `Literal[...] | None` compiles to a
@@ -144,19 +160,40 @@ nothing.
 **`max_length=200` on `reason` is enforced, not requested.** Day 26 asked the prompt for
 "one short sentence" and shipped 270-character paragraphs for a month.
 
-### The confidence floor, and why the prompt doesn't mention it
+**`confidence` is three levels because a float's range is not a guard.** This shipped as
+`float = Field(ge=0.0, le=1.0)` and I described it, in this file, as the same kind of
+constraint as `service`'s enum. It is not, and two runs proved it: **grammar-constrained
+decoding enforces structure, not value ranges.** `service` never once left its enum in 72
+calls, because the sampler physically cannot emit a token outside it. `ge`/`le` on a number
+are Pydantic rejecting a value *after* generation — so `"confidence": 10` from the 1.5b (four
+times) and `"confidence": 2` from the 7b that actually ships were each a 502, on the one field
+that had changed no outcome anyway. Two constraints in the same `Field(...)` call and only one
+of them load-bearing.
 
-`GW_MIN_CONFIDENCE=0.6`. Below it the gateway declines whatever the model named — the
-backstop for the failure mode a confidence field exists to catch, which is a model that
-picks *something* rather than nothing.
+`Literal["low", "medium", "high"]` makes it unrepresentable instead of rejected, the same way
+`service` already was. It also loses nothing: the float it replaces only ever came back `1.00`
+or `0.00`, so three levels are strictly more than the boolean it was really reporting.
 
-It has never fired. Every confidence the shipped model produced in the measured run was
-`1.00` or `0.00` — see *The floor did not fire once* below, which is the negative result this
-paragraph earned.
+### The floor, and why the prompt doesn't name it
 
-The prompt tells the model that a low score means the gateway will decline. It does not tell
-it the number. Name a threshold to a model and you get a model that reports one point above
-it, and then the floor is measuring its own instruction. There is a test asserting the number
+`GW_ROUTE_ON=medium` — the lowest level the gateway acts on. Under it the route is declined
+*with the service it would have picked still named*, so a caller who disagrees can retry
+explicitly. `medium` and not `high` because the float it replaces was 0.6 on a 0–1 scale,
+which accepted the middle of the range; tightening the policy while translating it would have
+hidden a behaviour change inside a refactor.
+
+Levels compare by position in `LEVELS`, not as strings — `"low" < "medium"` is true
+alphabetically and `"medium" < "high"` is not, so the obvious comparison is wrong in a way
+that passes half its cases. A `GW_ROUTE_ON` outside the three fails at import rather than
+silently leaving the gateway with no floor at all.
+
+It has never fired on the shipped model — see *The floor did not fire once* below, which is
+the negative result this paragraph earned.
+
+The prompt defines the three levels, because the model needs the vocabulary or it is guessing
+at an enum. It does not say which one the gateway acts on. Name a threshold to a model and
+you get a model that reports one notch above
+it, and then the floor is measuring its own instruction. There is a test asserting the bar
 does not appear in the prompt, because that is exactly the kind of helpful edit a later me
 would make.
 
@@ -194,7 +231,7 @@ confident answers are only worth something if a wrong route is legible next to t
 {
   "outcome": "needs_input",
   "service": "log-analyzer",
-  "confidence": 0.95,
+  "confidence": "high",
   "reason": "asks why a service returned errors, which is a log question",
   "detail": "log-analyzer can answer this, but attach the log text itself as `attachment`",
   "needs": "raw_log",
@@ -271,7 +308,7 @@ The shape, with one of each state in it:
   "provider": "ollama",
   "model": "qwen2.5:7b-instruct",
   "auth": "2 token(s)",
-  "policy": { "min_confidence": 0.6, "max_asks_per_hour": 60, ... },
+  "policy": { "route_on": "medium", "max_asks_per_hour": 60, ... },
   "backends": [
     {"service": "log-analyzer",       "status": "healthy",     "http": 200,  "latency_ms": 6,  "issues": []},
     {"service": "knowledge-copilot",  "status": "degraded",    "http": 200,  "latency_ms": 41,
@@ -331,7 +368,7 @@ n/24 routed as expected  declined a definite question: n/19  answered a vague on
 ```
 
 Both have to stay low. Optimising either alone is trivial and produces a router nobody
-would ship. The shipped model scores **18/24** — see *Picking the model* below.
+would ship. The shipped model scores **20/24** — see *Picking the model* below.
 
 A few cases accept a list, which is the same concession `eval_triage.py` makes with bands:
 local Ollama is not reproducible even at `temperature: 0`, and a question that genuinely
@@ -359,10 +396,14 @@ which is not the thing anybody uses.
 
 `GW_OLLAMA_MODEL=qwen2.5:7b-instruct`, and now for a reason rather than as a fail-safe.
 
-| model | score | declined a definite | answered a vague | s/route | tokens/route |
-|---|---|---|---|---|---|
-| `qwen2.5:7b-instruct` | **18/24** | 2/19 | 1/5 | 10.2 | 543 |
-| `qwen2.5-coder:1.5b` | 13/24 | 2/17 | 2/3 | 6.3 | 561 |
+| run | model | score | declined a definite | answered a vague | s/route | tokens/route |
+|---|---|---|---|---|---|---|
+| 1 | `qwen2.5:7b-instruct` | 18/24 | 2/19 | 1/5 | 10.2 | 543 |
+| 1 | `qwen2.5-coder:1.5b` | 13/24 | 2/17 | 2/3 | 6.3 | 561 |
+| 2 | `qwen2.5:7b-instruct` | **20/24** | 1/18 | 1/5 | 9.8 | 566 |
+
+Run 2 is the same 7b after one change, described two sections down: the copilot's catalogue
+entry narrowed. Nothing else moved.
 
 1.5b is 1.6x faster and costs the same in tokens, and it is not close on the thing being
 bought. Note its denominators: 17 and 3, not 19 and 5, because **four of its 24 calls never
@@ -386,12 +427,23 @@ structural: the grammar permits any number, and Pydantic rejects the value after
 is a 502 rather than a guard. Two constraints written in the same `Field(...)` call, and only
 one of them is load-bearing.
 
-I am leaving it as a 502 rather than clamping. A model that cannot keep a number inside
-`[0,1]` when asked is a model whose routing I would not act on either, and silently rewriting
-`10` to `1.0` would guess at intent and hide precisely the evidence that decided this table.
-What changed is the error text: it now names the field and the offending value, because
-`"1 field(s) bad"` sent me to the raw-body log line to learn something the exception already
-knew.
+My first instinct was to leave it as a 502 — a model that cannot keep a number inside `[0,1]`
+when asked is not one whose routing I would act on either, and rewriting `10` to `1.0` guesses
+at intent. **That was the wrong call, and the next run is what showed it.** The 7b did it too,
+once in 24. So this was never "a bad candidate model disqualifying itself"; it was **~4% of
+production `/ask` calls returning 502 for a reason unrelated to routing quality**, on the one
+field that changed no outcome anyway.
+
+`confidence` is therefore a `Literal["low", "medium", "high"]` — structural, so the sampler
+cannot produce an illegal value, exactly like `service`. The float never carried more than a
+boolean here in any case. The floor became `GW_ROUTE_ON=medium` rather than a number, and the
+error text now names the field and the offending value regardless, because `"1 field(s) bad"`
+sent me to the raw-body log line to learn something the exception already knew.
+
+The measurements in the table above were taken with the float, so they are what they are: the
+20/24 run includes one case lost to `confidence: 2` that had passed twice before. Call it
+20/23 on routes that got as far as being graded — and re-run it now that the field cannot fail
+that way.
 
 ```bash
 python eval_router.py                              # the shipped default
@@ -406,10 +458,10 @@ use and that load otherwise lands on whichever case is first: 17.3s against a ~9
 outright and reported case one as an error that had nothing to do with routing. `--no-warmup`
 puts it back if you want to see that.
 
-### What the 7b gets wrong, and why one of those is my fault
+### What the 7b got wrong, and why three of those were my fault
 
-Six misses, and they are not evenly distributed. **Three of them went to knowledge-copilot**,
-which was picked 8 times out of 24 — the catalogue's attractor. The model's stated reason for
+Run 1 had six misses, not evenly distributed. **Three went to knowledge-copilot**, which was
+picked 8 times out of 24 — the catalogue's attractor. The model's stated reason for
 the worst of them, a bare *"something is wrong with checkout"* that should have been declined,
 was two words:
 
@@ -425,34 +477,74 @@ log-analyzer and the agent.
 That description is now narrow, says it *"knows nothing whatever about the running system"*,
 and ends by pushing back instead of inviting: *"If the answer is not already written in a
 runbook, this is the wrong service."* **One variable changed** — not the catalogue ordering,
-which is the other live hypothesis for the same bias and the obvious next single-variable
-experiment. Changing both would leave neither attributable, which is the same discipline the
-triage backlog is ordered by.
+which is the other live hypothesis for the same bias. Changing both would leave neither
+attributable, which is the same discipline the triage backlog is ordered by.
 
-**The other thing those misses share is worth more than the fix.** Five of the six were
+**It worked, and cleanly.** Run 2, nothing else touched:
+
+| | run 1 | run 2 |
+|---|---|---|
+| knowledge-copilot picks | 8 | 5 |
+| of those, wrong | **3** | **0** |
+| total score | 18/24 | 20/24 |
+
+Both OOMKilled questions now go to log-analyzer. *"Is this Dockerfile safe to ship"* — which I
+had not attributed to this bias at all — went from declined to security-triage. Net +2 with one
+case lost to an unrelated `confidence: 2`, so 20/23 on routes that were graded at all.
+
+The honest caveat: the two vague misses **swapped identity** between runs. *"Something is wrong
+with checkout"* went miss → ok and *"is this actually safe or not"* went ok → miss, same count,
+different rows. So ±1–2 is noise here and 18 → 20 sits at the edge of what one run can claim.
+The 3 → 0 on knowledge-copilot is the part that is not ambiguous.
+
+### `reason` is naming the destination, not reading the question
+
+**The thing those misses share is worth more than the fix.** In run 1, five of six were
 explained in three words or fewer: `OOMKilled`, `scaling question`, `log analysis required`,
-`operational question`. `reason` is generated *before* `service` precisely so the pick is
-conditioned on stated reasoning — but a two-word label is not reasoning, and if the reason is
-degenerate then the field order is buying nothing. Whether the *passes* did any better was
-unanswerable from that run, because the report printed reasons for misses only. It now prints
-all of them plus the median word count for each group, so the next run answers it. Note the
-direction that comparison could go: the 1.5b wrote long, careful, fully-formed sentences —
+`operational question`. Run 2 put a number on it — `median reason: 6 words when right, 3 when
+wrong` — which supports the hypothesis but weakly, because there are two-word *passes* too
+(`log content`, `time reference`, `vague`).
+
+The decisive evidence is not the median. It is this pair:
+
+```
+ok   discrimination pair A: what does the log mean:   log analysis required
+miss discrimination pair B: what do I do about it:    log analysis required
+```
+
+**Byte-identical reasons, opposite correctness.** The prompt asks for *"what in the question
+decided it"* and the model is emitting a name for the service it picked — `scaling question`,
+`security scanner findings`, `log content`. Those describe the destination, not the question.
+Which means `reason`-before-`service` is buying nothing here: the model is not reasoning and
+then choosing, it is choosing and then labelling. The two questions in that pair differ only
+in what they ask for, and the field that exists to capture that difference produced the same
+string for both.
+
+Note which way this does *not* point: the 1.5b wrote long, careful, fully-formed sentences —
 *"This question fits both `log-analyzer` and `self-healing-agent`..."* — and scored worse.
-Length is clearly not the thing. Whether anything about the reason predicts the route is
-still open.
+Length is not the thing. The next single-variable experiment is a prompt that demands the
+reason quote the words in the question that decided it, rather than describe the service.
 
 ### The floor did not fire once
 
-Worth recording as a negative result. Every 7b confidence in the 24-case run was either
-`1.00` or `0.00`, nothing between — and each `0.00` came attached to `service: "none"`, which
-`decision()` declines on the enum branch before the floor is ever consulted. So
-`GW_MIN_CONFIDENCE=0.6` changed no outcome at all for the model actually shipping.
+Worth recording as a negative result, and it is the reason `confidence` is now an enum.
 
-The mechanism is not dead — the 1.5b used 0.50 and 0.90, and the floor correctly overrode two
-of its picks. But on the 7b, confidence is a boolean wearing a float's clothing, and the
-`gw_router_confidence` histogram exists to make exactly that visible. That is the guard's own
-comment coming true faster than expected: *a router that is always 0.95 is a router that
-never doubts.* Ours is always 1.00.
+Every 7b confidence in the 24-case runs was either `1.00` or `0.00`, nothing between — and
+each `0.00` came attached to `service: "none"`, which `decision()` declines on the enum branch
+*before* the floor is ever consulted. So the floor changed no outcome at all for the model
+actually shipping. Zero times, across 48 graded routes.
+
+The mechanism is not dead: the 1.5b used 0.50 and 0.90, and the floor correctly overrode two
+of its picks. But on the 7b, confidence was a boolean wearing a float's clothing — and the
+`gw_router_confidence` series exists to make exactly that visible, which is the guard's own
+comment coming true faster than expected: *a router that is always 0.95 is a router that never
+doubts.* Ours was always 1.00.
+
+Two things follow, and only one of them is a fix. The fix is that a field with three legal
+values cannot report a boolean by accident the way a continuous one can, and cannot go out of
+range at all. The thing that is *not* fixed is whether the model has any calibrated notion of
+its own uncertainty here — three levels make that measurable rather than answered, and the
+next run is what says whether `medium` ever appears.
 
 ## `metrics.py` and `/metrics`
 
@@ -463,7 +555,7 @@ body can invent a new time series with.
 | metric | what it answers |
 |---|---|
 | `gw_routes{service,outcome}` | the whole day in one metric: what got routed where, and how it ended |
-| `gw_router_confidence` | a router pinned at 0.95 is a router that never doubts |
+| `gw_router_confidence{level}` | a router pinned at `high` is a router that never doubts |
 | `gw_router_duration_seconds` | the classification call alone |
 | `gw_backend_duration_seconds{service}` | the forward, kept separate — "/ask is slow" has two causes |
 | `gw_proxy_requests{service,status}` | the passthrough, which never involves a model |
@@ -475,7 +567,7 @@ outage. Both are "no answer" and they need completely different fixes.
 
 ## Tests
 
-81, offline, no model and no backends:
+83, offline, no model and no backends:
 
 ```bash
 cd services/gateway && python -m pytest tests/ -q
