@@ -1,13 +1,7 @@
 """The four services, described once.
 
-Three consumers read this table and they must not disagree: the router prompt is generated
-from `answers`, the needs-check reads `needs`, and the proxy reads `url()` and `token()`.
-Writing a service's shape down twice is how a router starts recommending a service the
-forwarding code cannot reach.
-
-`answers` is prompt text, so it is written for a model rather than for a developer -- and
-each entry names what its service needs, because the model's classification and the code's
-needs-check have to agree about that or the two halves of a decline contradict each other.
+`answers` is prompt text -- the router's catalogue is generated from it, so edits here
+change routing behaviour. See Readme.md before rewording one.
 """
 
 import json
@@ -15,52 +9,30 @@ import os
 from dataclasses import dataclass
 from typing import Callable
 
-# Compose service names, not localhost: inside the gateway container `localhost` is the
-# gateway, and three of the four siblings bind 127.0.0.1 on the host so
-# host.docker.internal cannot reach them either. Only a bare `python app.py` wants ports
-# on localhost, and that is what the env vars are for.
-#
-# ponytail: four env vars rather than one templated base. A per-service override is what a
-# split deploy needs, and the four are already written down in .env.example anyway.
-
 
 @dataclass(frozen=True)
 class Backend:
     name: str
-    # Goes into the router prompt verbatim.
     answers: str
     path: str
     url_env: str
+    # Compose service names: inside the container `localhost` is the gateway.
     default_url: str
     # Empty for log-analyzer, which has no auth of its own.
     token_env: str
-    # None means the question alone is enough. Anything else is the field name the caller
-    # has to attach, and the string the needs-check reports.
+    # None means the question alone is enough; otherwise the field the caller must attach.
     needs: str | None
-    # What to tell a caller who did not attach it. Not derivable from `needs`: "raw_log"
-    # does not tell anybody where to get one.
+    # What to tell a caller who did not attach it; not derivable from `needs`.
     hint: str
     body: Callable[[str, str], dict]
 
     def url(self) -> str:
-        """Resolved per call, not frozen at import.
-
-        The sibling services read their config once at import and report it on /health,
-        which is right for a policy value somebody might have got wrong. A backend address
-        is not policy -- it is the difference between a test pointing at a local stub and a
-        container pointing at compose DNS, and an import-time read makes the first of those
-        need `object.__setattr__` on a frozen dataclass.
-        """
+        """Per call, not at import, so a test can point this at a stub."""
         return os.getenv(self.url_env) or self.default_url
 
     def token(self) -> str:
-        """The backend's own bearer token, or empty if it has none.
-
-        Split on comma and take the first: security-triage's ST_API_TOKENS is plural (one
-        per onboarded repo) while the others are singular. A singular value contains no
-        comma, so one code path covers both and there is no per-backend flag saying which
-        shape to expect.
-        """
+        """First of a comma-separated value, so plural ST_API_TOKENS and the singular
+        others take one code path."""
         if not self.token_env:
             return ""
         raw = os.getenv(self.token_env, "")
@@ -74,14 +46,7 @@ class Backend:
 BACKENDS: tuple[Backend, ...] = (
     Backend(
         name="knowledge-copilot",
-        # Rewritten 2026-08-26 from the first measured run, where this service was the
-        # catalogue's attractor: picked 8 times out of 24 and wrong on 3 of them, and the
-        # model's stated reason for the worst miss was the bare phrase "operational
-        # question" -- a quotation of this very description. Three things had to go:
-        # "operational questions", the broadest phrase in the whole catalogue; "what an
-        # alert means", which collides head-on with both log-analyzer and the agent; and
-        # "Needs nothing but the question", which reads as "pick me when unsure". What
-        # replaces them is narrow, and the last sentence pushes back rather than inviting.
+        # Narrowed 2026-08-26: the broad first version made this the catalogue's attractor.
         answers=(
             "Looks up what this team has already written down: a documented procedure, an "
             "agreed escalation path, a definition or threshold this team has settled on, a "
@@ -96,8 +61,7 @@ BACKENDS: tuple[Backend, ...] = (
         token_env="KC_API_TOKEN",
         needs=None,
         hint="",
-        # No `k`: the copilot has its own default and duplicating it here gives it a
-        # second place to drift from.
+        # No `k`: the copilot's own default is the only place that number should live.
         body=lambda question, attachment: {"question": question},
     ),
     Backend(
@@ -145,20 +109,16 @@ BACKENDS: tuple[Backend, ...] = (
         token_env="ST_API_TOKENS",
         needs="scan envelope",
         hint="attach `scan.sh`'s output envelope as JSON in `attachment`",
-        # The attachment *is* the request body: scan.sh already emits exactly the envelope
-        # POST /triage takes, repo and all, so re-assembling one here would only be a
-        # chance to assemble it differently.
+        # scan.sh already emits exactly what POST /triage takes.
         body=lambda question, attachment: json.loads(attachment),
     ),
 )
 
 BY_NAME: dict[str, Backend] = {b.name: b for b in BACKENDS}
 
-# The enum the router's schema constrains `service` to. Built from the table so a fifth
-# backend cannot be added without the model being allowed to name it.
+# What router.py constrains the model's `service` field to.
 NAMES: tuple[str, ...] = tuple(BY_NAME)
 
 
 def catalogue() -> str:
-    """The service list, as the router prompt sees it."""
     return "\n".join(f"- {b.name}: {b.answers}" for b in BACKENDS)

@@ -148,9 +148,7 @@ def test_triage_answering_202_is_accepted_and_not_answered(client, routed, upstr
 
 
 def test_the_model_declining_is_a_200_that_names_no_service(client, routed, upstream):
-    """A declared refusal is a 200 with a field, following the two services that already do
-    it: triage returns needs_human inside a 200 and the copilot returns grounded false.
-    """
+    """A declared refusal is a 200 with a field, like triage's needs_human."""
     routed(NONE, "high", "could be the log analyzer or the cluster agent")
     upstream(FakeResponse(200, {"never": "called"}))
 
@@ -183,8 +181,7 @@ def test_a_low_confidence_route_is_declined_and_says_what_it_would_have_picked(
 
 
 def test_the_right_service_with_no_attachment_asks_for_one(client, routed, upstream):
-    """The honest end of the plan's own example. "why did checkout start 500ing at 3am" is
-    log-analyzer's question, and log-analyzer analyses text it is handed."""
+    """log-analyzer's question, and log-analyzer analyses text it is handed."""
     routed("log-analyzer", "high", "asks why a service returned errors")
     calls = upstream(FakeResponse(200, {"never": "called"}))
 
@@ -392,8 +389,7 @@ def test_the_proxy_requires_a_token(client):
 
 
 def test_the_proxy_does_not_shadow_the_gateways_own_routes(client, monkeypatch):
-    """Under /s/ rather than at the root so it cannot ever shadow /ask, /health or
-    /metrics; a bare /{service}/{path} would depend on route declaration order."""
+    """Under /s/ so it cannot shadow the gateway's own routes."""
     monkeypatch.setattr(
         app_module.requests, "get", lambda url, timeout=None: FakeResponse(200, {})
     )
@@ -429,10 +425,8 @@ def _health_stub(statuses: dict[str, dict], ollama=("test-router-model",)):
 
 
 def test_health_reports_an_unreachable_model_backend(client, monkeypatch):
-    """Constructing a provider does no I/O, so without the /api/tags call this endpoint
-    reports a healthy router while the model behind it is down -- and the caller finds out
-    as a 503 from /ask. The laptop hosting Ollama is *expected* to sleep, so this is a
-    normal state that has to be legible."""
+    """Constructing a provider does no I/O, so without /api/tags this calls an unreachable
+    model healthy."""
     monkeypatch.setattr(
         app_module.requests,
         "get",

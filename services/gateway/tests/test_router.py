@@ -28,8 +28,7 @@ class FakeProvider:
 
 @pytest.fixture
 def use(monkeypatch):
-    """Install a fake provider. get_router_provider is lru_cached, so patching the name
-    router.py imported is the only version of this that actually takes effect."""
+    """get_router_provider is lru_cached, so patch the name router.py imported."""
 
     def install(answer: str):
         fake = FakeProvider(answer)
@@ -43,18 +42,14 @@ def use(monkeypatch):
 
 
 def test_the_schema_offers_the_four_services_and_nothing_else():
-    """An invented service name is not validated away after the fact -- it is
-    unrepresentable. Both providers get this as one flat `enum`, which is why `none` is a
-    member of it rather than the field being nullable."""
+    """One flat `enum`, so an invented name is unrepresentable rather than rejected."""
     field = Route.model_json_schema()["properties"]["service"]
     assert field["enum"] == list(backends.NAMES) + [NONE]
     assert "anyOf" not in field
 
 
 def test_reason_is_generated_before_the_service_it_explains():
-    """Field order is behaviour, not formatting. Generation is left to right, so this order
-    makes the explanation a premise; reverse it and the model picks first and writes
-    whatever justifies the pick, which reads identically and is worth nothing."""
+    """Generation is left to right, so this order makes the explanation a premise."""
     assert list(Route.model_json_schema()["properties"]) == [
         "reason",
         "service",
@@ -75,12 +70,8 @@ def test_reason_is_capped_rather_than_asked_nicely():
 
 
 def test_confidence_is_an_enum_the_grammar_can_enforce():
-    """The finding that made this a `Literal` instead of a float. Both candidate models
-    emitted out-of-range numbers against `ge=0.0, le=1.0` -- `10` from the 1.5b and `2`
-    from the 7b that ships -- because grammar-constrained decoding enforces structure and
-    not value ranges, so the bound was Pydantic rejecting after the fact and every
-    rejection was a 502. As an enum it is unrepresentable, exactly like `service`.
-    """
+    """A grammar enforces membership but not numeric bounds, so `ge/le` was a post-hoc
+    rejection both models tripped. As an enum it is unrepresentable."""
     field = Route.model_json_schema()["properties"]["confidence"]
     assert field["enum"] == list(router.LEVELS)
     assert field["type"] == "string"
@@ -101,11 +92,8 @@ def test_the_system_prompt_lists_every_service():
 
 
 def test_the_prompt_defines_the_levels_without_naming_the_bar():
-    """The model needs the vocabulary, so low/medium/high have to appear or it is guessing
-    at an enum. Which level the gateway *acts* on is a different fact and stays out: name a
-    threshold to a model and you get a model that reports one notch above it, and then the
-    floor is measuring its own instruction.
-    """
+    """The levels have to appear or the model is guessing at an enum. The bar stays out:
+    name a threshold and the model reports one notch above it."""
     for level in router.LEVELS:
         assert level in router.SYSTEM_PROMPT
 
@@ -121,10 +109,7 @@ def test_a_question_with_no_attachment_carries_no_attachment_block():
 
 
 def test_an_attachment_reaches_the_router_truncated(monkeypatch):
-    """An attachment is real evidence -- a JSON alert is almost certainly the agent's -- and
-    the first couple of hundred characters carry all of that signal. Sending a 16 MiB scan
-    envelope to a classifier would be paying LLM prices to reread what a dict lookup
-    knows."""
+    """Enough to be evidence, not enough to pay LLM prices for."""
     monkeypatch.setattr(router, "ATTACHMENT_PREVIEW", 20)
     prompt = build_user_prompt("what is this", "A" * 500)
 
@@ -158,8 +143,7 @@ def test_a_good_answer_becomes_a_route(use):
 
 
 def test_non_json_is_a_502_and_never_a_default_route(use):
-    """There is no safe service to fall back to. Picking one would be exactly the behaviour
-    `none` exists to prevent, decided by a bug instead of by the model."""
+    """A default route would be the behaviour `none` exists to prevent, chosen by a bug."""
     use("I think this is probably the log analyzer?")
 
     with pytest.raises(GatewayProviderError) as caught:
@@ -195,8 +179,7 @@ def test_a_confident_route_passes_through_with_nothing_added():
 
 
 def test_the_floor_overrides_a_service_the_model_named():
-    """The failure mode a confidence field exists to catch: a model that picks something
-    rather than nothing."""
+    """The failure mode the field exists to catch: picking something over nothing."""
     route = Route(reason="a guess", service="security-triage", confidence="low")
     name, note = decision(route)
 
@@ -213,9 +196,7 @@ def test_the_floor_is_inclusive_at_its_own_level(monkeypatch):
 
 
 def test_raising_the_bar_to_high_rejects_medium(monkeypatch):
-    """The levels are ranked by position in LEVELS, not compared as strings: `"low" <
-    "medium"` is true alphabetically and `"medium" < "high"` is not, so the obvious
-    comparison is wrong in a way that passes half its cases."""
+    """Ranked by position, not as strings: `"medium" < "high"` is false alphabetically."""
     assert router.LEVELS == ("low", "medium", "high")
     monkeypatch.setattr(router, "ROUTE_ON", "high")
 

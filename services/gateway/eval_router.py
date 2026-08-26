@@ -1,16 +1,8 @@
 """Golden-route regression eval, and the measurement that picks the router's model.
 
-Two degenerate routers exist and both are easy to ship by accident: one that names a
-service for everything, and one that declines everything. The eval set is built so each
-fails about half of it. A case with a named `expect` is one this repo says is definitely
-that service's, so declining it is a miss; a case with `expect: null` is one nothing should
-be confident about, so naming a service is a miss. A score is only meaningful because both
-mistakes cost the same here.
-
-Some cases accept a list, which is the same concession `eval_triage.py` makes with bands:
-local Ollama is not reproducible even at `temperature: 0`, and a question that genuinely
-fits two services should not flap the score. A list including `null` means declining is
-also defensible.
+The set is built so both degenerate routers score badly: a named `expect` makes declining a
+miss, `expect: null` makes naming a service a miss. A list accepts any of its members, the
+same concession eval_triage.py makes with bands. See Readme.md.
 
     python eval_router.py                                  # the shipped provider and model
     python eval_router.py --model qwen2.5-coder:1.5b        # the cheap candidate
@@ -40,8 +32,7 @@ console = Console()
 def load_cases(path: Path) -> list[dict]:
     """The eval set, checked against the service names that actually exist.
 
-    A case naming a retired service would otherwise fail forever for a reason that looks
-    like a model regression.
+    A case naming a retired service would otherwise look like a model regression.
     """
     import backends
 
@@ -62,11 +53,8 @@ def load_cases(path: Path) -> list[dict]:
 
 
 def grade(case: dict, routed: str | None) -> tuple[bool, str]:
-    """`routed` is what the gateway would act on -- after the confidence floor, not before.
-
-    Grading the model's raw pick would score a router the gateway then overrides, which is
-    not the thing anybody uses.
-    """
+    """`routed` is post-floor: grading the raw pick would score a decision the gateway
+    then overrides."""
     expected = case["expect"]
     allowed = expected if isinstance(expected, list) else [expected]
 
@@ -97,24 +85,17 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
     table.add_column("routed")
     table.add_column("conf", justify="right", style="dim")
     table.add_column("s", justify="right", style="dim")
-    # Clipped rather than wrapped: an unreachable backend puts a whole connection-pool
-    # traceback in this cell, and wrapping it turns one row into fifteen. The full text
-    # still prints under the table.
+    # Clipped, not wrapped: a connection traceback here turns one row into fifteen.
     table.add_column(
         "why", max_width=30, style="dim", no_wrap=True, overflow="ellipsis"
     )
     table.add_column("", justify="center")
 
     for row in rows:
-        # A level name now, not a float. This line said `f"{confidence:.2f}"` and crashed
-        # the whole report on the first run after the schema changed -- the suite never
-        # noticed because nothing here tested `report()` at all, despite it being the third
-        # thing in this function to break. There is a test now.
         confidence = row["confidence"]
         if row["error"]:
             got = "[red](error)[/red]"
         elif row["declined_by"] == "floor":
-            # The gateway's call, not the model's: it named a service and was overruled.
             got = "(floor)"
         elif row["declined_by"] == "none":
             got = "(none)"
@@ -134,14 +115,9 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
     passed = sum(r["passed"] for r in rows)
     errored = [r for r in rows if r["error"]]
 
-    # The two numbers that actually decide anything. A router is useful only if both stay
-    # low: one counts the questions it should have placed and refused to, the other counts
-    # the ones it had no business being sure about. Optimising either alone is trivial and
-    # produces a router nobody would ship.
-    #
-    # Errored cases are excluded from both. A case the model never answered is not evidence
-    # about how the model answers, and counting it as a decline is how an outage gets
-    # written down as a finding.
+    # Both have to stay low; optimising either alone produces a router nobody would ship.
+    # Errored cases are excluded -- counting them as declines writes an outage down as a
+    # finding.
     graded = [r for r in rows if not r["error"]]
     definite = [r for r in graded if r["case"]["expect"] is not None]
     vague = [r for r in graded if r["case"]["expect"] is None]
@@ -154,15 +130,12 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
         f"answered a vague one: {over_confident}/{len(vague)}"
     )
 
-    # Who did the declining, which is the only way to tell whether GW_ROUTE_ON is earning
-    # its place. Floor declines are the ones the bar is responsible for: raise it and there
-    # are more, lower it and they become routes. Model declines are unaffected by it.
+    # Only floor declines respond to GW_ROUTE_ON, so the split says whether the bar earns
+    # its place.
     by_model = sum(1 for r in graded if r["declined_by"] == "none")
     by_floor = sum(1 for r in graded if r["declined_by"] == "floor")
     if by_model or by_floor:
-        # Imported here rather than at module scope for the same reason main() does it:
-        # --model and --provider have to reach the environment before provider.py is read.
-        # By the time report() runs it is already in sys.modules, so this costs nothing.
+        # Local, like main()'s: --model must reach the env before provider.py is read.
         import router
 
         console.print(
@@ -175,8 +148,7 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
             f"below is not a measurement of routing: {errored[0]['why']}"
         )
 
-    # Latency per route is the number a human feels, and the mean is the honest form of it
-    # here: every case is one call on the same prompt, so there is no long tail to hide.
+    # The mean is honest here: every case is one call on the same prompt.
     seconds = [r["seconds"] for r in rows]
     console.print(
         f"{elapsed:.0f}s total, {sum(seconds) / len(seconds):.1f}s per route, "
@@ -184,12 +156,8 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
         f"({sum(tokens) / len(rows):.0f} per route)"
     )
 
-    # `reason` is generated before `service` so the classification is conditioned on
-    # stated reasoning rather than justifying a pick already made. That only works if the
-    # reason is actually reasoning -- and the first measured run had five of six misses
-    # explained by three words or fewer ("OOMKilled", "scaling question", "operational
-    # question"). Whether the passes were any better was unanswerable, because this report
-    # printed reasons for misses only. Hence both numbers, and every reason below.
+    # The field-order trick only works if the reason is actually reasoning, and a
+    # degenerate two-word label is not. Hence both medians, and every reason below.
     if graded:
         hit_words = [_words(r) for r in graded if r["passed"]]
         miss_words = [_words(r) for r in graded if not r["passed"]]
@@ -198,9 +166,8 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
             f"right, {median(miss_words) if miss_words else 0:.0f} when wrong"
         )
 
-    # A router that picked wrong for a stated reason is a prompt problem; one that picked
-    # wrong for an unrelated reason is a model problem. Only the sentence tells them apart,
-    # and only having the right ones to compare against makes it readable.
+    # Wrong for a stated reason is a prompt problem; wrong for an unrelated one is a model
+    # problem. Only the sentence tells them apart.
     for row in rows:
         if row["reason"]:
             mark = "[green]ok  [/green]" if row["passed"] else "[red]miss[/red]"
@@ -225,8 +192,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # Set before importing provider: both are read in a constructor, and
-    # get_router_provider is lru_cached so there is no second chance.
+    # Before importing provider: get_router_provider is lru_cached.
     if args.provider:
         os.environ["GW_LLM_PROVIDER"] = args.provider
     if args.model:
@@ -248,12 +214,9 @@ def main() -> int:
         f"({provider.model_name}), acting on {router.ROUTE_ON} confidence and up"
     )
 
-    # One throwaway call before the clock starts, because Ollama loads the model on first
-    # use and that load lands on whichever case happens to be first. Measured: 17.3s
-    # against a ~9s median on 7b, 27.6s against ~5s on 1.5b -- and on a 5-case run it
-    # exceeded GW_LLM_TIMEOUT outright, so case one was reported as an error that had
-    # nothing to do with routing. Failures here are swallowed: if the backend is genuinely
-    # down, all 24 cases are about to say so with their own error text.
+    # Ollama loads the model on first use, and that load otherwise lands on case one --
+    # once badly enough to blow through GW_LLM_TIMEOUT. Failures here are swallowed: the
+    # real cases are about to report the same outage themselves.
     if not args.no_warmup:
         console.print("[dim]warming the model (not counted)...[/dim]")
         try:
@@ -273,11 +236,8 @@ def main() -> int:
             routed, _ = router.decision(route)
             confidence, reason, error = route.confidence, route.reason, None
             if routed is None:
-                # The distinction the whole design rests on, and the table hid it: a
-                # `(decline)` is either the model saying it cannot place the question, or
-                # the floor overriding a service it named too tentatively. Only the second
-                # is affected by GW_ROUTE_ON, so without this you cannot tell whether the
-                # bar is earning its place or costing you cases.
+                # Which of the two declines it was; only the floor one responds to
+                # GW_ROUTE_ON.
                 declined_by = "none" if route.service == router.NONE else "floor"
         except Exception as e:
             # One unreachable backend should not throw away the cases that did run: a
@@ -292,9 +252,7 @@ def main() -> int:
                 "passed": passed,
                 "why": why,
                 "routed": routed,
-                # Kept apart from `routed is None`, which also means "declined". Without
-                # this, a run against a dead backend prints a table of declines and a
-                # summary blaming the model for an outage.
+                # Apart from `routed is None`, which also means declined.
                 "error": error,
                 "declined_by": declined_by,
                 "confidence": confidence,
@@ -308,8 +266,7 @@ def main() -> int:
 
     all_passed = report(rows, elapsed, tokens)
 
-    # The one line eval_all.py at the repo root reads. Every eval in this repo ends with
-    # it, so the cross-service table does not have to parse five report formats.
+    # The one line eval_all.py reads; every eval in this repo ends with it.
     print(
         "EVAL_RESULT "
         + json.dumps({"passed": sum(r["passed"] for r in rows), "total": len(rows)})

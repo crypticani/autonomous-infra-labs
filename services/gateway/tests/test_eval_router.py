@@ -1,8 +1,6 @@
 """The eval's own grading, checked without a model.
 
-Worth its own file because the grading is the eval's whole claim. A scorer that quietly
-gave both degenerate routers a good mark would keep printing a number and the number would
-mean nothing -- and nothing else in the suite reads eval_set.json.
+The grading is the eval's whole claim, and nothing else in the suite reads eval_set.json.
 """
 
 import json
@@ -60,10 +58,7 @@ def test_routing_to_the_wrong_service_is_a_miss():
 
 
 def test_both_degenerate_routers_fail_about_half_the_set():
-    """The reason a score here is worth reading. A router that names a service for
-    everything and one that declines everything are both easy to ship by accident, and both
-    have to be punished or the number is decoration.
-    """
+    """Both are easy to ship by accident, so both have to be punished."""
     always_declines = sum(grade(c, None)[0] for c in CASES)
     always_guesses = sum(grade(c, "knowledge-copilot")[0] for c in CASES)
 
@@ -88,10 +83,7 @@ def test_every_service_is_represented():
 
 
 def test_the_keyword_trap_pairs_expect_different_services():
-    """Two questions about the same subject that differ only in what they ask for. If a
-    router passes the rest of the set and fails these, it is matching words rather than
-    intent -- and the prompt has a rule against exactly that.
-    """
+    """Same subject, different ask: failing these means matching words, not intent."""
     by_label = {c["label"]: c for c in CASES}
     assert by_label["discrimination pair A: what does the log mean"]["expect"] == (
         "log-analyzer"
@@ -108,21 +100,19 @@ def test_the_keyword_trap_pairs_expect_different_services():
 
 
 def test_labels_are_unique():
-    """The table is read by label, so two rows sharing one is a report you cannot act on."""
+    """The table is read by label."""
     labels = [c["label"] for c in CASES]
     assert len(set(labels)) == len(labels)
 
 
 def test_every_question_is_long_enough_for_the_endpoint_to_accept():
-    """AskRequest sets min_length=10, so a case shorter than that grades a route the real
-    /ask would have 422'd before reaching the router."""
+    """AskRequest sets min_length=10; a shorter case grades a route /ask would 422."""
     for case in CASES:
         assert len(case["question"]) >= 10, case["label"]
 
 
 def test_load_cases_rejects_a_service_that_does_not_exist(tmp_path):
-    """A case naming a retired service would otherwise fail forever for a reason that looks
-    like a model regression."""
+    """Otherwise it fails forever, looking like a model regression."""
     bad = tmp_path / "eval_set.json"
     bad.write_text(json.dumps([{"label": "x", "question": "y", "expect": "grafana"}]))
 
@@ -159,12 +149,8 @@ def _row(
 
 
 def test_the_report_renders_every_kind_of_row():
-    """`report()` has now broken three times -- an errored row printed as a decline, a
-    `why` column that wrapped a connection traceback across fifteen lines, and a level
-    formatted with `:.2f` after confidence stopped being a float. Each one got through
-    because nothing in the suite ever called this function. This is the cheapest thing that
-    fails the next time.
-    """
+    """report() broke three times before anything in the suite called it. This is the
+    cheapest check that fails the next time."""
     rows = [
         _row(
             "log-analyzer", "log-analyzer", "high", True, reason="asks what a log means"
@@ -206,8 +192,7 @@ def test_the_report_renders_every_kind_of_row():
 
 
 def test_the_report_survives_a_run_where_nothing_reached_the_model():
-    """Every row errored, so `graded` is empty -- which is a median over no samples and a
-    ratio with a zero denominator if either is written carelessly."""
+    """`graded` is empty: a median over no samples and a zero denominator."""
     rows = [_row("log-analyzer", None, None, False, why="boom", error="boom")]
     assert report(rows, elapsed=1.0, tokens=(0, 0)) is False
 

@@ -1,8 +1,6 @@
 """The counters, checked through the endpoints rather than by calling .inc().
 
-A metric asserted on directly proves the Counter works, which was never in doubt. What can
-actually break is the label a handler passes -- an outcome recorded under the wrong name is
-a dashboard that lies, and nothing else in the suite would notice.
+What can break is the label a handler passes; nothing else in the suite would notice.
 """
 
 import pytest
@@ -51,9 +49,7 @@ def test_each_outcome_lands_under_its_own_label(client, monkeypatch):
 
 
 def test_an_unroutable_ask_is_counted_under_none(client, monkeypatch):
-    """`service="none"` rather than the sentinel string leaking into a label, and kept apart
-    from a backend outage: they are both "no answer" and they need very different fixes.
-    """
+    """Kept apart from a backend outage: both are "no answer", with different fixes."""
     _route(monkeypatch, NONE)
     before = metric("gw_routes_total", service="none", outcome="unroutable")
 
@@ -63,14 +59,9 @@ def test_an_unroutable_ask_is_counted_under_none(client, monkeypatch):
 
 
 def test_a_confidence_the_floor_will_reject_is_still_recorded(monkeypatch):
-    """The counter has to see the low levels or it cannot show that the floor ever fires. A
-    router that is always sure is a router that never doubts, and that is the failure mode
-    the confidence field exists to catch -- so the observation belongs in classify(), before
-    anything decides whether to act on the route.
-
-    Goes through router.classify rather than the endpoint, because the endpoint tests stub
-    classify out and a stub cannot record anything.
-    """
+    """The counter has to see the low levels or it cannot show the floor firing, so the
+    observation belongs in classify(). Goes through it directly: the endpoint tests stub
+    classify out."""
     import json
 
     import router
@@ -115,8 +106,7 @@ def test_an_oversized_body_is_counted_before_it_is_parsed(client):
 
 
 def test_the_proxy_records_the_upstream_status_class(client, monkeypatch):
-    """Class, not the exact code: a 404 and a 422 from a backend are the same operational
-    fact here, and per-code series would be a cardinality bill for nothing."""
+    """Class, not the exact code: per-code series would be cardinality for nothing."""
     monkeypatch.setattr(
         app_module.requests,
         "request",
@@ -132,8 +122,7 @@ def test_the_proxy_records_the_upstream_status_class(client, monkeypatch):
 
 
 def test_an_unknown_service_is_a_refusal_and_not_a_proxy_request(client):
-    """It never reached a backend, so counting it under gw_proxy_requests would make the
-    unreachable rate depend on how often callers typo a service name."""
+    """It never reached a backend, so it must not move the unreachable rate."""
     before_refusal = metric("gw_refusals_total", reason="unknown_service")
 
     client.get("/s/grafana/api", headers=AUTH)

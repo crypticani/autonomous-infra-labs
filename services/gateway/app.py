@@ -1,15 +1,8 @@
 """FastAPI surface for the gateway.
 
-Four services behind one address, one edge token, and one endpoint that decides which of
-them a plain-English question belongs to.
-
-POST /ask always answers 200 when the gateway itself worked, and the `outcome` field is the
-contract -- `unroutable` and `needs_input` are results, not errors. That follows the two
-services that already do it: triage returns `needs_human` inside a 200, and the copilot
-returns `grounded: false` the same way. A backend failure is different and does surface as
-the backend's own status code, because nothing about that is a legitimate answer.
-
-GET /s/{service}/{path} is the plain passthrough, and involves no model at all.
+POST /ask answers 200 whenever the gateway itself worked; `outcome` is the contract, and
+`unroutable` / `needs_input` are results rather than errors. A backend failure surfaces as
+the backend's own status code. GET /s/{service}/{path} is the plain passthrough.
 """
 
 import hashlib
@@ -46,38 +39,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Plural, following security-triage: one token per caller, so revoking a leaked one is a
-# list edit rather than a rotation everybody has to be told about.
+# Plural: one token per caller, so revoking a leaked one is a list edit.
 TOKENS = {t.strip() for t in os.getenv("GW_API_TOKENS", "").split(",") if t.strip()}
 
-# 16 MiB, matching security-triage's, because the same scan envelope can arrive here as an
-# `attachment` and then be forwarded there. A smaller cap at the edge would make the
-# gateway refuse bodies the service behind it accepts.
-#
-# nginx caps uploads at 1 MiB by default and sits in front of this in the real deploy, so
-# it is the binding limit until `client_max_body_size` is raised. See the Readme.
+# Matches security-triage's: the same scan envelope arrives here and is forwarded there.
+# nginx's own 1 MiB default is the binding limit until raised -- see Readme.md.
 MAX_BODY_BYTES = int(os.getenv("GW_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 
-# Generous next to triage's 5/hour, because this is a human-facing endpoint rather than a
-# CI job spending CPU-minutes. It exists at all because /ask spends a model call *before*
-# any backend's own limit gets a say, so without it one token can burn the router freely.
+# /ask spends a model call before any backend's own limit applies, hence a limit here.
 MAX_ASKS_PER_HOUR = int(os.getenv("GW_MAX_ASKS_PER_HOUR", "60"))
 RATE_WINDOW = int(os.getenv("GW_RATE_WINDOW", "3600"))
 
-# The /ask forward. 300 because the copilot's own LLM_TIMEOUT is 300 and it is the slowest
-# of the four; the rest answer in seconds and triage answers 202 immediately.
+# The /ask forward. 300 clears the copilot's own LLM_TIMEOUT, the slowest of the four.
 BACKEND_TIMEOUT = int(os.getenv("GW_BACKEND_TIMEOUT", "300"))
 
-# Much shorter, and a different number for a different job: /health is what the container's
-# HEALTHCHECK and Prometheus both call, so a wedged backend must not hold it open. Four
-# fan out concurrently, so this is the whole endpoint's worst case, not four times it.
+# Shorter, and a separate knob: /health serves the container HEALTHCHECK and Prometheus.
 HEALTH_TIMEOUT = int(os.getenv("GW_HEALTH_TIMEOUT", "5"))
 
 _starts: dict[str, list[float]] = {}
 
-# Four threads for four backends, so /health costs one HEALTH_TIMEOUT rather than four.
-# A module-level pool rather than one per request: `with ThreadPoolExecutor(...)` spawns
-# and joins four OS threads on every scrape, and Prometheus scrapes forever.
+# Module-level: Prometheus scrapes forever, and a per-request pool would spawn four
+# threads each time.
 _health_pool = ThreadPoolExecutor(
     max_workers=len(BACKENDS), thread_name_prefix="health"
 )
@@ -137,10 +119,9 @@ app = FastAPI(
 
 @app.middleware("http")
 async def cap_body_size(request: Request, call_next):
-    """Middleware, not `Depends`: FastAPI parses the body before it solves dependencies, so
-    a `Depends` guard fires only after the megabytes it exists to refuse are already dicts.
-    Returns a response rather than raising -- an HTTPException here is outside FastAPI's
-    handlers and 500s.
+    """Middleware, not `Depends`: FastAPI parses the body before solving dependencies.
+
+    Returns a response rather than raising -- an HTTPException here would 500.
     """
     if request.method in ("POST", "PUT", "PATCH"):
         error = body_size_error(request.headers.get("content-length"))
@@ -156,10 +137,8 @@ class AskRequest(BaseModel):
     question: str = Field(
         min_length=10, description="What you want to know, in English"
     )
-    # A string rather than a dict, even for the two backends that want JSON: a raw log is
-    # text, and one field that is sometimes text and sometimes an object is a field every
-    # caller has to special-case. The two JSON backends parse it, and a parse failure is a
-    # 400 that names which.
+    # A string even for the two JSON backends: one field that is sometimes text and
+    # sometimes an object is one every caller has to special-case.
     attachment: str = Field(
         default="",
         description="The material the chosen service needs: log text, or JSON",
@@ -167,23 +146,17 @@ class AskRequest(BaseModel):
 
 
 class AskResponse(BaseModel):
-    """`service`, `confidence` and `reason` are present on every outcome, successes
-    included. That is deliberate: a router you cannot second-guess after the fact is one
-    whose mistakes are invisible, and the confident answers are only worth something if a
-    wrong route is legible next to them.
-    """
+    """`service`, `confidence` and `reason` ride on every outcome, successes included, so
+    a misroute is legible in the answer rather than hidden behind it."""
 
     outcome: Literal["answered", "accepted", "needs_input", "unroutable", "failed"]
     service: str | None
-    # Three levels, not a float, and the change is measured rather than cosmetic: see
-    # router.LEVELS. A float's range is the one constraint the model's grammar could not
-    # enforce, so out-of-range answers reached this field as 502s.
     confidence: router.Confidence
     # The model's sentence.
     reason: str
-    # The gateway's, when it has something of its own to say.
+    # The gateway's, when it overrode or could not use the route.
     detail: str | None = None
-    # Set only on needs_input: the field the caller has to attach.
+    # needs_input only: the field the caller has to attach.
     needs: str | None = None
     answer: Any = None
     attributed_to: str | None = None
@@ -210,10 +183,7 @@ def _reply(outcome: str, route, **extra) -> AskResponse:
 def ask(request: AskRequest, response: Response, caller: str = Depends(require_token)):
     """Classify, then forward -- or say why not.
 
-    The two refusals here come from different places on purpose. `unroutable` is the
-    model's judgment, arriving as service "none" or as a confidence below the floor.
-    `needs_input` is a dict lookup against the backend table and involves no model at all,
-    which is what makes it the one refusal that cannot be wrong.
+    `unroutable` is the model's call; `needs_input` is a table lookup. See Readme.md.
     """
     check_rate(caller)
 
@@ -232,9 +202,7 @@ def ask(request: AskRequest, response: Response, caller: str = Depends(require_t
     backend = BY_NAME[name]
 
     if backend.needs and not request.attachment:
-        # The honest end of the plan's own examples: "why did checkout start 500ing at 3am"
-        # is log-analyzer's question and log-analyzer analyses text it is handed. Naming
-        # the service and refusing beats inventing a log to send it.
+        # Name the service and refuse, rather than inventing material to send it.
         return _reply(
             "needs_input",
             route,
@@ -263,8 +231,6 @@ def ask(request: AskRequest, response: Response, caller: str = Depends(require_t
             time.perf_counter() - started
         )
         logger.error(f"{name} unreachable at {target}: {e}")
-        # The backend's failure, reported with the backend's name on it, and 503 rather
-        # than a 200 carrying an apology.
         response.status_code = 503
         return _reply(
             "failed",
@@ -279,9 +245,7 @@ def ask(request: AskRequest, response: Response, caller: str = Depends(require_t
 
     if upstream.status_code >= 400:
         logger.warning(f"{name} answered {upstream.status_code}")
-        # Mirrored, not flattened to 502: a 422 from the backend means the caller's
-        # attachment was wrong and a 429 means it should try later. Those are different
-        # instructions and only the real status carries them.
+        # Mirrored, not flattened to 502: a 422 and a 429 are different instructions.
         response.status_code = upstream.status_code
         return _reply(
             "failed",
@@ -292,8 +256,7 @@ def ask(request: AskRequest, response: Response, caller: str = Depends(require_t
         )
 
     if upstream.status_code == 202:
-        # Only security-triage. Calling a pending run "answered" would be a lie the
-        # response body immediately contradicts.
+        # security-triage only; a pending run is not an answer.
         run_id = answer.get("run_id") if isinstance(answer, dict) else None
         return _reply(
             "accepted",
@@ -308,10 +271,8 @@ def ask(request: AskRequest, response: Response, caller: str = Depends(require_t
 
 
 def _safe_json(upstream: requests.Response) -> Any:
-    """A backend's body, whatever shape it came in.
-
-    A 502 page from an intermediary is not JSON, and letting `.json()` raise here would
-    turn somebody else's outage into a stack trace in this service's logs.
+    """A backend's body, whatever shape it came in -- an intermediary's 502 page is not
+    JSON, and `.json()` raising here would make somebody else's outage look like ours.
     """
     try:
         return upstream.json()
@@ -325,22 +286,12 @@ def _safe_json(upstream: requests.Response) -> Any:
     dependencies=[Depends(require_token)],
 )
 def proxy(service: str, path: str, request: Request, body: Any = Body(default=None)):
-    """The plain passthrough: one edge token in, each backend's own token out.
+    """One edge token in, each backend's own token out. No model, no rewriting.
 
-    No model, no routing, no rewriting -- this is what a caller uses when it already knows
-    which service it wants, which is every CI job. Under /s/ rather than at the root so it
-    cannot ever shadow /ask, /health or /metrics; a bare `/{service}/{path}` would depend
-    on route declaration order to stay correct.
+    Under /s/ so it cannot shadow /ask, /health or /metrics. `Body(default=None)` is
+    load-bearing: FastAPI reads a bare `Any` from the query string, not the body.
 
-    `Body(default=None)` is load-bearing and the bare `Any = None` it replaced was a silent
-    bug: FastAPI reads an un-annotated `Any` from the query string, so every POST through
-    here forwarded an empty body to a backend that answered 422 about a field the caller
-    had definitely sent. A GET test passes either way, which is how it survived being
-    written.
-
-    ponytail: JSON only, and the whole upstream body lands in memory. Both are true of all
-    four backends. Upgrade path is httpx with `stream=True` and the raw content-type
-    forwarded rather than re-encoded.
+    ponytail: JSON only, whole body in memory. Upgrade path is httpx with stream=True.
     """
     backend = BY_NAME.get(service)
     if backend is None:
@@ -379,9 +330,7 @@ def _backend_health(backend) -> dict[str, Any]:
         body = _safe_json(upstream)
         return {
             "service": backend.name,
-            # The backend's own word for it, not a guess from the status code: all four
-            # answer 200 while calling themselves degraded, which is the case that
-            # matters and the one a status-code check would miss.
+            # Its own word for it: all four answer 200 while reporting degraded.
             "status": (
                 body.get("status", "unknown") if isinstance(body, dict) else "unknown"
             ),
@@ -395,22 +344,17 @@ def _backend_health(backend) -> dict[str, Any]:
             "status": "unreachable",
             "http": None,
             "latency_ms": round((time.perf_counter() - started) * 1000),
-            # Truncated: a connection error carries the whole URL and retry chain, and
-            # this response is read in a terminal.
+            # Truncated; a connection error carries the whole retry chain.
             "issues": [str(e)[:200]],
         }
 
 
 @app.get("/health")
 def health_check():
-    """Aggregated, and unauthenticated so the container's own HEALTHCHECK can run it.
+    """Every backend's own health, not just this process's liveness.
 
-    Reports every backend's own health rather than just this process's liveness -- a
-    gateway that says `healthy` while three of the four services behind it are down is
-    reporting on the wrong thing.
-
-    Fanned out concurrently: sequentially this would be four HEALTH_TIMEOUTs, which is
-    long enough to fail the container healthcheck it exists to serve.
+    Unauthenticated so the container HEALTHCHECK can run it, and fanned out concurrently
+    so the endpoint costs one HEALTH_TIMEOUT rather than four.
     """
     issues: list[str] = []
     provider_name = model = "unknown"
@@ -422,12 +366,8 @@ def health_check():
         provider = None
         issues.append(f"router provider unavailable: {e}")
 
-    # Constructing a provider does no I/O, so without this the endpoint reports a healthy
-    # router while the model behind it is unreachable -- and the caller finds out as a 503
-    # from /ask instead. Lifted from knowledge-copilot's /health, which has carried the
-    # same check since Day 12; log-analyzer's does it too, and this service is the one
-    # where it matters most: the laptop hosting Ollama is *expected* to be asleep, so
-    # "unreachable model" is a normal state that has to be legible rather than a surprise.
+    # Constructing a provider does no I/O, so without this /health calls an unreachable
+    # model healthy and the caller finds out as a 503 from /ask.
     if provider is not None and provider.name == "ollama":
         try:
             tags = requests.get(f"{provider.base_url}/api/tags", timeout=2)
@@ -440,8 +380,6 @@ def health_check():
             issues.append(f"Ollama unreachable at {provider.base_url}: {e}")
 
     if not TOKENS:
-        # A deploy that forgot GW_API_TOKENS is visible here rather than quietly serving
-        # every service behind it to the internet.
         issues.append("auth disabled: GW_API_TOKENS is unset")
 
     downstream = list(_health_pool.map(_backend_health, BACKENDS))
@@ -450,15 +388,13 @@ def health_check():
             issues.append(f"{entry['service']} is {entry['status']}")
 
     return {
-        # Degraded, never unhealthy: /ask still routes and still declines correctly with
-        # every backend down, and a container that reports itself dead gets restarted,
-        # which fixes nothing when the fault is somebody else's.
+        # Degraded, never unhealthy: /ask still routes with every backend down, and a
+        # restart fixes nothing when the fault is somebody else's.
         "status": "degraded" if issues else "healthy",
         "provider": provider_name,
         "model": model,
         "auth": f"{len(TOKENS)} token(s)" if TOKENS else "disabled",
-        # What this process loaded, not what the image ships: .env overrides image
-        # defaults and a stale one has cost an evening before.
+        # What this process loaded, not what the image ships.
         "policy": {
             "route_on": router.ROUTE_ON,
             "max_body_bytes": MAX_BODY_BYTES,
