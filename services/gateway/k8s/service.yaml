@@ -11,6 +11,6 @@ spec:
     app: gateway
   ports:
     - name: http
-      port: 7400
+      port: 7500
       targetPort: http
       protocol: TCP

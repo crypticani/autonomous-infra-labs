@@ -109,9 +109,9 @@ services:
       - .env
     # --workers 1: _starts holds the per-token rate-limit buckets and the Prometheus
     # registry is per-process.
-    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${GW_PORT:-7400}", "--workers", "1"]
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${GW_PORT:-7500}", "--workers", "1"]
     ports:
-      - "127.0.0.1:${GW_PORT:-7400}:${GW_PORT:-7400}"
+      - "127.0.0.1:${GW_PORT:-7500}:${GW_PORT:-7500}"
     # No depends_on, deliberately. The gateway is correct with every backend down: /ask
     # still routes and still declines, and /health is the endpoint that says which of the
     # four is missing. Waiting on them would delay the one service that can report on them.
@@ -119,7 +119,7 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:${GW_PORT:-7400}/health"]
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:${GW_PORT:-7500}/health"]
       interval: 60s
       timeout: 30s
       retries: 3

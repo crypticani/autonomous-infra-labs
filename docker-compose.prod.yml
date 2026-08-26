@@ -121,10 +121,10 @@ services:
     # --workers 1: _starts holds the per-token rate-limit buckets and the Prometheus
     # registry is per-process. This service does no work heavy enough to want a second --
     # every request it serves is spent waiting on somebody else's socket.
-    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${GW_PORT:-7400}", "--workers", "1"]
+    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "${GW_PORT:-7500}", "--workers", "1"]
     ports:
       # Loopback only; nginx terminates TLS on this host and proxies to it.
-      - "127.0.0.1:${GW_PORT:-7400}:${GW_PORT:-7400}"
+      - "127.0.0.1:${GW_PORT:-7500}:${GW_PORT:-7500}"
     # No user override and no volumes: nothing is bind-mounted, so the image's own uid
     # 10001 stands.
     #
@@ -135,7 +135,7 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "sh", "-c", "curl -f http://localhost:${GW_PORT:-7400}/health"]
+      test: ["CMD", "sh", "-c", "curl -f http://localhost:${GW_PORT:-7500}/health"]
       interval: 60s
       timeout: 30s
       retries: 3

@@ -43,10 +43,10 @@ RUN chown -R appuser:appgroup /app
 
 USER 10001
 
-EXPOSE 7400
+EXPOSE 7500
 
 # --workers 1 for two reasons: _starts holds the per-token rate-limit buckets, and the
 # Prometheus registry is per-process. Neither survives a second worker intact, and this
 # service does no work heavy enough to want one -- every request it serves is spent waiting
 # on somebody else.
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7400", "--workers", "1"]
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7500", "--workers", "1"]

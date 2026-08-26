@@ -663,7 +663,7 @@ the confidence floor's value does not appear in the system prompt, and one asser
 ```bash
 cd services/gateway
 pip install -r requirements.txt
-python app.py                                  # :7400
+python app.py                                  # :7500
 ```
 
 Locally the four backends are on localhost rather than compose DNS, so:
@@ -677,20 +677,20 @@ export GW_SECURITY_TRIAGE_URL=http://localhost:7300
 
 ```bash
 # what it thinks it can reach
-curl -sS localhost:7400/health | jq '.status, .backends[] | {service, status}'
+curl -sS localhost:7500/health | jq '.status, .backends[] | {service, status}'
 
 # a question one backend answers from a sentence
-curl -sS -X POST localhost:7400/ask \
+curl -sS -X POST localhost:7500/ask \
   -H "Authorization: Bearer $GW_TOKEN" -H 'Content-Type: application/json' \
   -d '{"question": "what is our documented procedure for draining a node"}' | jq
 
 # a question that needs material, without the material
-curl -sS -X POST localhost:7400/ask \
+curl -sS -X POST localhost:7500/ask \
   -H "Authorization: Bearer $GW_TOKEN" -H 'Content-Type: application/json' \
   -d '{"question": "why did checkout start 500ing at 3am"}' | jq '.outcome, .needs, .detail'
 
 # and with it
-curl -sS -X POST localhost:7400/ask \
+curl -sS -X POST localhost:7500/ask \
   -H "Authorization: Bearer $GW_TOKEN" -H 'Content-Type: application/json' \
   -d "$(jq -n --rawfile log /tmp/checkout.log \
         '{question: "why did checkout start 500ing at 3am", attachment: $log}')" | jq
@@ -698,7 +698,7 @@ curl -sS -X POST localhost:7400/ask \
 
 ## Deploying it
 
-Fifth entry in `docker-compose.prod.yml`, loopback bind on 7400, GHCR image published by
+Fifth entry in `docker-compose.prod.yml`, loopback bind on 7500, GHCR image published by
 `.github/workflows/gateway_ci.yml` on push to `main`. No `depends_on`, deliberately: the
 gateway is correct with every backend down, and making it wait would delay the one endpoint
 that can report which of the four is missing.
@@ -732,7 +732,7 @@ docker compose -f docker-compose.prod.yml pull gateway
 docker compose -f docker-compose.prod.yml up -d gateway
 
 # every backend's own status, not just this process's liveness
-curl -sS localhost:7400/health | jq '.status, .auth, (.backends[] | {service, status})'
+curl -sS localhost:7500/health | jq '.status, .auth, (.backends[] | {service, status})'
 ```
 
 `qwen2.5:7b-instruct` has to be pulled on whichever Ollama `GW_OLLAMA_BASE_URL` points at.
@@ -758,7 +758,7 @@ server {
     # /ask, /health, and the /s/{service}/{path} passthrough. Prefix matches, because
     # every one of them carries something after the first segment.
     location ~ ^/(ask|health|s/) {
-        proxy_pass http://127.0.0.1:7400;
+        proxy_pass http://127.0.0.1:7500;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
 

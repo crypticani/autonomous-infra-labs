@@ -76,7 +76,11 @@ because it wasn't anywhere until the fifth service needed a number.
 | knowledge-copilot | 7100 | `COPILOT_PORT` | `127.0.0.1` only, nginx proxies to it |
 | self-healing-agent | 7200 | `SHA_PORT` | `127.0.0.1` only |
 | security-triage | 7300 | `ST_PORT` | `127.0.0.1` only |
-| gateway | 7400 | `GW_PORT` | `127.0.0.1` only |
+| gateway | **7500** | `GW_PORT` | `127.0.0.1` only |
+
+**7500 skips 7400 on purpose.** The four backends are a series and the gateway is not part of
+it — it is the one port a person types, so it gets a round number that stands out from the
+things behind it. 7400 stays free for a sixth backend.
 
 `PORT` is log-analyzer's and predates the convention; every service added since has a prefixed
 name of its own. Nothing falls back to `PORT` — the gateway reads `GW_PORT` and only that.

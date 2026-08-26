@@ -21,7 +21,7 @@ spec:
         app: gateway
       annotations:
         prometheus.io/scrape: "true"
-        prometheus.io/port: "7400"
+        prometheus.io/port: "7500"
         prometheus.io/path: "/metrics"
     spec:
       # CKV_K8S_38. This service talks to four HTTP endpoints and never to the Kubernetes
@@ -40,7 +40,7 @@ spec:
           image: ghcr.io/crypticani/autonomous-infra-labs/gateway:latest
           ports:
             - name: http
-              containerPort: 7400
+              containerPort: 7500
           envFrom:
             - configMapRef:
                 name: gateway-config
