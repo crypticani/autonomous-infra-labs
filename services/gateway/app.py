@@ -23,6 +23,7 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 
 import metrics
+import provider as provider_module
 import router
 from backends import BACKENDS, BY_NAME
 from errors import GatewayProviderError
@@ -397,6 +398,9 @@ def health_check():
         # What this process loaded, not what the image ships.
         "policy": {
             "route_on": router.ROUTE_ON,
+            # The one knob set from a cold-start measurement, so it has to be readable
+            # without exec'ing into the container.
+            "llm_timeout": provider_module.LLM_TIMEOUT,
             "max_body_bytes": MAX_BODY_BYTES,
             "max_asks_per_hour": MAX_ASKS_PER_HOUR,
             "window": RATE_WINDOW,

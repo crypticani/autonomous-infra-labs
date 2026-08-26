@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 os.environ["GEMINI_API_KEY"] = "test-key-never-sent"
 os.environ["GW_API_TOKENS"] = ""
 os.environ["GW_ROUTE_ON"] = "medium"
+os.environ["GW_LLM_TIMEOUT"] = "300"
 os.environ["GW_LLM_PROVIDER"] = "ollama"
 
 # /health calls /api/tags, so an unpinned address means the suite reaches a real Ollama.

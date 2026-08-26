@@ -484,6 +484,8 @@ def test_health_is_open_and_reports_every_backend(client, monkeypatch):
     }
     assert all(b["latency_ms"] >= 0 for b in body["backends"])
     assert body["policy"]["route_on"] == "medium"
+    # The knob set from the cold-start measurement has to be visible here.
+    assert body["policy"]["llm_timeout"] == 300
 
 
 def test_one_degraded_backend_degrades_the_gateway(client, monkeypatch):
