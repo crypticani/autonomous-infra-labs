@@ -138,7 +138,9 @@ def test_load_cases_accepts_the_committed_set():
 # --- the report, which nothing covered until it had broken three times ---
 
 
-def _row(expect, routed, confidence, passed, why="", reason="", error=None):
+def _row(
+    expect, routed, confidence, passed, why="", reason="", error=None, declined_by=None
+):
     return {
         "case": {
             "label": f"a case expecting {expect}",
@@ -149,6 +151,7 @@ def _row(expect, routed, confidence, passed, why="", reason="", error=None):
         "why": why,
         "routed": routed,
         "error": error,
+        "declined_by": declined_by,
         "confidence": confidence,
         "reason": reason,
         "seconds": 1.0,
@@ -174,7 +177,12 @@ def test_the_report_renders_every_kind_of_row():
             why="declined a definite self-healing-agent question",
             reason="scaling question",
         ),
-        _row(None, None, "medium", True, reason="vague"),
+        # The two kinds of decline, which the table showed identically until the run that
+        # made it matter: the model saying it cannot place the question, versus the floor
+        # overruling a service it named too tentatively. Only the second is GW_ROUTE_ON's
+        # doing, so only the second changes if the bar moves.
+        _row(None, None, "low", True, reason="vague", declined_by="none"),
+        _row(None, None, "low", True, reason="a guess", declined_by="floor"),
         _row(
             ["log-analyzer", "self-healing-agent", None],
             "log-analyzer",

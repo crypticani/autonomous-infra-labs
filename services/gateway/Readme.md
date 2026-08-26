@@ -98,10 +98,10 @@ which was the entire point of the split two sections up. And the prompt says so 
 Then three entries end with *"so the log must be supplied"*, *"so the scan results must be
 supplied"*, and — the agent's — *"a description of an alert is not an alert."* I told the
 model not to do the needs-check and wrote the needs-check into the descriptions anyway. The
-measured cost of that contradiction is in *What the 7b gets wrong* below: the one miss that
-has survived every run is a bare *"can something scale it back up?"* that gets **declined**
-rather than routed to the agent, and routing it there would have passed, because
-`needs_input` is what should have handled the missing alert.
+measured cost of that contradiction is in *The two misses left* below: the one case that has
+missed every single run is a bare *"can something scale it back up?"*, which gets **declined**
+rather than routed to the agent — and routing it there would have passed, because
+`needs_input` is exactly what should have handled the missing alert.
 
 Two details that are less obvious than they look:
 
@@ -187,8 +187,10 @@ alphabetically and `"medium" < "high"` is not, so the obvious comparison is wron
 that passes half its cases. A `GW_ROUTE_ON` outside the three fails at import rather than
 silently leaving the gateway with no floor at all.
 
-It has never fired on the shipped model — see *The floor did not fire once* below, which is
-the negative result this paragraph earned.
+It fired zero times while `confidence` was a float, because the model only ever answered
+`1.00` or `0.00`. It plausibly fires now that the field is three levels and the model uses all
+three — see *The field's shape changed the model's behaviour* below, which is both the negative
+result this paragraph earned and the more interesting thing that replaced it.
 
 The prompt defines the three levels, because the model needs the vocabulary or it is guessing
 at an enum. It does not say which one the gateway acts on. Name a threshold to a model and
@@ -368,7 +370,7 @@ n/24 routed as expected  declined a definite question: n/19  answered a vague on
 ```
 
 Both have to stay low. Optimising either alone is trivial and produces a router nobody
-would ship. The shipped model scores **20/24** — see *Picking the model* below.
+would ship. The shipped model scores **22/24** — see *Picking the model* below.
 
 A few cases accept a list, which is the same concession `eval_triage.py` makes with bands:
 local Ollama is not reproducible even at `temperature: 0`, and a question that genuinely
@@ -400,10 +402,15 @@ which is not the thing anybody uses.
 |---|---|---|---|---|---|---|
 | 1 | `qwen2.5:7b-instruct` | 18/24 | 2/19 | 1/5 | 10.2 | 543 |
 | 1 | `qwen2.5-coder:1.5b` | 13/24 | 2/17 | 2/3 | 6.3 | 561 |
-| 2 | `qwen2.5:7b-instruct` | **20/24** | 1/18 | 1/5 | 9.8 | 566 |
+| 2 | `qwen2.5:7b-instruct` | 20/24 | 1/18 | 1/5 | 9.8 | 566 |
+| 3 | `qwen2.5:7b-instruct` | **22/24** | 2/19 | **0/5** | 10.6 | 599 |
 
-Run 2 is the same 7b after one change, described two sections down: the copilot's catalogue
-entry narrowed. Nothing else moved.
+One change per run, so each step is attributable. Run 2: the copilot's catalogue entry
+narrowed. Run 3: `confidence` became a three-level enum. Nothing else moved either time.
+
+The score movements are each +2 and I have already put the noise band at ±1–2, so treat
+18 → 20 → 22 as suggestive. What is *not* noise is distributional, and there is a lot of it
+below.
 
 1.5b is 1.6x faster and costs the same in tokens, and it is not close on the thing being
 bought. Note its denominators: 17 and 3, not 19 and 5, because **four of its 24 calls never
@@ -440,10 +447,10 @@ boolean here in any case. The floor became `GW_ROUTE_ON=medium` rather than a nu
 error text now names the field and the offending value regardless, because `"1 field(s) bad"`
 sent me to the raw-body log line to learn something the exception already knew.
 
-The measurements in the table above were taken with the float, so they are what they are: the
-20/24 run includes one case lost to `confidence: 2` that had passed twice before. Call it
-20/23 on routes that got as far as being graded — and re-run it now that the field cannot fail
-that way.
+Runs 1 and 2 in the table above were taken with the float, so the 20/24 includes one case lost
+to `confidence: 2` that had passed twice before — 20/23 on routes that got as far as being
+graded. Run 3 is the enum, and it did considerably more than stop the 502; see *The field's
+shape changed the model's behaviour* below, which is the part of this I did not expect.
 
 ```bash
 python eval_router.py                              # the shipped default
@@ -482,20 +489,47 @@ attributable, which is the same discipline the triage backlog is ordered by.
 
 **It worked, and cleanly.** Run 2, nothing else touched:
 
-| | run 1 | run 2 |
-|---|---|---|
-| knowledge-copilot picks | 8 | 5 |
-| of those, wrong | **3** | **0** |
-| total score | 18/24 | 20/24 |
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| knowledge-copilot picks | 8 | 5 | 5 |
+| of those, wrong | **3** | **0** | **0** |
+| total score | 18/24 | 20/24 | 22/24 |
+
+It has stayed fixed through a further change, which is the part that makes it a fix rather
+than a run.
 
 Both OOMKilled questions now go to log-analyzer. *"Is this Dockerfile safe to ship"* — which I
 had not attributed to this bias at all — went from declined to security-triage. Net +2 with one
 case lost to an unrelated `confidence: 2`, so 20/23 on routes that were graded at all.
 
-The honest caveat: the two vague misses **swapped identity** between runs. *"Something is wrong
-with checkout"* went miss → ok and *"is this actually safe or not"* went ok → miss, same count,
-different rows. So ±1–2 is noise here and 18 → 20 sits at the edge of what one run can claim.
-The 3 → 0 on knowledge-copilot is the part that is not ambiguous.
+The honest caveat: the two vague misses **swapped identity** between runs 1 and 2. *"Something
+is wrong with checkout"* went miss → ok and *"is this actually safe or not"* went ok → miss,
+same count, different rows. So ±1–2 is noise here and each +2 sits at the edge of what one run
+can claim. The 3 → 0 on knowledge-copilot is the part that is not ambiguous, and it held
+through run 3.
+
+### The two misses left, and why only one of them is a router problem
+
+By run 3 both remaining misses are **declines at `low`**, not confident misroutes — which is
+the failure mode you want if you must have one, and `answered a vague one: 0/5` is the other
+side of the same coin.
+
+*"The sandbox deployment has fewer replicas than it should. Can something scale it back up?"*
+has missed **every run**, and I do not think the router is wrong so much as talked out of it.
+The agent's catalogue entry says it *"diagnoses a firing Prometheus or Alertmanager alert"* and
+ends *"a description of an alert is not an alert."* There is no alert here, so the model backs
+off — reporting `low` in run 3, which is the first run where I could see it hesitate rather
+than just decline. But routing to the agent is the right answer: `needs_input` exists precisely
+to say "that one, and attach the alert." The description is doing the needs-check that the
+prompt explicitly tells it not to do, which is the contradiction written up under
+`backends.py`. That is the fix, and it is a description edit rather than anything about the
+router.
+
+*"Is this Dockerfile safe to ship"* has now gone miss → ok → miss. It is the plan's own example
+and security-triage is the right service, but a Dockerfile-safety question with nothing
+attached is genuinely near the line, and a case that flips on every run is measuring variance
+rather than the router. Left in the set as-is: it is a real question somebody would type, and
+`declined a definite question: 2/19` is honest about the cost.
 
 ### `reason` is naming the destination, not reading the question
 
@@ -522,29 +556,61 @@ string for both.
 
 Note which way this does *not* point: the 1.5b wrote long, careful, fully-formed sentences —
 *"This question fits both `log-analyzer` and `self-healing-agent`..."* — and scored worse.
-Length is not the thing. The next single-variable experiment is a prompt that demands the
-reason quote the words in the question that decided it, rather than describe the service.
+Length is not the thing.
 
-### The floor did not fire once
+**And then it fixed itself, from a change aimed at something else entirely.** Run 3 changed
+`confidence` to an enum and touched nothing about `reason`, and the reasons came back
+describing the question:
 
-Worth recording as a negative result, and it is the reason `confidence` is now an enum.
+| | run 2 | run 3 |
+|---|---|---|
+| pair A | `log analysis required` | `asked for meaning of a specific log entry` |
+| pair B | `log analysis required` → **miss** | `the question asks for remediation` → **ok** |
+| cluster change | `scaling question` | `asked about scaling` |
+| log line | `log content` | `log message` |
+| median words, right / wrong | 6 / 3 | 6 / 6 |
 
-Every 7b confidence in the 24-case runs was either `1.00` or `0.00`, nothing between — and
-each `0.00` came attached to `service: "none"`, which `decision()` declines on the enum branch
-*before* the floor is ever consulted. So the floor changed no outcome at all for the model
-actually shipping. Zero times, across 48 graded routes.
+The identical-reason pair separated, pair B started passing, and the short degenerate labels
+mostly went. My best guess is that being asked to grade its own fit — *plainly belongs /
+probably does / guessing* — is what forced an actual read of the question, and that the
+`reason` field was downstream of that all along. It is a guess: I did not set out to change
+this, and one run is not a finding.
 
-The mechanism is not dead: the 1.5b used 0.50 and 0.90, and the floor correctly overrode two
-of its picks. But on the 7b, confidence was a boolean wearing a float's clothing — and the
-`gw_router_confidence` series exists to make exactly that visible, which is the guard's own
-comment coming true faster than expected: *a router that is always 0.95 is a router that never
-doubts.* Ours was always 1.00.
+So the planned experiment is still worth running, but it is now a *confirmation* rather than a
+fix: a prompt that demands `reason` quote the words in the question that decided it. If the
+reasons are already question-shaped without it, that tells me something too.
 
-Two things follow, and only one of them is a fix. The fix is that a field with three legal
-values cannot report a boolean by accident the way a continuous one can, and cannot go out of
-range at all. The thing that is *not* fixed is whether the model has any calibrated notion of
-its own uncertainty here — three levels make that measurable rather than answered, and the
-next run is what says whether `medium` ever appears.
+### The field's shape changed the model's behaviour, not just its legal values
+
+This started as a bug report and turned into the most interesting thing on the page.
+
+With `confidence: float = Field(ge=0.0, le=1.0)`, the 7b emitted `1.00` or `0.00` across 48
+graded routes and **nothing in between** — every `0.00` attached to `service: "none"`, which
+`decision()` declines on the enum branch before the floor is ever consulted. So the floor
+changed no outcome at all, zero times. Confidence was a boolean wearing a float's clothing,
+which is the `gw_router_confidence` series' own comment coming true faster than expected: *a
+router that is always 0.95 is a router that never doubts.*
+
+With `Literal["low","medium","high"]`, the same model on the same 24 questions used **all
+three**: 15 `high`, 2 `medium`, 7 `low`.
+
+That is not a bug fix. Nothing prevented the float from returning `0.6`. Asking for a number
+got a number treated as a switch; asking for one of three named judgements got a judgement.
+The distribution is the evidence — one score moving is noise, but 7 lows and 2 mediums where
+there had been none across twice as many routes is not.
+
+**Two honest limits on that claim.** It was one design decision but two edits — the schema
+field *and* the prompt sentence that describes it, which went from "how sure you are" to
+"`high` if the question plainly belongs there, `medium` if it probably does, `low` if you are
+guessing". Which half did the work is unknown, and separating them is a run I have not done.
+And it is one run: the direction is clear, the size is not.
+
+What follows for the floor is that it plausibly fires now, and the report could not tell me.
+Both remaining misses show `low` and a decline — but a decline is either the model answering
+`none` or the floor overriding a service it named, and those are different facts. `GW_ROUTE_ON`
+owns the second and has nothing to do with the first. The table now prints `(none)` versus
+`(floor)` and the summary counts each, because whether the bar is earning its place or costing
+two cases is a question one column answers and no amount of reasoning does.
 
 ## `metrics.py` and `/metrics`
 

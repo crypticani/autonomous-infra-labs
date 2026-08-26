@@ -111,10 +111,19 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
         # noticed because nothing here tested `report()` at all, despite it being the third
         # thing in this function to break. There is a test now.
         confidence = row["confidence"]
+        if row["error"]:
+            got = "[red](error)[/red]"
+        elif row["declined_by"] == "floor":
+            # The gateway's call, not the model's: it named a service and was overruled.
+            got = "(floor)"
+        elif row["declined_by"] == "none":
+            got = "(none)"
+        else:
+            got = _name(row["routed"])
         table.add_row(
             row["case"]["label"],
             _name(row["case"]["expect"]),
-            "[red](error)[/red]" if row["error"] else _name(row["routed"]),
+            got,
             confidence or "-",
             f"{row['seconds']:.1f}",
             row["why"] or "",
@@ -144,6 +153,22 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
         f"declined a definite question: {over_declined}/{len(definite)}  "
         f"answered a vague one: {over_confident}/{len(vague)}"
     )
+
+    # Who did the declining, which is the only way to tell whether GW_ROUTE_ON is earning
+    # its place. Floor declines are the ones the bar is responsible for: raise it and there
+    # are more, lower it and they become routes. Model declines are unaffected by it.
+    by_model = sum(1 for r in graded if r["declined_by"] == "none")
+    by_floor = sum(1 for r in graded if r["declined_by"] == "floor")
+    if by_model or by_floor:
+        # Imported here rather than at module scope for the same reason main() does it:
+        # --model and --provider have to reach the environment before provider.py is read.
+        # By the time report() runs it is already in sys.modules, so this costs nothing.
+        import router
+
+        console.print(
+            f"declines: {by_model} the model's own, {by_floor} the "
+            f"{router.ROUTE_ON} floor's"
+        )
     if errored:
         console.print(
             f"[red]{len(errored)} case(s) never reached the model[/red] -- the score "
@@ -242,10 +267,18 @@ def main() -> int:
     rows = []
     for case in cases:
         case_started = time.monotonic()
+        declined_by = None
         try:
             route = router.classify(case["question"], case.get("attachment", ""))
             routed, _ = router.decision(route)
             confidence, reason, error = route.confidence, route.reason, None
+            if routed is None:
+                # The distinction the whole design rests on, and the table hid it: a
+                # `(decline)` is either the model saying it cannot place the question, or
+                # the floor overriding a service it named too tentatively. Only the second
+                # is affected by GW_ROUTE_ON, so without this you cannot tell whether the
+                # bar is earning its place or costing you cases.
+                declined_by = "none" if route.service == router.NONE else "floor"
         except Exception as e:
             # One unreachable backend should not throw away the cases that did run: a
             # partial score with the failures visible is worth more than a traceback.
@@ -263,6 +296,7 @@ def main() -> int:
                 # this, a run against a dead backend prints a table of declines and a
                 # summary blaming the model for an outage.
                 "error": error,
+                "declined_by": declined_by,
                 "confidence": confidence,
                 "reason": reason,
                 "seconds": time.monotonic() - case_started,
