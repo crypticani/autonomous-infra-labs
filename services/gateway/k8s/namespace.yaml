@@ -1,5 +1,4 @@
-# Its own namespace: this repo's own scan flags KSV-0110 and CKV_K8S_21 on the manifests
-# that have none.
+# Its own namespace: KSV-0110 and CKV_K8S_21 flag manifests without one.
 apiVersion: v1
 kind: Namespace
 metadata:

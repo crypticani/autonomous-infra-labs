@@ -29,9 +29,8 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Numeric uid, like security-triage's: `USER <name>` leaves a non-numeric user in the image
-# config, which a pod with runAsNonRoot refuses to start. k8s/deployment.yaml pins the same
-# 10001.
+# Numeric uid: `USER <name>` leaves a non-numeric user, which runAsNonRoot refuses.
+# k8s/deployment.yaml pins the same 10001.
 RUN addgroup --system --gid 10001 appgroup \
     && adduser --system --uid 10001 --ingroup appgroup appuser
 
@@ -45,8 +44,5 @@ USER 10001
 
 EXPOSE 7500
 
-# --workers 1 for two reasons: _starts holds the per-token rate-limit buckets, and the
-# Prometheus registry is per-process. Neither survives a second worker intact, and this
-# service does no work heavy enough to want one -- every request it serves is spent waiting
-# on somebody else.
+# --workers 1: _starts and the Prometheus registry are process-local.
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7500", "--workers", "1"]

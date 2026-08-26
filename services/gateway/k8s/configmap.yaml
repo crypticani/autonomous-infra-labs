@@ -1,5 +1,4 @@
-# Non-secret policy only. GW_API_TOKENS, the four backend tokens and GEMINI_API_KEY all
-# come from a Secret; see deployment.yaml and the `kubectl create secret` line in Readme.md.
+# Non-secret policy only. Tokens and keys come from a Secret; see deployment.yaml.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,40 +7,29 @@ metadata:
 data:
   GW_LLM_PROVIDER: "ollama"
 
-  # `.invalid` is RFC 2606 reserved and never resolves, so a deploy that forgot to set
-  # this fails loudly instead of routing against something unexpected.
+  # `.invalid` never resolves, so a deploy that forgot this fails loudly.
   GW_OLLAMA_BASE_URL: "http://ollama-host.invalid:11434"
 
-  # Fail-safe until eval_router.py says otherwise. An instruct tune rather than the coder
-  # model triage runs: this call classifies prose about incidents.
+  # An instruct tune, not triage's coder model; set from eval_router.py.
   GW_OLLAMA_MODEL: "qwen2.5:7b-instruct"
 
-  # 120, not triage's 600. This is the one model call a human waits on synchronously, so a
-  # router that takes ten minutes is broken rather than slow.
+  # 120, not triage's 600: a human waits on this one synchronously.
   GW_LLM_TIMEOUT: "120"
   GW_MAX_TOKENS: "256"
 
-  # The lowest confidence level the gateway will act on: low, medium or high. Anything
-  # under it is declined with the service it would have picked still named. "high" makes
-  # the router quieter and more often wrong by omission; "low" disables the floor.
-  #
-  # Three levels rather than a float because the float's range was the one constraint the
-  # model's grammar could not enforce -- both models emitted out-of-range numbers, and each
-  # one was a 502. An enum is structural, like GW_ROUTE_ON's sibling constraint on service.
+  # The lowest confidence level the gateway acts on: low, medium or high. "high" makes the
+  # router quieter and more often wrong by omission; "low" disables the floor.
   GW_ROUTE_ON: "medium"
 
-  # Fully-qualified cross-namespace DNS, because each backend lives in its own namespace.
-  # A bare service name would resolve inside `gateway` and find nothing.
+  # Fully-qualified: each backend lives in its own namespace.
   GW_LOG_ANALYZER_URL: "http://log-analyzer.log-analyzer.svc.cluster.local:7000"
   GW_KNOWLEDGE_COPILOT_URL: "http://knowledge-copilot.knowledge-copilot.svc.cluster.local:7100"
   GW_SELF_HEALING_AGENT_URL: "http://self-healing-agent.self-healing-agent.svc.cluster.local:7200"
   GW_SECURITY_TRIAGE_URL: "http://security-triage.security-triage.svc.cluster.local:7300"
 
-  # The copilot is the slowest of the four at 300s on CPU, and this has to clear it or the
-  # gateway invents a timeout the backend would not have had.
+  # Has to clear the copilot's own 300s or the gateway invents a timeout.
   GW_BACKEND_TIMEOUT: "300"
-  # Deliberately much shorter and a different number for a different job: /health serves
-  # the kubelet probes, so a wedged backend must not hold it open.
+  # Shorter, and a separate knob: /health serves the kubelet probes.
   GW_HEALTH_TIMEOUT: "5"
 
   GW_MAX_ASKS_PER_HOUR: "60"

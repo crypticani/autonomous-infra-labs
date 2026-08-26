@@ -36,8 +36,7 @@ jobs:
         run: python -m pytest tests/ -q
 
       - name: Check the cross-service eval runner
-        # No service's tests cover the repo-root runner. Catches a renamed eval script,
-        # which would otherwise be a permanently empty column in the table.
+        # Nothing else covers the repo-root runner; catches a renamed eval script.
         run: python eval_all.py --selftest
 
   validate-manifests:
@@ -56,8 +55,7 @@ jobs:
 
   build-and-push:
     needs: [lint-and-test, validate-manifests]
-    # Load-bearing: without it the `pull_request` trigger publishes :latest from unmerged
-    # code, and this image holds the edge token plus every backend's token at runtime.
+    # Load-bearing: without it `pull_request` publishes :latest from unmerged code.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
