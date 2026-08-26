@@ -150,6 +150,10 @@ nothing.
 backstop for the failure mode a confidence field exists to catch, which is a model that
 picks *something* rather than nothing.
 
+It has never fired. Every confidence the shipped model produced in the measured run was
+`1.00` or `0.00` — see *The floor did not fire once* below, which is the negative result this
+paragraph earned.
+
 The prompt tells the model that a low score means the gateway will decline. It does not tell
 it the number. Name a threshold to a model and you get a model that reports one point above
 it, and then the floor is measuring its own instruction. There is a test asserting the number
@@ -327,7 +331,7 @@ n/24 routed as expected  declined a definite question: n/19  answered a vague on
 ```
 
 Both have to stay low. Optimising either alone is trivial and produces a router nobody
-would ship. No score is recorded here yet — see *Picking the model* below.
+would ship. The shipped model scores **18/24** — see *Picking the model* below.
 
 A few cases accept a list, which is the same concession `eval_triage.py` makes with bands:
 local Ollama is not reproducible even at `temperature: 0`, and a question that genuinely
@@ -351,14 +355,43 @@ Grading happens on the route the gateway would **act on** — after the confiden
 before. Scoring the model's raw pick would be scoring a decision the gateway then overrides,
 which is not the thing anybody uses.
 
-### Picking the model
+### Picking the model — measured 2026-08-26
 
-**Not yet measured.** `GW_OLLAMA_MODEL` ships as `qwen2.5:7b-instruct` — an instruct tune
-rather than the coder model triage runs, because this call classifies prose about incidents,
-and both are already pulled so the choice cost nothing to make on the merits. 7b is the
-*fail-safe* default: Day 23 proved 1.5b cannot write triage explanations, which is a far
-bigger job than picking one of four names, so evidence gets to lower this and a wish for a
-faster demo does not.
+`GW_OLLAMA_MODEL=qwen2.5:7b-instruct`, and now for a reason rather than as a fail-safe.
+
+| model | score | declined a definite | answered a vague | s/route | tokens/route |
+|---|---|---|---|---|---|
+| `qwen2.5:7b-instruct` | **18/24** | 2/19 | 1/5 | 10.2 | 543 |
+| `qwen2.5-coder:1.5b` | 13/24 | 2/17 | 2/3 | 6.3 | 561 |
+
+1.5b is 1.6x faster and costs the same in tokens, and it is not close on the thing being
+bought. Note its denominators: 17 and 3, not 19 and 5, because **four of its 24 calls never
+produced a valid route at all** — the score is 13/20 on the ones it answered, dressed up as
+13/24. Day 23 said 1.5b cannot write triage explanations. This says it cannot reliably emit
+three fields either.
+
+**And the way it failed is the more useful half.** All four bad calls looked like this:
+
+```json
+{ "reason": "The question asks for an analysis of an Alertmanager alert...",
+  "service": "self-healing-agent", "confidence": 10 }
+```
+
+`confidence: 10` against a schema declaring `le=1.0`. So the claim at the top of this file —
+*the schema is the guard* — is true of exactly the part I built it for and not of the part I
+assumed came free. **Grammar-constrained decoding enforces structure, not value ranges.**
+`service` never once left its enum in 48 calls across both models, because an enum is
+structural and the sampler cannot emit a token outside it. `ge`/`le` on a float are not
+structural: the grammar permits any number, and Pydantic rejects the value afterwards, which
+is a 502 rather than a guard. Two constraints written in the same `Field(...)` call, and only
+one of them is load-bearing.
+
+I am leaving it as a 502 rather than clamping. A model that cannot keep a number inside
+`[0,1]` when asked is a model whose routing I would not act on either, and silently rewriting
+`10` to `1.0` would guess at intent and hide precisely the evidence that decided this table.
+What changed is the error text: it now names the field and the offending value, because
+`"1 field(s) bad"` sent me to the raw-body log line to learn something the exception already
+knew.
 
 ```bash
 python eval_router.py                              # the shipped default
@@ -367,9 +400,59 @@ python eval_router.py --provider gemini
 python eval_router.py --limit 5                    # smoke test before the full run
 ```
 
-The eval prints seconds per route and tokens per route alongside the score, so the
-comparison that decides it is one table each way. Latency matters more here than anywhere
-else in the repo: this is the only model call a human waits on synchronously.
+There is one throwaway call before the clock starts, because Ollama loads the model on first
+use and that load otherwise lands on whichever case is first: 17.3s against a ~9s median on
+7b, 27.6s against ~5s on 1.5b, and on a five-case run it blew through `GW_LLM_TIMEOUT`
+outright and reported case one as an error that had nothing to do with routing. `--no-warmup`
+puts it back if you want to see that.
+
+### What the 7b gets wrong, and why one of those is my fault
+
+Six misses, and they are not evenly distributed. **Three of them went to knowledge-copilot**,
+which was picked 8 times out of 24 — the catalogue's attractor. The model's stated reason for
+the worst of them, a bare *"something is wrong with checkout"* that should have been declined,
+was two words:
+
+> `operational question`
+
+Which is a quotation. The description I had written for that service opened *"Answers
+operational questions from the team's own runbooks"* — the broadest phrase in the whole
+catalogue, sitting in the entry for the one backend that needs no attachment, and ending with
+*"Needs nothing but the question."* I wrote a default and then recorded surprise that the
+model chose it. It also said *"what an alert means"*, which collides head-on with both
+log-analyzer and the agent.
+
+That description is now narrow, says it *"knows nothing whatever about the running system"*,
+and ends by pushing back instead of inviting: *"If the answer is not already written in a
+runbook, this is the wrong service."* **One variable changed** — not the catalogue ordering,
+which is the other live hypothesis for the same bias and the obvious next single-variable
+experiment. Changing both would leave neither attributable, which is the same discipline the
+triage backlog is ordered by.
+
+**The other thing those misses share is worth more than the fix.** Five of the six were
+explained in three words or fewer: `OOMKilled`, `scaling question`, `log analysis required`,
+`operational question`. `reason` is generated *before* `service` precisely so the pick is
+conditioned on stated reasoning — but a two-word label is not reasoning, and if the reason is
+degenerate then the field order is buying nothing. Whether the *passes* did any better was
+unanswerable from that run, because the report printed reasons for misses only. It now prints
+all of them plus the median word count for each group, so the next run answers it. Note the
+direction that comparison could go: the 1.5b wrote long, careful, fully-formed sentences —
+*"This question fits both `log-analyzer` and `self-healing-agent`..."* — and scored worse.
+Length is clearly not the thing. Whether anything about the reason predicts the route is
+still open.
+
+### The floor did not fire once
+
+Worth recording as a negative result. Every 7b confidence in the 24-case run was either
+`1.00` or `0.00`, nothing between — and each `0.00` came attached to `service: "none"`, which
+`decision()` declines on the enum branch before the floor is ever consulted. So
+`GW_MIN_CONFIDENCE=0.6` changed no outcome at all for the model actually shipping.
+
+The mechanism is not dead — the 1.5b used 0.50 and 0.90, and the floor correctly overrode two
+of its picks. But on the 7b, confidence is a boolean wearing a float's clothing, and the
+`gw_router_confidence` histogram exists to make exactly that visible. That is the guard's own
+comment coming true faster than expected: *a router that is always 0.95 is a router that
+never doubts.* Ours is always 1.00.
 
 ## `metrics.py` and `/metrics`
 

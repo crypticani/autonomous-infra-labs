@@ -74,11 +74,21 @@ class Backend:
 BACKENDS: tuple[Backend, ...] = (
     Backend(
         name="knowledge-copilot",
+        # Rewritten 2026-08-26 from the first measured run, where this service was the
+        # catalogue's attractor: picked 8 times out of 24 and wrong on 3 of them, and the
+        # model's stated reason for the worst miss was the bare phrase "operational
+        # question" -- a quotation of this very description. Three things had to go:
+        # "operational questions", the broadest phrase in the whole catalogue; "what an
+        # alert means", which collides head-on with both log-analyzer and the agent; and
+        # "Needs nothing but the question", which reads as "pick me when unsure". What
+        # replaces them is narrow, and the last sentence pushes back rather than inviting.
         answers=(
-            "Answers operational questions from the team's own runbooks: how to perform a "
-            "procedure, what an alert means, what the documented response to a situation "
-            "is. Cites the runbook it used, and says the runbooks do not cover it rather "
-            "than guessing. Needs nothing but the question."
+            "Looks up what this team has already written down: a documented procedure, an "
+            "agreed escalation path, a definition or threshold this team has settled on, a "
+            "postmortem of something that happened before. It searches documents and "
+            "knows nothing whatever about the running system -- it cannot see logs, the "
+            "cluster, or scan results. If the answer is not already written in a runbook, "
+            "this is the wrong service."
         ),
         path="/ask-runbook",
         url_env="GW_KNOWLEDGE_COPILOT_URL",

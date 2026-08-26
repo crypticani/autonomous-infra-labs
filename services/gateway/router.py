@@ -115,6 +115,28 @@ def build_user_prompt(question: str, attachment: str = "") -> str:
     return "\n\n".join(parts)
 
 
+def _bad_fields(error: ValidationError) -> str:
+    """Which field, what it said, and why that was rejected.
+
+    Written after the first measured run, where a 1.5b model answered `"confidence": 10`
+    against a schema declaring `le=1.0` -- four times. The old message said "1 field(s)
+    bad" and I had to go read the raw-body log line to learn which field and what value,
+    which is the wrong amount of work for the one error this path exists to explain.
+
+    It is also the finding worth keeping: grammar-constrained decoding enforces *structure*
+    -- `service` never once left its enum across 48 calls -- and does not enforce numeric
+    bounds, so `ge`/`le` are a validation after the fact rather than a guard. A 502 is the
+    correct outcome and this is what makes it diagnosable.
+    """
+    parts = []
+    for err in error.errors():
+        where = ".".join(str(p) for p in err["loc"]) or "(root)"
+        # Truncated: a rejected `reason` can be the whole over-long string.
+        got = repr(err.get("input"))
+        parts.append(f"{where}={got[:80]} ({err['msg']})")
+    return "; ".join(parts)
+
+
 def classify(question: str, attachment: str = "") -> Route:
     """One model call. Raises GatewayProviderError; never returns a guess.
 
@@ -136,7 +158,7 @@ def classify(question: str, attachment: str = "") -> Route:
         # this should be impossible, so when it happens the body is the evidence.
         logger.error(f"the router returned unusable JSON: {raw[:400]!r}")
         raise GatewayProviderError(
-            f"the router model returned an invalid route: {e.error_count()} field(s) bad",
+            f"the router model returned an invalid route: {_bad_fields(e)}",
             502,
             provider=provider.name,
         ) from e

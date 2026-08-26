@@ -27,6 +27,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from statistics import median
 
 from rich.console import Console
 from rich.table import Table
@@ -76,6 +77,10 @@ def grade(case: dict, routed: str | None) -> tuple[bool, str]:
     if routed is None:
         return False, f"declined a definite {expected} question"
     return False, f"wanted {expected}"
+
+
+def _words(row: dict) -> int:
+    return len((row["reason"] or "").split())
 
 
 def _name(expected) -> str:
@@ -150,12 +155,29 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
         f"({sum(tokens) / len(rows):.0f} per route)"
     )
 
+    # `reason` is generated before `service` so the classification is conditioned on
+    # stated reasoning rather than justifying a pick already made. That only works if the
+    # reason is actually reasoning -- and the first measured run had five of six misses
+    # explained by three words or fewer ("OOMKilled", "scaling question", "operational
+    # question"). Whether the passes were any better was unanswerable, because this report
+    # printed reasons for misses only. Hence both numbers, and every reason below.
+    if graded:
+        hit_words = [_words(r) for r in graded if r["passed"]]
+        miss_words = [_words(r) for r in graded if not r["passed"]]
+        console.print(
+            f"median reason: {median(hit_words) if hit_words else 0:.0f} words when "
+            f"right, {median(miss_words) if miss_words else 0:.0f} when wrong"
+        )
+
+    # A router that picked wrong for a stated reason is a prompt problem; one that picked
+    # wrong for an unrelated reason is a model problem. Only the sentence tells them apart,
+    # and only having the right ones to compare against makes it readable.
     for row in rows:
-        if not row["passed"] and row["reason"]:
-            # The model's own sentence for every miss: a router that picked wrong for a
-            # stated reason is a prompt problem, and one that picked wrong for an unrelated
-            # reason is a model problem. Only this line tells them apart.
-            console.print(f"  [dim]{row['case']['label']}:[/dim] {row['reason']}")
+        if row["reason"]:
+            mark = "[green]ok  [/green]" if row["passed"] else "[red]miss[/red]"
+            console.print(
+                f"  {mark} [dim]{row['case']['label']}:[/dim] {row['reason']}"
+            )
 
     return passed == len(rows)
 
@@ -166,6 +188,11 @@ def main() -> int:
     parser.add_argument("--model", help="override the provider's model for this run")
     parser.add_argument(
         "--limit", type=int, help="run only the first N cases, for a smoke test"
+    )
+    parser.add_argument(
+        "--no-warmup",
+        action="store_true",
+        help="skip the throwaway first call; the cold model load then lands on case one",
     )
     args = parser.parse_args()
 
@@ -191,6 +218,19 @@ def main() -> int:
         f"{len(cases)} cases against [bold]{provider.name}[/bold] "
         f"({provider.model_name}), floor {router.MIN_CONFIDENCE}"
     )
+
+    # One throwaway call before the clock starts, because Ollama loads the model on first
+    # use and that load lands on whichever case happens to be first. Measured: 17.3s
+    # against a ~9s median on 7b, 27.6s against ~5s on 1.5b -- and on a 5-case run it
+    # exceeded GW_LLM_TIMEOUT outright, so case one was reported as an error that had
+    # nothing to do with routing. Failures here are swallowed: if the backend is genuinely
+    # down, all 24 cases are about to say so with their own error text.
+    if not args.no_warmup:
+        console.print("[dim]warming the model (not counted)...[/dim]")
+        try:
+            router.classify("what is our documented escalation path")
+        except Exception as e:
+            console.print(f"[yellow]warm-up call failed: {e}[/yellow]")
 
     before = provider.prompt_tokens, provider.output_tokens
     started = time.monotonic()
