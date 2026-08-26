@@ -65,6 +65,33 @@ needs, rather than to invent a log or an alert to send it.
 
 Every service exposes `/metrics` for Prometheus (token cost, latency, error rate — not just uptime) and ships with a small eval harness so behavior is tested, not just demoed once.
 
+### Port allocation
+
+One port per service, one env var per port, and no service reads another's. Written down here
+because it wasn't anywhere until the fifth service needed a number.
+
+| service | port | env var | published in `docker-compose.prod.yml` |
+|---|---|---|---|
+| log-analyzer | 7000 | `PORT` | **all interfaces** — see the note below |
+| knowledge-copilot | 7100 | `COPILOT_PORT` | `127.0.0.1` only, nginx proxies to it |
+| self-healing-agent | 7200 | `SHA_PORT` | `127.0.0.1` only |
+| security-triage | 7300 | `ST_PORT` | `127.0.0.1` only |
+| gateway | 7400 | `GW_PORT` | `127.0.0.1` only |
+
+`PORT` is log-analyzer's and predates the convention; every service added since has a prefixed
+name of its own. Nothing falls back to `PORT` — the gateway reads `GW_PORT` and only that.
+
+Inside the compose network the services address each other by **service name**, not by
+`localhost`: `http://knowledge-copilot:7100`. That is what the gateway's `GW_*_URL` defaults
+already are, so a compose deploy needs no URL entries in `.env` at all. Override them only for
+a bare `python app.py`, where the backends really are on localhost.
+
+> **Note on log-analyzer's bind.** It is the only one of the five published on every interface
+> rather than loopback, which on a public host means port 7000 is reachable from the internet.
+> That predates the gateway and is not something Day 30 changed, but it is worth a decision now
+> that a gateway exists to front it: `"127.0.0.1:${PORT:-7000}:${PORT:-7000}"` is the one-line
+> change, and log-analyzer has no auth of its own, which is the reason it matters.
+
 ## Design principles
 
 * **Understand before you automate.** Every service is built by hand first; frameworks are added later, only once the underlying loop can be explained without one.

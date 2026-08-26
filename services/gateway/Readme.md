@@ -703,22 +703,88 @@ Fifth entry in `docker-compose.prod.yml`, loopback bind on 7400, GHCR image publ
 gateway is correct with every backend down, and making it wait would delay the one endpoint
 that can report which of the four is missing.
 
+### 1. `.env` on the host
+
+Two keys are required and the rest have working defaults:
+
 ```bash
-# on the host, after the image exists
-docker compose -f docker-compose.prod.yml pull gateway
-docker compose -f docker-compose.prod.yml up -d gateway
-curl -sS localhost:7400/health | jq '.status, .auth'
+GW_API_TOKENS=<one per caller, comma-separated>
+GW_OLLAMA_BASE_URL=http://<laptop tailnet ip>:11434
 ```
 
-`.env` needs `GW_API_TOKENS` at minimum. `/health` reports `degraded` and says
-`auth: disabled` without it, which is the loud version of a deploy that left the front door
-to all four services open.
+`GW_API_TOKENS` unset means auth is off, and `/health` says `degraded` / `auth: disabled` —
+the loud version of a deploy that left the front door to all four services open.
 
-**The nginx `client_max_body_size` trap.** nginx defaults to 1 MiB and terminates TLS in
-front of this. The gateway's own cap is 16 MiB to match triage's, so a scan envelope between
-those two sizes is refused by nginx with an HTML 413 that never reaches any of my code —
-the same shape of problem that cost an evening on Day 28. Raise it in the server block or
-accept 1 MiB as the real limit.
+**`GW_OLLAMA_BASE_URL` is the one that will catch you.** The provider falls back to the
+shared `OLLAMA_BASE_URL`, and on the host that points wherever the *other* services' models
+live — which is exactly why `ST_OLLAMA_BASE_URL` had to exist on Day 28. Only triage's
+backend moved to the laptop; the router's model lives there too, so it needs the same
+override. Without it `/ask` answers 503 and `/health` names the unreachable address, which is
+at least a legible failure rather than a silent one.
+
+No `GW_*_URL` entries are needed. The defaults are the compose service names, which is what
+resolves inside the network.
+
+### 2. Pull and start
+
+```bash
+docker compose -f docker-compose.prod.yml pull gateway
+docker compose -f docker-compose.prod.yml up -d gateway
+
+# every backend's own status, not just this process's liveness
+curl -sS localhost:7400/health | jq '.status, .auth, (.backends[] | {service, status})'
+```
+
+`qwen2.5:7b-instruct` has to be pulled on whichever Ollama `GW_OLLAMA_BASE_URL` points at.
+`/health` checks that too and names the model if it is missing.
+
+### 3. nginx
+
+Deny by default, like the sibling blocks: three locations proxied and everything else 404.
+`/metrics` is deliberately **not** among them — Prometheus scrapes it over the compose
+network, and publishing routing volumes and token spend to the internet is free operational
+intelligence for anyone who asks.
+
+```bash
+dig +short gw.crypticani.dev          # before touching nginx; certbot's HTTP-01 needs it
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx --expand -d gw.crypticani.dev
+```
+
+```nginx
+server {
+    server_name gw.crypticani.dev;
+
+    # /ask, /health, and the /s/{service}/{path} passthrough. Prefix matches, because
+    # every one of them carries something after the first segment.
+    location ~ ^/(ask|health|s/) {
+        proxy_pass http://127.0.0.1:7400;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+
+        # THE ONE THAT MATTERS, for the second time this month. nginx defaults to 1 MiB;
+        # this service's own cap is 16 MiB to match triage's, because the same scan
+        # envelope arrives here as an `attachment` and gets forwarded there. Without this
+        # line a 2.7 MB envelope gets nginx's HTML 413 and GW_MAX_BODY_BYTES never gets a
+        # say. A cap silently overridden by a smaller cap one layer up is worse than no
+        # cap: the control you tested is not the control that fired.
+        client_max_body_size 16m;
+
+        # A router call is one CPU-bound model call and the copilot behind it can take
+        # 300s. nginx's default 60s proxy_read_timeout would 504 a request the gateway
+        # was still legitimately serving.
+        proxy_read_timeout 320s;
+    }
+
+    location / { return 404; }
+
+    # certbot --nginx fills in listen 443 / ssl_certificate / etc.
+}
+```
+
+**Not yet run.** Everything above is derived from the four blocks that came before it rather
+than from a verified deploy, so treat the `proxy_read_timeout` and the regex location as the
+two lines most likely to want adjusting.
 
 **The laptop hosting Ollama does not need to be awake.** Accepted on Day 28 and it applies
 here too: with the model unreachable, `/ask` answers 503 naming the router provider, and
