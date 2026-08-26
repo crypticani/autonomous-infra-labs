@@ -10,7 +10,7 @@ import json
 import pytest
 
 import backends
-from eval_router import EVAL_SET, grade, load_cases
+from eval_router import EVAL_SET, grade, load_cases, report
 
 CASES = json.loads(EVAL_SET.read_text(encoding="utf-8"))
 
@@ -133,3 +133,80 @@ def test_load_cases_rejects_a_service_that_does_not_exist(tmp_path):
 
 def test_load_cases_accepts_the_committed_set():
     assert len(load_cases(EVAL_SET)) == len(CASES)
+
+
+# --- the report, which nothing covered until it had broken three times ---
+
+
+def _row(expect, routed, confidence, passed, why="", reason="", error=None):
+    return {
+        "case": {
+            "label": f"a case expecting {expect}",
+            "question": "q",
+            "expect": expect,
+        },
+        "passed": passed,
+        "why": why,
+        "routed": routed,
+        "error": error,
+        "confidence": confidence,
+        "reason": reason,
+        "seconds": 1.0,
+    }
+
+
+def test_the_report_renders_every_kind_of_row():
+    """`report()` has now broken three times -- an errored row printed as a decline, a
+    `why` column that wrapped a connection traceback across fifteen lines, and a level
+    formatted with `:.2f` after confidence stopped being a float. Each one got through
+    because nothing in the suite ever called this function. This is the cheapest thing that
+    fails the next time.
+    """
+    rows = [
+        _row(
+            "log-analyzer", "log-analyzer", "high", True, reason="asks what a log means"
+        ),
+        _row(
+            "self-healing-agent",
+            None,
+            "low",
+            False,
+            why="declined a definite self-healing-agent question",
+            reason="scaling question",
+        ),
+        _row(None, None, "medium", True, reason="vague"),
+        _row(
+            ["log-analyzer", "self-healing-agent", None],
+            "log-analyzer",
+            "high",
+            True,
+            reason="asks about log text",
+        ),
+        # The outage row: no level and no reason, which is the shape that printed as a
+        # decline and made an unreachable backend look like a cautious model.
+        _row(
+            "security-triage",
+            None,
+            None,
+            False,
+            why="GatewayProviderError: unreachable",
+            error="GatewayProviderError: unreachable",
+        ),
+    ]
+
+    assert report(rows, elapsed=12.0, tokens=(1000, 100)) is False
+
+
+def test_the_report_survives_a_run_where_nothing_reached_the_model():
+    """Every row errored, so `graded` is empty -- which is a median over no samples and a
+    ratio with a zero denominator if either is written carelessly."""
+    rows = [_row("log-analyzer", None, None, False, why="boom", error="boom")]
+    assert report(rows, elapsed=1.0, tokens=(0, 0)) is False
+
+
+def test_the_report_returns_true_only_when_every_row_passed():
+    rows = [
+        _row("log-analyzer", "log-analyzer", "high", True, reason="a reason"),
+        _row(None, None, "low", True, reason="another"),
+    ]
+    assert report(rows, elapsed=2.0, tokens=(10, 5)) is True

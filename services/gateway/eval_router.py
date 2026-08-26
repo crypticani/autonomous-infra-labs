@@ -106,12 +106,16 @@ def report(rows: list[dict], elapsed: float, tokens: tuple[int, int]) -> bool:
     table.add_column("", justify="center")
 
     for row in rows:
+        # A level name now, not a float. This line said `f"{confidence:.2f}"` and crashed
+        # the whole report on the first run after the schema changed -- the suite never
+        # noticed because nothing here tested `report()` at all, despite it being the third
+        # thing in this function to break. There is a test now.
         confidence = row["confidence"]
         table.add_row(
             row["case"]["label"],
             _name(row["case"]["expect"]),
             "[red](error)[/red]" if row["error"] else _name(row["routed"]),
-            f"{confidence:.2f}" if confidence is not None else "-",
+            confidence or "-",
             f"{row['seconds']:.1f}",
             row["why"] or "",
             "[green]ok[/green]" if row["passed"] else "[red]miss[/red]",

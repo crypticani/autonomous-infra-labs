@@ -567,7 +567,7 @@ outage. Both are "no answer" and they need completely different fixes.
 
 ## Tests
 
-83, offline, no model and no backends:
+86, offline, no model and no backends:
 
 ```bash
 cd services/gateway && python -m pytest tests/ -q
