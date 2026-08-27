@@ -289,7 +289,7 @@ which is the closest thing I have to a checkable version of "production-ready".
 
 ## Where it stands
 
-Four services, 512 tests, four evals. Each one has been driven end to end against something real
+Five services, 598 tests, five evals. Each one has been driven end to end against something real
 rather than a fixture — a public endpoint behind TLS, a Slack workspace, a `kind` cluster that
 really did scale back up, a pull request on this repo that really was gated. Every service exposes
 `/metrics` and every one has a documented way to refuse.
