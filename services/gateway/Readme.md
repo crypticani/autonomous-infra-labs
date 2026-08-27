@@ -787,6 +787,81 @@ here too: with the model unreachable, `/ask` answers 503 naming the router provi
 `/health` says `degraded` with the reason. That is the correct and visible outcome for a
 learning build, and the passthrough keeps working throughout — it never touches a model.
 
+### Deployed, and two speeds
+
+Live at `aiops.crypticani.dev` since 2026-08-26. Verified end to end: `/health` reports all
+four backends healthy, `/metrics` correctly returns nginx's own 404, and `POST /ask` returned
+`answered` attributed to `knowledge-copilot POST /ask-runbook` — with the copilot itself
+declining, *"Not covered in the runbooks."* Two refusals stacked correctly, which is the
+whole design working.
+
+The same call twice in a row, on the deployed host:
+
+| | cold | warm |
+|---|---|---|
+| total | **186.9s** | **9.0s** |
+| prompt tokens | 555 | 555 |
+| output tokens | 24 | 25 |
+
+`GW_LLM_TIMEOUT` shipped at 120, sitting exactly between those two numbers, so the first call
+after any idle period was a guaranteed 504 and every call after it was fine. It is 300 now —
+and the correction matters more than the number. **120 came from a principle, not a
+measurement.** "This is the only model call a human waits on synchronously, so it should be
+short" is true, and I never checked it against a cold start. The eval didn't catch it because
+I had added a warm-up call to the eval for exactly this reason: I fixed the symptom in the
+measurement tool and left it in production.
+
+Nothing else was at fault. `num_predict` is innocent at 24 output tokens against a 256
+ceiling; prompt eval is innocent at ~168 tok/s warm; the grammar is innocent — 218 vs 232
+ms/token with and without `maxLength`, identical within noise.
+
+### The RAM wall
+
+The gap is model load, and it is not a fixed cost. Measured on the host *after*
+`OLLAMA_KEEP_ALIVE=30m` was set and confirmed applied:
+
+```
+Mem:  15Gi total   10Gi used   764Mi free   5.1Gi available
+Swap: 8.0Gi total  2.7Gi used
+ollama ps  ->  empty, immediately after a successful call
+```
+
+One laptop serves four services and three distinct models — the copilot shares
+`qwen2.5:7b-instruct` with this router, log-analyzer and triage both want
+`qwen2.5-coder:7b`, embeddings want `nomic-embed-text`. Roughly 9.4GB of weights, and a 7B
+Q4_K_M is ~4.7GB against 5.1GB available with 2.7GB already swapped. It can just about load
+and it cannot stay: keep-alive cannot hold memory the kernel is reclaiming.
+
+So 300s is a floor, not a fix. Three ways out, none taken, all in the root README's
+what's-next:
+
+1. **A smaller router model.** The 13/24 that disqualified a small model was
+   `qwen2.5-coder:1.5b` — a *coder* tune doing prose classification, the one thing this
+   service chose an instruct tune to avoid. `qwen2.5:3b` at ~1.9GB has a real chance of
+   staying resident, and `eval_router.py --model` is one command. Untested.
+2. **Gemini for the router.** The seam exists and the call is 575 tokens, the smallest in the
+   repo. Held off because the free tier has run out here before, and because
+   `GW_MAX_ASKS_PER_HOUR=60` lets one token issue 1,440/day — above the daily cap, so the
+   gateway's own limit does not protect the quota. `/health` also has no Gemini reachability
+   check, so an exhausted quota would read as healthy.
+3. **Reclaim RAM on the host.** 10GB is going somewhere and 2.7GB is already swapped.
+
+### `/ask` is synchronous and should not be
+
+A design error rather than a tuning problem, and the clearest thing I got wrong this day.
+`POST /ask` returns the answer inline, which is `knowledge-copilot`'s shape — and the copilot
+answers in seconds. This endpoint is 9s warm and 190s cold, which is **security-triage's**
+profile. Triage returns `202` plus a poll URL for exactly that reason, in a docstring I had
+read: *"a run is one model call per ST_BATCH_SIZE findings, minutes each, so a synchronous
+endpoint would time out on every real request and be retried."*
+
+The right pattern was already in this repo and I copied from the wrong sibling.
+
+It has a consequence past latency. Cloudflare fronts this subdomain and caps origin response
+time, so a cold `/ask` returns `error code: 524` at 125s no matter what nginx and the gateway
+allow — measured. `202` + poll removes that ceiling; grey-clouding the DNS record also works,
+at the cost of exposing the origin address.
+
 ## Not built
 
 A UI, response caching, and a queue. Those are a fifth project, and I said so before
