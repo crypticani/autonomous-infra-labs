@@ -1,0 +1,7 @@
+# The quickstart in the README: `eval_all.py` at the repo root needs `rich`, and the
+# "run the log analyzer" step runs that service directly. The include below covers both.
+#
+# Each service has its own requirements.txt and that file is the authority for it. Install
+# per service when working on one -- the five pin the same versions where they overlap, but
+# only the service's own file is guaranteed complete for it.
+-r services/log-analyzer/requirements.txt

@@ -304,14 +304,10 @@ I'm leaving them red. The first case study on this page is an eval that passed o
 re-run, and had been measuring nothing for three weeks — a green number nobody re-runs is a record
 of one afternoon. A red one with a cause written next to it is a work queue.
 
-Since writing that, the gateway in front of all four is built — and it taught me something about
-these four services I had not noticed writing them up separately. Routing a plain-English question
-to whichever one can answer it turns out to be the easy half. The hard half is that **only one of
-the four can answer a bare sentence at all**: the copilot takes a question, and the other three need
-a log, an alert, or a scan envelope that no amount of English contains. So the router has two ways
-to refuse rather than one — it can say it cannot place the question, and the gateway can say the
-right service was found but the request has nothing to send it. Which is the same shape as every
-refusal on this page, arrived at from a completely different direction.
+Since writing that, the gateway in front of all four is built, and it turned up another refusal of
+the same shape from a completely different direction — only one of these four services can answer a
+bare sentence at all, so the router has to be able to name a service *and* say what you still have
+to attach. That one has its own write-up: [`services/gateway`](../services/gateway).
 
 After that, the two triage fixes: context lines first, then the rubric, in that order, so the eval
 can tell me which one moved the number.
